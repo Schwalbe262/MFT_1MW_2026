@@ -664,14 +664,15 @@ def _validate_winner(
         normalized.get("immediate_task_id"), "immediate task ID"
     )
     immediate_kind = normalized.get("immediate_retry_kind")
-    if immediate_kind not in {"none", "timeout"}:
+    if immediate_kind not in {"none", "timeout", "infrastructure"}:
         raise ClaimContractError("immediate retry kind is unsupported")
     logical_task_id = _require_positive_int(
         reference.get("logical_authority_task_id"),
         "logical authority task ID",
     )
     if (immediate_kind == "none" and immediate_task_id != logical_task_id) or (
-        immediate_kind == "timeout" and immediate_task_id == logical_task_id
+        immediate_kind in {"timeout", "infrastructure"}
+        and immediate_task_id == logical_task_id
     ):
         raise ClaimContractError("campaign claim ancestry is inconsistent")
     for field, label in (

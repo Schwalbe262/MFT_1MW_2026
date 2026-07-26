@@ -45,14 +45,19 @@ RETENTION_SCHEMA = "mft-corrected-thermal-retained-bundle-v1"
 RETENTION_MARKER_SCHEMA = "mft-corrected-thermal-retention-marker-v1"
 SOURCE_EVIDENCE_SCHEMA = "mft-corrected-source-em-evidence-v1"
 COLLECTION_SCHEMA = "mft-corrected-thermal-mixed-provenance-collection-v1"
+RUNTIME_QUOTA_AUTHORITY_SCHEMA = (
+    "mft-corrected-thermal-runtime-quota-authority-v1"
+)
 
 CAMPAIGN_ID = "mft-goal-20260726"
 PROJECT = "MFT_1MW_2026v1"
 SCHEDULER_URL = "http://127.0.0.1:8002"
-TASK_NAME = "mft-goal-corrected-thermal-l96230-b7c30cb70b95-v1"
+TASK_NAME = (
+    "mft-goal-corrected-thermal-l96230-b7c30cb70b95-infra-r1"
+)
 ACCOUNT = "r1jae262"
 ACCOUNT_UID = 1455
-TARGET_NODE = "n111"
+TARGET_NODE = "n109"
 FORBIDDEN_NODE = "n114"
 SOURCE_LOGICAL_TASK_ID = 96230
 SOURCE_EXECUTION_TASK_ID = 96304
@@ -87,6 +92,9 @@ GPUS = 0
 MEMORY_MARGIN_MB = 65_536
 NODE_TELEMETRY_MAX_AGE_SECONDS = 120.0
 NODE_TELEMETRY_FUTURE_TOLERANCE_SECONDS = 5.0
+RUNTIME_QUOTA_AUTHORITY_MAX_AGE_SECONDS = 1_800
+RUNTIME_QUOTA_DRIFT_RESERVE_BYTES = 16 * 1024**3
+RUNTIME_QUOTA_DRIFT_RESERVE_INODES = 4_096
 MAX_TIMEOUT_SECONDS = 21_600
 MIN_RUNTIME_SECONDS = 10_800
 PACKAGE_RESERVE_SECONDS = 1_800
@@ -107,9 +115,36 @@ CHECKPOINT_ROOT = PurePosixPath(
 )
 RETAINED_ROOT = (
     "/gpfs/home1/r1jae262/slurm_scheduler/mft_goal_20260726/"
-    "corrected_thermal_minimum_v1"
+    "corrected_thermal_minimum_infra_r1"
 )
-RETRY_GENERATION = "corrected-thermal-v1"
+RETRY_GENERATION = "corrected-thermal-infra-r1"
+INFRASTRUCTURE_RETRY_SOURCE = {
+    "task_id": 96308,
+    "task_name": "mft-goal-corrected-thermal-l96230-b7c30cb70b95-v1",
+    "dedupe_key": (
+        "mft-al:mft-goal-corrected-thermal-l96230-b7c30cb70b95-v1:"
+        "a64b8ced44af225269e39ae8e9209760d9189119:"
+        "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:cf1fed66de1ec262"
+    ),
+    "executor_revision": "a64b8ced44af225269e39ae8e9209760d9189119",
+    "plan_payload_sha256": (
+        "b9f94a38639a702d930b9f2e3979f1ab8dca352cb79ee38d8e15d7b924ed031b"
+    ),
+    "plan_file_sha256": (
+        "ff4dd2175cdca69abbdd0c4178a203dff7876af325ed2b4e3f425240e1efe888"
+    ),
+    "submission_receipt_payload_sha256": (
+        "95da9f164dbb995e0ad382a8541e3f5f76c80da82697ec55861842cb124d6b29"
+    ),
+    "submission_receipt_file_sha256": (
+        "9e4fc32e8d290fddaf3426f1d34b283062ea6f427ceea0876456def7327e16b7"
+    ),
+    "requested_node": "n111",
+    "allocation_id": 14636,
+    "slurm_job_id": "837823",
+    "failure_class": "compute_node_mmlsquota_daemon_unavailable_before_solver",
+    "retry_kind": "infrastructure",
+}
 REMOTE_CWD = "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/runs"
 EXECUTOR_ENTRYPOINT = "tools/mft_goal_execute_corrected_thermal_checkpoint.py"
 STAGE_ENTRYPOINT = "tools/mft_goal_corrected_thermal_continuation.py"
@@ -776,6 +811,7 @@ def _execution_contract(
     task_name: str,
     dedupe_key: str,
     retention: Mapping[str, Any],
+    runtime_quota_authority: Mapping[str, Any],
 ) -> dict[str, Any]:
     value = {
         "schema": EXECUTION_PLAN_SCHEMA,
@@ -799,6 +835,9 @@ def _execution_contract(
             "tasks": 1,
             "use_auto_settings": False,
         },
+        "runtime_quota_authority": copy.deepcopy(
+            dict(runtime_quota_authority)
+        ),
         "output_storage": copy.deepcopy(dict(retention)),
         "submission_contract_sha256": contract_digest,
         "task_name": task_name,
@@ -1002,10 +1041,12 @@ def build_plan(
     *,
     checkpoint_manifest: Path,
     claim_root: Path,
+    runtime_quota_snapshot: Mapping[str, Any],
     executor_identity: Mapping[str, Any] | None = None,
     repo_root: Path = REPO_ROOT,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    observed_now = _utc_now(now)
     checkpoint = authenticate_checkpoint_manifest(checkpoint_manifest)
     executor = (
         resolve_executor_identity(repo_root)
@@ -1040,6 +1081,11 @@ def build_plan(
         }
     )[:16]
     retention = _retention_contract(checkpoint, provisional_identity)
+    runtime_quota_authority = build_runtime_quota_authority(
+        runtime_quota_snapshot,
+        retention=retention,
+        now=observed_now,
+    )
     contract = {
         "checkpoint": {
             key: checkpoint[key]
@@ -1068,6 +1114,10 @@ def build_plan(
         "library_revision": LIBRARY_REVISION,
         "dispatch": {"cpus": CPUS, "tasks": 1, "use_auto_settings": False},
         "retention": retention,
+        "runtime_quota_authority": runtime_quota_authority,
+        "retry_of_infrastructure": copy.deepcopy(
+            INFRASTRUCTURE_RETRY_SOURCE
+        ),
     }
     contract_digest = canonical_sha256(contract)
     dedupe = (
@@ -1081,6 +1131,7 @@ def build_plan(
         task_name=TASK_NAME,
         dedupe_key=dedupe,
         retention=retention,
+        runtime_quota_authority=runtime_quota_authority,
     )
     command = _build_command(
         checkpoint=checkpoint,
@@ -1088,7 +1139,7 @@ def build_plan(
         execution_contract=execution,
         retention=retention,
     )
-    timeout = calculate_timeout(now)
+    timeout = calculate_timeout(observed_now)
     profile = {
         "project": PROJECT,
         "remote_cwd": REMOTE_CWD,
@@ -1120,7 +1171,7 @@ def build_plan(
     value = {
         "schema_version": PLAN_SCHEMA,
         "campaign_id": CAMPAIGN_ID,
-        "created_at_utc": _utc_now(now).isoformat(),
+        "created_at_utc": observed_now.isoformat(),
         "deadline": {
             "deadline_kst": DEADLINE_TEXT,
             "package_reserve_seconds": PACKAGE_RESERVE_SECONDS,
@@ -1146,6 +1197,10 @@ def build_plan(
         "executor": executor,
         "execution_contract": execution,
         "retention": retention,
+        "runtime_quota_authority": runtime_quota_authority,
+        "retry_of_infrastructure": copy.deepcopy(
+            INFRASTRUCTURE_RETRY_SOURCE
+        ),
         "task_identity": {
             "name": TASK_NAME,
             "dedupe_key": dedupe,
@@ -1172,6 +1227,7 @@ def write_plan(
     *,
     checkpoint_manifest: Path,
     claim_root: Path,
+    runtime_quota_snapshot: Mapping[str, Any],
     output: Path,
     repo_root: Path = REPO_ROOT,
     now: datetime | None = None,
@@ -1179,6 +1235,7 @@ def write_plan(
     plan = build_plan(
         checkpoint_manifest=checkpoint_manifest,
         claim_root=claim_root,
+        runtime_quota_snapshot=runtime_quota_snapshot,
         repo_root=repo_root,
         now=now,
     )
@@ -1215,10 +1272,29 @@ def load_plan(
         "project_mutation_allowed": False,
     }:
         raise CorrectedThermalError("scheduler authority drifted")
-    if plan.get("contract_digest_sha256") != canonical_sha256(
-        plan.get("contract")
-    ):
+    contract = _mapping(plan.get("contract"), "submission contract")
+    if plan.get("contract_digest_sha256") != canonical_sha256(contract):
         raise CorrectedThermalError("submission contract digest drifted")
+    if (
+        plan.get("retry_of_infrastructure")
+        != INFRASTRUCTURE_RETRY_SOURCE
+        or contract.get("retry_of_infrastructure")
+        != INFRASTRUCTURE_RETRY_SOURCE
+    ):
+        raise CorrectedThermalError(
+            "infrastructure retry ancestry drifted"
+        )
+    runtime_quota_authority = validate_runtime_quota_authority(
+        _mapping(
+            plan.get("runtime_quota_authority"),
+            "runtime quota authority",
+        ),
+        retention=_mapping(plan.get("retention"), "retention contract"),
+    )
+    if contract.get("runtime_quota_authority") != runtime_quota_authority:
+        raise CorrectedThermalError(
+            "runtime quota authority contract binding drifted"
+        )
     executor = _mapping(plan.get("executor"), "plan executor")
     revision = _sha1(executor.get("revision"), "plan executor revision")
     if executor.get("required_ancestor") != EXECUTOR_REQUIRED_ANCESTOR:
@@ -1293,6 +1369,8 @@ def load_plan(
         or execution.get("task_name") != TASK_NAME
         or execution.get("dedupe_key") != expected_dedupe
         or execution.get("output_storage") != plan.get("retention")
+        or execution.get("runtime_quota_authority")
+        != runtime_quota_authority
     ):
         raise CorrectedThermalError("execution/submission contract binding drifted")
     claim = _mapping(plan.get("claim"), "claim contract")
@@ -1940,6 +2018,201 @@ def validate_storage_gate(
     }
 
 
+_RUNTIME_QUOTA_FIELDS = {
+    "filesystem",
+    "quota_type",
+    "uid",
+    "name",
+    "usage_bytes",
+    "soft_limit_bytes",
+    "hard_limit_bytes",
+    "in_doubt_bytes",
+    "files_used",
+    "files_soft_limit",
+    "files_hard_limit",
+    "files_in_doubt",
+}
+
+
+def build_runtime_quota_authority(
+    quota: Mapping[str, Any],
+    *,
+    retention: Mapping[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    raw = _mapping(quota, "runtime GPFS quota")
+    if set(raw) != _RUNTIME_QUOTA_FIELDS:
+        raise CorrectedThermalError("runtime GPFS quota fields drifted")
+    normalized: dict[str, Any] = {
+        "filesystem": str(raw["filesystem"]),
+        "quota_type": str(raw["quota_type"]),
+        "name": str(raw["name"]),
+    }
+    for field in _RUNTIME_QUOTA_FIELDS - {
+        "filesystem",
+        "quota_type",
+        "name",
+    }:
+        normalized[field] = _positive_int(
+            raw[field],
+            f"runtime GPFS quota {field}",
+            allow_zero=field
+            in {
+                "usage_bytes",
+                "in_doubt_bytes",
+                "files_used",
+                "files_in_doubt",
+            },
+        )
+    conservative = dict(normalized)
+    conservative["in_doubt_bytes"] += RUNTIME_QUOTA_DRIFT_RESERVE_BYTES
+    conservative["files_in_doubt"] += RUNTIME_QUOTA_DRIFT_RESERVE_INODES
+    admission = validate_storage_gate(conservative, retention)
+    observed_epoch = _utc_now(now).timestamp()
+    return sealed(
+        {
+            "schema": RUNTIME_QUOTA_AUTHORITY_SCHEMA,
+            "source": "submission-login:mmlsquota-Y",
+            "account_name": ACCOUNT,
+            "account_uid": ACCOUNT_UID,
+            "observed_at_epoch": observed_epoch,
+            "maximum_age_seconds": RUNTIME_QUOTA_AUTHORITY_MAX_AGE_SECONDS,
+            "conservatism": {
+                "maximum_usage_growth_bytes": (
+                    RUNTIME_QUOTA_DRIFT_RESERVE_BYTES
+                ),
+                "maximum_file_growth": RUNTIME_QUOTA_DRIFT_RESERVE_INODES,
+            },
+            "quota": normalized,
+            "admission": admission,
+        },
+        digest_field="payload_sha256",
+    )
+
+
+def validate_runtime_quota_authority(
+    value: Mapping[str, Any],
+    *,
+    retention: Mapping[str, Any],
+    now: datetime | None = None,
+    enforce_fresh: bool = False,
+) -> dict[str, Any]:
+    authority = validate_seal(
+        value,
+        schema_field="schema",
+        schema=RUNTIME_QUOTA_AUTHORITY_SCHEMA,
+        digest_field="payload_sha256",
+    )
+    if set(authority) != {
+        "schema",
+        "source",
+        "account_name",
+        "account_uid",
+        "observed_at_epoch",
+        "maximum_age_seconds",
+        "conservatism",
+        "quota",
+        "admission",
+        "payload_sha256",
+    }:
+        raise CorrectedThermalError("runtime quota authority fields drifted")
+    if (
+        authority.get("source") != "submission-login:mmlsquota-Y"
+        or authority.get("account_name") != ACCOUNT
+        or authority.get("account_uid") != ACCOUNT_UID
+        or authority.get("maximum_age_seconds")
+        != RUNTIME_QUOTA_AUTHORITY_MAX_AGE_SECONDS
+    ):
+        raise CorrectedThermalError("runtime quota authority identity drifted")
+    try:
+        observed_epoch = float(authority["observed_at_epoch"])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CorrectedThermalError(
+            "runtime quota authority observation time drifted"
+        ) from exc
+    if not math.isfinite(observed_epoch) or observed_epoch < 0:
+        raise CorrectedThermalError(
+            "runtime quota authority observation time drifted"
+        )
+    quota = _mapping(authority.get("quota"), "runtime quota snapshot")
+    if set(quota) != _RUNTIME_QUOTA_FIELDS:
+        raise CorrectedThermalError("runtime quota snapshot fields drifted")
+    conservatism = _mapping(
+        authority.get("conservatism"),
+        "runtime quota authority conservatism",
+    )
+    if conservatism != {
+        "maximum_usage_growth_bytes": RUNTIME_QUOTA_DRIFT_RESERVE_BYTES,
+        "maximum_file_growth": RUNTIME_QUOTA_DRIFT_RESERVE_INODES,
+    }:
+        raise CorrectedThermalError(
+            "runtime quota authority conservatism drifted"
+        )
+    conservative = dict(quota)
+    conservative["in_doubt_bytes"] += RUNTIME_QUOTA_DRIFT_RESERVE_BYTES
+    conservative["files_in_doubt"] += RUNTIME_QUOTA_DRIFT_RESERVE_INODES
+    expected_admission = validate_storage_gate(conservative, retention)
+    if authority.get("admission") != expected_admission:
+        raise CorrectedThermalError("runtime quota admission drifted")
+    if enforce_fresh:
+        age = _utc_now(now).timestamp() - observed_epoch
+        if (
+            age < -NODE_TELEMETRY_FUTURE_TOLERANCE_SECONDS
+            or age > RUNTIME_QUOTA_AUTHORITY_MAX_AGE_SECONDS
+        ):
+            raise CorrectedThermalError(
+                f"runtime quota authority is stale/future: {age:.3f}s"
+            )
+    return authority
+
+
+def validate_infrastructure_retry_source(
+    task: Mapping[str, Any],
+    *,
+    stdout: str,
+    stderr: str,
+) -> dict[str, Any]:
+    value = _mapping(task, "infrastructure retry source task")
+    source = INFRASTRUCTURE_RETRY_SOURCE
+    status = str(value.get("status") or value.get("state") or "").lower()
+    failure = str(value.get("failure_message") or "")
+    if (
+        _task_id(value) != source["task_id"]
+        or value.get("name") != source["task_name"]
+        or value.get("dedupe_key") != source["dedupe_key"]
+        or value.get("project") != PROJECT
+        or value.get("account_name") != ACCOUNT
+        or status != "failed"
+        or isinstance(value.get("exit_code"), bool)
+        or value.get("exit_code") != 2
+        or value.get("requested_node_name") != source["requested_node"]
+        or value.get("actual_node_name") != source["requested_node"]
+        or value.get("allocation_node_name") != source["requested_node"]
+        or value.get("placement_contract_satisfied") is not True
+        or value.get("allocation_id") != source["allocation_id"]
+        or str(value.get("slurm_job_id") or "") != source["slurm_job_id"]
+        or "mmlsquota failed rc=50" not in failure
+        or "Failed to connect to file system daemon" not in failure
+        or "GPFS is down on this node" not in stderr
+        or "CORRECTED_THERMAL_JSON " in stdout
+    ):
+        raise CorrectedThermalError(
+            "infrastructure retry source is not the exact pre-solver "
+            "mmlsquota failure"
+        )
+    return {
+        "task_id": source["task_id"],
+        "status": "failed",
+        "exit_code": 2,
+        "failure_class": source["failure_class"],
+        "node": source["requested_node"],
+        "allocation_id": source["allocation_id"],
+        "slurm_job_id": source["slurm_job_id"],
+        "stdout_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
+    }
+
+
 def _capacity_params() -> dict[str, Any]:
     return {
         "cpus": CPUS,
@@ -1968,6 +2241,27 @@ def fresh_gates(
         raise CorrectedThermalError(
             "sealed plan timeout no longer fits the deadline; create a fresh plan"
         )
+    runtime_quota = validate_runtime_quota_authority(
+        _mapping(
+            plan.get("runtime_quota_authority"),
+            "runtime quota authority",
+        ),
+        retention=plan["retention"],
+        now=now,
+        enforce_fresh=True,
+    )
+    source_task_id = int(INFRASTRUCTURE_RETRY_SOURCE["task_id"])
+    infrastructure_retry = validate_infrastructure_retry_source(
+        client.get_json(f"/api/tasks/{source_task_id}"),
+        stdout=client.get_text(
+            f"/api/tasks/{source_task_id}/stdout",
+            {"max_bytes": 16 * 1024**2},
+        ),
+        stderr=client.get_text(
+            f"/api/tasks/{source_task_id}/stderr",
+            {"max_bytes": 16 * 1024**2},
+        ),
+    )
     inventory = complete_task_inventory(client)
     collision = classify_collisions(
         inventory["rows"],
@@ -1983,10 +2277,43 @@ def fresh_gates(
         client.get_json("/api/task-capacity", _capacity_params()),
         now=now,
     )
-    storage = validate_storage_gate(storage_probe(), plan["retention"])
+    fresh_quota = _mapping(storage_probe(), "fresh GPFS quota")
+    storage = validate_storage_gate(fresh_quota, plan["retention"])
+    sealed_quota = _mapping(
+        runtime_quota["quota"], "sealed runtime quota snapshot"
+    )
+    conservatism = _mapping(
+        runtime_quota["conservatism"],
+        "sealed runtime quota conservatism",
+    )
+    fresh_usage = int(fresh_quota["usage_bytes"]) + int(
+        fresh_quota["in_doubt_bytes"]
+    )
+    sealed_usage_ceiling = int(sealed_quota["usage_bytes"]) + int(
+        sealed_quota["in_doubt_bytes"]
+    ) + int(conservatism["maximum_usage_growth_bytes"])
+    fresh_files = int(fresh_quota["files_used"]) + int(
+        fresh_quota["files_in_doubt"]
+    )
+    sealed_files_ceiling = int(sealed_quota["files_used"]) + int(
+        sealed_quota["files_in_doubt"]
+    ) + int(conservatism["maximum_file_growth"])
+    if (
+        fresh_usage > sealed_usage_ceiling
+        or fresh_files > sealed_files_ceiling
+    ):
+        raise CorrectedThermalError(
+            "fresh GPFS quota exceeded the sealed conservative authority"
+        )
     return {
         "observed_at_utc": _utc_now(now).isoformat(),
         "deadline_timeout_seconds": planned_timeout,
+        "runtime_quota_authority": {
+            "payload_sha256": runtime_quota["payload_sha256"],
+            "observed_at_epoch": runtime_quota["observed_at_epoch"],
+            "maximum_age_seconds": runtime_quota["maximum_age_seconds"],
+        },
+        "retry_of_infrastructure": infrastructure_retry,
         "inventory": {
             key: value for key, value in inventory.items() if key != "rows"
         },
@@ -1995,6 +2322,13 @@ def fresh_gates(
         "licenses": licenses,
         "node": node,
         "storage": storage,
+        "storage_vs_sealed_authority": {
+            "fresh_usage_bytes": fresh_usage,
+            "sealed_usage_ceiling_bytes": sealed_usage_ceiling,
+            "fresh_files": fresh_files,
+            "sealed_files_ceiling": sealed_files_ceiling,
+            "passed": True,
+        },
     }
 
 
@@ -2248,8 +2582,8 @@ def submit_plan(
         )
         body = build_submission_body(plan)
         winner = {
-            "immediate_task_id": SOURCE_LOGICAL_TASK_ID,
-            "immediate_retry_kind": "none",
+            "immediate_task_id": INFRASTRUCTURE_RETRY_SOURCE["task_id"],
+            "immediate_retry_kind": "infrastructure",
             "plan_payload_sha256": plan["plan_payload_sha256"],
             "plan_file_sha256": sha256_file(plan_path),
             "profile_sha256": canonical_sha256(body),
@@ -3167,6 +3501,27 @@ def _storage_probe_from_args(args: argparse.Namespace) -> Callable[[], dict]:
     )
 
 
+def _runtime_quota_from_plan_args(args: argparse.Namespace) -> dict[str, Any]:
+    required = {
+        "--ssh-host": args.ssh_host,
+        "--ssh-private-key": args.ssh_private_key,
+        "--known-hosts": args.known_hosts,
+    }
+    missing = [name for name, value in required.items() if value in {None, ""}]
+    if missing:
+        raise CorrectedThermalError(
+            "plan requires a fresh login-node GPFS quota probe: "
+            + ", ".join(missing)
+        )
+    return probe_gpfs_quota(
+        host=args.ssh_host,
+        username=ACCOUNT,
+        private_key=args.ssh_private_key,
+        known_hosts=args.known_hosts,
+        port=args.ssh_port,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3176,6 +3531,10 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--claim-root", required=True, type=Path)
     plan.add_argument("--output", required=True, type=Path)
     plan.add_argument("--repo-root", type=Path, default=REPO_ROOT)
+    plan.add_argument("--ssh-host", required=True)
+    plan.add_argument("--ssh-port", type=int, default=22)
+    plan.add_argument("--ssh-private-key", required=True, type=Path)
+    plan.add_argument("--known-hosts", required=True, type=Path)
 
     validate = commands.add_parser("validate-plan")
     validate.add_argument("--plan", required=True, type=Path)
@@ -3216,6 +3575,7 @@ def main(argv: list[str] | None = None) -> int:
             path = write_plan(
                 checkpoint_manifest=args.checkpoint_manifest,
                 claim_root=args.claim_root,
+                runtime_quota_snapshot=_runtime_quota_from_plan_args(args),
                 output=args.output,
                 repo_root=args.repo_root,
             )

@@ -190,6 +190,7 @@ def _plan(tmp_path: Path) -> tuple[dict, Path]:
     value = submission.build_plan(
         checkpoint_manifest=checkpoint,
         claim_root=tmp_path / "claims",
+        runtime_quota_snapshot=_quota(),
         executor_identity=_executor_identity(),
         now=NOW,
     )
@@ -220,7 +221,9 @@ def _license() -> dict:
     }
 
 
-def _allocation(node: str = "n111", state: str = "mix") -> dict:
+def _allocation(
+    node: str = submission.TARGET_NODE, state: str = "mix"
+) -> dict:
     return {
         "id": 1,
         "account_name": "dw16",
@@ -268,7 +271,41 @@ class FakeScheduler:
         self.rows = list(rows or [])
         self.post_calls = 0
         self.response_loss = False
-        self.stdout: dict[int, str] = {}
+        source_id = submission.INFRASTRUCTURE_RETRY_SOURCE["task_id"]
+        self.stdout: dict[int, str] = {
+            source_id: "executor tools authenticated\n"
+        }
+        self.stderr: dict[int, str] = {
+            source_id: (
+                "Failed to connect to file system daemon: No such process\n"
+                "mmlsquota: GPFS is down on this node.\n"
+            )
+        }
+
+    def _infrastructure_source(self) -> dict:
+        source = submission.INFRASTRUCTURE_RETRY_SOURCE
+        return {
+            "id": source["task_id"],
+            "task_id": source["task_id"],
+            "name": source["task_name"],
+            "dedupe_key": source["dedupe_key"],
+            "project": submission.PROJECT,
+            "account_name": submission.ACCOUNT,
+            "status": "failed",
+            "state": "failed",
+            "exit_code": 2,
+            "requested_node_name": source["requested_node"],
+            "actual_node_name": source["requested_node"],
+            "allocation_node_name": source["requested_node"],
+            "placement_contract_satisfied": True,
+            "allocation_id": source["allocation_id"],
+            "slurm_job_id": source["slurm_job_id"],
+            "failure_message": (
+                "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
+                "mmlsquota failed rc=50: Failed to connect to file system "
+                "daemon: No such process"
+            ),
+        }
 
     def _page(self, params: dict) -> dict:
         before_id = int(params["before_id"])
@@ -330,12 +367,18 @@ class FakeScheduler:
             return _capacity()
         if path.startswith("/api/tasks/"):
             task_id = int(path.rsplit("/", 1)[-1])
+            if task_id == submission.INFRASTRUCTURE_RETRY_SOURCE["task_id"]:
+                return self._infrastructure_source()
             return next(row for row in self.rows if row["id"] == task_id)
         raise AssertionError(path)
 
     def get_text(self, path: str, params: dict | None = None) -> str:
         task_id = int(path.split("/")[3])
-        return self.stdout[task_id]
+        return (
+            self.stderr[task_id]
+            if path.endswith("/stderr")
+            else self.stdout[task_id]
+        )
 
     def post_json(self, path: str, body: dict):
         assert path == "/api/tasks"
@@ -347,7 +390,7 @@ class FakeScheduler:
             "task_id": 100001,
             "status": "queued",
             "state": "queued",
-            "requested_node_name": "n111",
+            "requested_node_name": submission.TARGET_NODE,
             "requested_node_name_policy": "strict",
             "preferred_node_relaxed": False,
             "actual_node_name": "",
@@ -367,7 +410,7 @@ def test_plan_binds_fresh_executor_and_two_tier_storage(tmp_path: Path) -> None:
     assert plan["executor"]["revision"] == "b" * 40
     assert plan["submission_profile"]["cpus"] == 8
     assert plan["submission_profile"]["memory_mb"] == 294912
-    assert plan["submission_profile"]["node_name"] == "n111"
+    assert plan["submission_profile"]["node_name"] == submission.TARGET_NODE
     assert plan["submission_profile"]["same_node_as_task_id"] == 0
     assert plan["submission_profile"]["timeout_seconds"] == 21600
     storage = plan["execution_contract"]["output_storage"]
@@ -376,7 +419,16 @@ def test_plan_binds_fresh_executor_and_two_tier_storage(tmp_path: Path) -> None:
     )
     assert storage["minimum_scratch_working_shadow_bytes"] == 256 * 1024**3
     assert storage["maximum_minimum_bundle_bytes"] == 4 * 1024**3
-    assert "test \"$host\" = 'n111'" in plan["canonical_command"]
+    assert (
+        f"test \"$host\" = '{submission.TARGET_NODE}'"
+        in plan["canonical_command"]
+    )
+    assert plan["retry_of_infrastructure"] == (
+        submission.INFRASTRUCTURE_RETRY_SOURCE
+    )
+    assert plan["runtime_quota_authority"]["source"] == (
+        "submission-login:mmlsquota-Y"
+    )
     assert "test \"$host\" != 'n114'" in plan["canonical_command"]
     assert "--execution-plan" in plan["canonical_command"]
 
@@ -449,7 +501,10 @@ def test_node_and_license_gates_reject_relaxation() -> None:
     assert accepted_closed["telemetry_carrier_allocation_state"] == "closed"
     bad = _capacity()
     bad["allocations"] = [{"node_name": "n114"}]
-    with pytest.raises(submission.CorrectedThermalError, match="n111"):
+    with pytest.raises(
+        submission.CorrectedThermalError,
+        match=submission.TARGET_NODE,
+    ):
         submission.validate_node_gate([_allocation()], bad, now=NOW)
     stale = _license()
     stale["admission"]["snapshot_age_seconds"] = 121
@@ -506,6 +561,70 @@ def test_default_submit_is_get_only(tmp_path: Path) -> None:
     assert scheduler.post_calls == 0
 
 
+def test_runtime_quota_authority_and_infrastructure_source_fail_closed(
+    tmp_path: Path,
+) -> None:
+    plan, _path = _plan(tmp_path)
+    authority = plan["runtime_quota_authority"]
+    with pytest.raises(
+        submission.CorrectedThermalError, match="stale/future"
+    ):
+        submission.validate_runtime_quota_authority(
+            authority,
+            retention=plan["retention"],
+            now=datetime.fromtimestamp(
+                authority["observed_at_epoch"]
+                + submission.RUNTIME_QUOTA_AUTHORITY_MAX_AGE_SECONDS
+                + 1,
+                tz=NOW.tzinfo,
+            ),
+            enforce_fresh=True,
+        )
+
+    scheduler = FakeScheduler(plan)
+    source = scheduler._infrastructure_source()
+    accepted = submission.validate_infrastructure_retry_source(
+        source,
+        stdout=scheduler.stdout[source["id"]],
+        stderr=scheduler.stderr[source["id"]],
+    )
+    assert accepted["failure_class"] == (
+        submission.INFRASTRUCTURE_RETRY_SOURCE["failure_class"]
+    )
+    with pytest.raises(
+        submission.CorrectedThermalError,
+        match="exact pre-solver",
+    ):
+        submission.validate_infrastructure_retry_source(
+            source,
+            stdout="CORRECTED_THERMAL_JSON {}\n",
+            stderr=scheduler.stderr[source["id"]],
+        )
+
+
+def test_apply_time_quota_cannot_exceed_sealed_conservative_ceiling(
+    tmp_path: Path,
+) -> None:
+    plan, path = _plan(tmp_path)
+    scheduler = FakeScheduler(plan)
+    worse = _quota()
+    worse["usage_bytes"] += (
+        submission.RUNTIME_QUOTA_DRIFT_RESERVE_BYTES + 1
+    )
+    with pytest.raises(
+        submission.CorrectedThermalError,
+        match="sealed conservative authority",
+    ):
+        submission.submit_plan(
+            path,
+            client=scheduler,
+            storage_probe=lambda: worse,
+            now=NOW,
+            verify_local_files=False,
+        )
+    assert scheduler.post_calls == 0
+
+
 @pytest.mark.parametrize("response_loss", [False, True])
 def test_apply_posts_once_and_finalizes_durable_claim(
     tmp_path: Path, response_loss: bool
@@ -537,7 +656,7 @@ def _submitted_readback(plan: dict) -> tuple[dict, dict]:
         "task_id": 100001,
         "status": "queued",
         "state": "queued",
-        "requested_node_name": "n111",
+        "requested_node_name": submission.TARGET_NODE,
         "requested_node_name_policy": "strict",
         "preferred_node_relaxed": False,
         "actual_node_name": "",

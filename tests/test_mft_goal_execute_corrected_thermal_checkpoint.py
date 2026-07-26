@@ -5,9 +5,12 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
+
+from tools import mft_goal_corrected_thermal_submission as submission
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -159,6 +162,71 @@ def _checkpoint(root: Path) -> tuple[Path, dict]:
 def _execution_plan(
     path: Path, checkpoint_authentication: dict
 ) -> Path:
+    storage = {
+        "mode": "node_local_scratch_with_gpfs_minimum_retention",
+        "scratch_root": str(path.parent / "scratch"),
+        "minimum_scratch_working_shadow_bytes": (
+            executor.MINIMUM_SCRATCH_WORKING_SHADOW_BYTES
+        ),
+        "retained_filesystem": "gpfs",
+        "retained_root": str(path.parent / "retained"),
+        "maximum_minimum_bundle_bytes": (
+            executor.MAXIMUM_MINIMUM_BUNDLE_BYTES
+        ),
+        "minimum_retained_headroom_after_bytes": (
+            executor.MINIMUM_RETAINED_HEADROOM_BYTES
+        ),
+        "minimum_retained_inode_headroom_after": (
+            executor.MINIMUM_RETAINED_INODE_HEADROOM
+        ),
+    }
+    gib = 1024**3
+    quota = {
+        "filesystem": "gpfs",
+        "quota_type": "USR",
+        "uid": executor.ACCOUNT_UID,
+        "name": executor.ACCOUNT_NAME,
+        "usage_bytes": 100 * gib,
+        "soft_limit_bytes": 400 * gib,
+        "hard_limit_bytes": 450 * gib,
+        "in_doubt_bytes": 1 * gib,
+        "files_used": 1000,
+        "files_soft_limit": 100_000,
+        "files_hard_limit": 110_000,
+        "files_in_doubt": 10,
+    }
+    authority = {
+        "schema": executor.RUNTIME_QUOTA_AUTHORITY_SCHEMA,
+        "source": "submission-login:mmlsquota-Y",
+        "account_name": executor.ACCOUNT_NAME,
+        "account_uid": executor.ACCOUNT_UID,
+        "observed_at_epoch": time.time(),
+        "maximum_age_seconds": (
+            executor.RUNTIME_QUOTA_AUTHORITY_MAX_AGE_SECONDS
+        ),
+        "conservatism": {
+            "maximum_usage_growth_bytes": (
+                executor.RUNTIME_QUOTA_DRIFT_RESERVE_BYTES
+            ),
+            "maximum_file_growth": (
+                executor.RUNTIME_QUOTA_DRIFT_RESERVE_INODES
+            ),
+        },
+        "quota": quota,
+        "admission": {
+            "filesystem": "gpfs",
+            "quota_type": "USR",
+            "available_before_bytes": 283 * gib,
+            "retention_budget_bytes": 4 * gib,
+            "headroom_after_bytes": 279 * gib,
+            "available_before_inodes": 94_894,
+            "retention_budget_inodes": 32,
+            "headroom_after_inodes": 94_862,
+        },
+    }
+    authority["payload_sha256"] = executor.hashlib.sha256(
+        executor.canonical_json_bytes(authority)
+    ).hexdigest()
     plan = {
         "schema": executor.EXECUTION_PLAN_SCHEMA,
         "diagnostic_only": True,
@@ -174,24 +242,8 @@ def _execution_plan(
             "tasks": 1,
             "use_auto_settings": False,
         },
-        "output_storage": {
-            "mode": "node_local_scratch_with_gpfs_minimum_retention",
-            "scratch_root": str(path.parent / "scratch"),
-            "minimum_scratch_working_shadow_bytes": (
-                executor.MINIMUM_SCRATCH_WORKING_SHADOW_BYTES
-            ),
-            "retained_filesystem": "gpfs",
-            "retained_root": str(path.parent / "retained"),
-            "maximum_minimum_bundle_bytes": (
-                executor.MAXIMUM_MINIMUM_BUNDLE_BYTES
-            ),
-            "minimum_retained_headroom_after_bytes": (
-                executor.MINIMUM_RETAINED_HEADROOM_BYTES
-            ),
-            "minimum_retained_inode_headroom_after": (
-                executor.MINIMUM_RETAINED_INODE_HEADROOM
-            ),
-        },
+        "runtime_quota_authority": authority,
+        "output_storage": storage,
     }
     plan["plan_payload_sha256"] = executor.hashlib.sha256(
         executor.canonical_json_bytes(plan)
@@ -400,32 +452,115 @@ def test_retained_output_quota_admission_accounts_for_clone_and_growth(
     plan = executor.authenticate_execution_plan(plan_path, authenticated)
     gib = 1024**3
     monkeypatch.setattr(
-        executor,
-        "_quota_snapshot",
-        lambda _filesystem: {
-            "filesystem": "gpfs",
-            "quota_type": "USR",
-            "uid": 1,
-            "name": "test",
-            "usage_bytes": 100 * gib,
-            "soft_limit_bytes": 400 * gib,
-            "hard_limit_bytes": 450 * gib,
-            "in_doubt_bytes": 1 * gib,
-            "files_used": 1000,
-            "files_soft_limit": 100_000,
-            "files_hard_limit": 110_000,
-            "files_in_doubt": 10,
-        },
+        executor.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(
+            f_bavail=100 * gib // 4096,
+            f_frsize=4096,
+            f_flag=0,
+            f_fsid=authenticated["filesystem_evidence"]["after_copy"][
+                "fsid"
+            ],
+        ),
+        raising=False,
     )
-
     result = executor.admit_retained_output_storage(
         authenticated, plan, tmp_path / "scratch"
     )
 
     assert result["passed"] is True
     assert result["minimum_bundle_budget_bytes"] == 4 * gib
+    assert result["quota_source"] == (
+        "sealed_fresh_login_node_mmlsquota_authority"
+    )
+    assert result["retained_physical_required_bytes"] == 54 * gib
     assert result["scratch_required_bytes"] > (
         executor.MINIMUM_SCRATCH_WORKING_SHADOW_BYTES
+    )
+
+
+@pytest.mark.parametrize(
+    ("free_bytes", "flags", "fsid_delta", "message"),
+    [
+        (54 * 1024**3 - 4096, 0, 0, "physical free space"),
+        (100 * 1024**3, 1, 0, "read-only"),
+        (100 * 1024**3, 0, 1, "filesystem identity"),
+    ],
+)
+def test_retained_output_statvfs_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    free_bytes: int,
+    flags: int,
+    fsid_delta: int,
+    message: str,
+) -> None:
+    checkpoint, _manifest = _checkpoint(tmp_path)
+    authenticated = executor.authenticate_checkpoint(checkpoint)
+    plan_path = _execution_plan(tmp_path / "plan.json", authenticated)
+    plan = executor.authenticate_execution_plan(plan_path, authenticated)
+    expected_fsid = authenticated["filesystem_evidence"]["after_copy"][
+        "fsid"
+    ]
+    monkeypatch.setattr(
+        executor.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(
+            f_bavail=free_bytes // 4096,
+            f_frsize=4096,
+            f_flag=flags,
+            f_fsid=expected_fsid + fsid_delta,
+        ),
+        raising=False,
+    )
+    with pytest.raises(executor.ContinuationError, match=message):
+        executor.admit_retained_output_storage(
+            authenticated, plan, tmp_path / "scratch"
+        )
+
+
+def test_submission_and_executor_runtime_quota_contract_match() -> None:
+    gib = 1024**3
+    retention = {
+        "mode": "node_local_scratch_with_gpfs_minimum_retention",
+        "scratch_root": "/enroot/mft-corrected-test/output",
+        "minimum_scratch_working_shadow_bytes": 256 * gib,
+        "retained_filesystem": "gpfs",
+        "retained_root": "/gpfs/home1/r1jae262/test",
+        "maximum_minimum_bundle_bytes": 4 * gib,
+        "minimum_retained_headroom_after_bytes": 8 * gib,
+        "minimum_retained_inode_headroom_after": 4096,
+    }
+    quota = {
+        "filesystem": "gpfs",
+        "quota_type": "USR",
+        "uid": executor.ACCOUNT_UID,
+        "name": executor.ACCOUNT_NAME,
+        "usage_bytes": 100 * gib,
+        "soft_limit_bytes": 400 * gib,
+        "hard_limit_bytes": 450 * gib,
+        "in_doubt_bytes": 1 * gib,
+        "files_used": 1000,
+        "files_soft_limit": 100_000,
+        "files_hard_limit": 110_000,
+        "files_in_doubt": 10,
+    }
+    observed = time.time()
+    authority = submission.build_runtime_quota_authority(
+        quota,
+        retention=retention,
+        now=submission.datetime.fromtimestamp(
+            observed, tz=submission.timezone.utc
+        ),
+    )
+    authenticated = executor._authenticate_runtime_quota_authority(
+        authority,
+        storage=retention,
+        now_epoch=observed,
+    )
+    assert authenticated["payload_sha256"] == authority["payload_sha256"]
+    assert authenticated["age_seconds_at_execution"] == pytest.approx(
+        0.0, abs=1e-5
     )
 
 

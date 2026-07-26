@@ -41,6 +41,9 @@ if str(REPO_ROOT) not in sys.path:
 CHECKPOINT_SCHEMA = "mft-corrected-thermal-static-checkpoint-v3"
 RECEIPT_SCHEMA = "mft-corrected-thermal-checkpoint-execution-v1"
 EXECUTION_PLAN_SCHEMA = "mft-corrected-thermal-execution-plan-v1"
+RUNTIME_QUOTA_AUTHORITY_SCHEMA = (
+    "mft-corrected-thermal-runtime-quota-authority-v1"
+)
 SOURCE_SOLVER_REVISION = "a1e4f70cefa1af04673c73a6131bf490c0cc14b5"
 EXECUTOR_REQUIRED_ANCESTOR = "a927ef7ba7d4b5577e47a43377922dacd77b1993"
 PYAEDT_LIBRARY_REVISION = "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
@@ -52,12 +55,17 @@ THERMAL_DESIGN = "icepak_thermal"
 THERMAL_SETUP = "ThermalSetup"
 CORES = 8
 TASKS = 1
+ACCOUNT_NAME = "r1jae262"
+ACCOUNT_UID = 1455
+RUNTIME_QUOTA_AUTHORITY_MAX_AGE_SECONDS = 1_800
+RUNTIME_QUOTA_FUTURE_TOLERANCE_SECONDS = 5.0
+RUNTIME_QUOTA_DRIFT_RESERVE_BYTES = 16 * 1024**3
+RUNTIME_QUOTA_DRIFT_RESERVE_INODES = 4_096
 FAN_VELOCITY_M_S = 1.5
 TIM_CONDUCTIVITY_W_MK = 0.2
 PAD_THICKNESS_MM = 2.0
 SIZE_LIMITS_MM = (1200.0, 1000.0, 750.0)
 COPY_CHUNK_BYTES = 8 * 1024 * 1024
-GPFS_QUOTA_BINARY = Path("/usr/lpp/mmfs/bin/mmlsquota")
 MINIMUM_SCRATCH_WORKING_SHADOW_BYTES = 256 * 1024**3
 MAXIMUM_MINIMUM_BUNDLE_BYTES = 4 * 1024**3
 MINIMUM_RETAINED_HEADROOM_BYTES = 8 * 1024**3
@@ -680,6 +688,205 @@ def authenticate_checkpoint(checkpoint: Path) -> dict[str, Any]:
     }
 
 
+_RUNTIME_QUOTA_FIELDS = {
+    "filesystem",
+    "quota_type",
+    "uid",
+    "name",
+    "usage_bytes",
+    "soft_limit_bytes",
+    "hard_limit_bytes",
+    "in_doubt_bytes",
+    "files_used",
+    "files_soft_limit",
+    "files_hard_limit",
+    "files_in_doubt",
+}
+
+
+def _authenticate_runtime_quota_authority(
+    value: Any,
+    *,
+    storage: Mapping[str, Any],
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    authority = dict(
+        _required_mapping(
+            value,
+            "runtime quota authority",
+            {
+                "schema",
+                "source",
+                "account_name",
+                "account_uid",
+                "observed_at_epoch",
+                "maximum_age_seconds",
+                "conservatism",
+                "quota",
+                "admission",
+                "payload_sha256",
+            },
+        )
+    )
+    if set(authority) != {
+        "schema",
+        "source",
+        "account_name",
+        "account_uid",
+        "observed_at_epoch",
+        "maximum_age_seconds",
+        "conservatism",
+        "quota",
+        "admission",
+        "payload_sha256",
+    }:
+        raise ContinuationError("runtime quota authority fields mismatch")
+    payload_hash = _exact_hex(
+        authority["payload_sha256"],
+        64,
+        "runtime quota authority payload SHA-256",
+    )
+    unsigned = dict(authority)
+    unsigned.pop("payload_sha256")
+    if hashlib.sha256(canonical_json_bytes(unsigned)).hexdigest() != payload_hash:
+        raise ContinuationError(
+            "runtime quota authority payload SHA-256 mismatch"
+        )
+    if (
+        authority["schema"] != RUNTIME_QUOTA_AUTHORITY_SCHEMA
+        or authority["source"] != "submission-login:mmlsquota-Y"
+        or authority["account_name"] != ACCOUNT_NAME
+        or authority["account_uid"] != ACCOUNT_UID
+        or authority["maximum_age_seconds"]
+        != RUNTIME_QUOTA_AUTHORITY_MAX_AGE_SECONDS
+    ):
+        raise ContinuationError("runtime quota authority identity mismatch")
+    try:
+        observed_at = float(authority["observed_at_epoch"])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ContinuationError(
+            "runtime quota authority observation time is invalid"
+        ) from exc
+    age = (time.time() if now_epoch is None else float(now_epoch)) - observed_at
+    if (
+        not math.isfinite(age)
+        or age < -RUNTIME_QUOTA_FUTURE_TOLERANCE_SECONDS
+        or age > RUNTIME_QUOTA_AUTHORITY_MAX_AGE_SECONDS
+    ):
+        raise ContinuationError(
+            f"runtime quota authority is stale/future: age={age:.3f}s"
+        )
+    quota = dict(
+        _required_mapping(
+            authority["quota"],
+            "runtime quota snapshot",
+            _RUNTIME_QUOTA_FIELDS,
+        )
+    )
+    if set(quota) != _RUNTIME_QUOTA_FIELDS:
+        raise ContinuationError("runtime quota snapshot fields mismatch")
+    if (
+        quota["filesystem"] != "gpfs"
+        or quota["quota_type"] != "USR"
+        or quota["uid"] != ACCOUNT_UID
+        or quota["name"] != ACCOUNT_NAME
+    ):
+        raise ContinuationError("runtime quota snapshot identity mismatch")
+    conservatism = dict(
+        _required_mapping(
+            authority["conservatism"],
+            "runtime quota authority conservatism",
+            {
+                "maximum_usage_growth_bytes",
+                "maximum_file_growth",
+            },
+        )
+    )
+    if conservatism != {
+        "maximum_usage_growth_bytes": RUNTIME_QUOTA_DRIFT_RESERVE_BYTES,
+        "maximum_file_growth": RUNTIME_QUOTA_DRIFT_RESERVE_INODES,
+    }:
+        raise ContinuationError(
+            "runtime quota authority conservatism mismatch"
+        )
+    integer_fields = _RUNTIME_QUOTA_FIELDS - {
+        "filesystem",
+        "quota_type",
+        "name",
+    }
+    for field in integer_fields:
+        raw = quota[field]
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            raise ContinuationError(
+                f"runtime quota field is invalid: {field}"
+            )
+    budget_bytes = int(storage["maximum_minimum_bundle_bytes"])
+    budget_inodes = 32
+    usage = (
+        int(quota["usage_bytes"])
+        + int(quota["in_doubt_bytes"])
+        + RUNTIME_QUOTA_DRIFT_RESERVE_BYTES
+    )
+    files_used = (
+        int(quota["files_used"])
+        + int(quota["files_in_doubt"])
+        + RUNTIME_QUOTA_DRIFT_RESERVE_INODES
+    )
+    shadow = {
+        "soft_headroom_after_bytes": (
+            int(quota["soft_limit_bytes"]) - usage - budget_bytes
+        ),
+        "hard_headroom_after_bytes": (
+            int(quota["hard_limit_bytes"]) - usage - budget_bytes
+        ),
+        "soft_inode_headroom_after": (
+            int(quota["files_soft_limit"]) - files_used - budget_inodes
+        ),
+        "hard_inode_headroom_after": (
+            int(quota["files_hard_limit"]) - files_used - budget_inodes
+        ),
+    }
+    expected_admission = {
+        "filesystem": "gpfs",
+        "quota_type": "USR",
+        "available_before_bytes": min(
+            int(quota["soft_limit_bytes"]),
+            int(quota["hard_limit_bytes"]),
+        )
+        - usage,
+        "retention_budget_bytes": budget_bytes,
+        "headroom_after_bytes": min(
+            shadow["soft_headroom_after_bytes"],
+            shadow["hard_headroom_after_bytes"],
+        ),
+        "available_before_inodes": min(
+            int(quota["files_soft_limit"]),
+            int(quota["files_hard_limit"]),
+        )
+        - files_used,
+        "retention_budget_inodes": budget_inodes,
+        "headroom_after_inodes": min(
+            shadow["soft_inode_headroom_after"],
+            shadow["hard_inode_headroom_after"],
+        ),
+    }
+    if authority["admission"] != expected_admission:
+        raise ContinuationError("runtime quota admission snapshot mismatch")
+    if (
+        expected_admission["headroom_after_bytes"]
+        < int(storage["minimum_retained_headroom_after_bytes"])
+        or expected_admission["headroom_after_inodes"]
+        < int(storage["minimum_retained_inode_headroom_after"])
+    ):
+        raise ContinuationError("runtime quota authority cannot admit retention")
+    return {
+        **authority,
+        "quota": quota,
+        "age_seconds_at_execution": age,
+        "shadow": shadow,
+    }
+
+
 def authenticate_execution_plan(
     plan_path: Path,
     checkpoint_authentication: Mapping[str, Any],
@@ -802,6 +1009,10 @@ def authenticate_execution_plan(
             f"execution plan retained-output budget is insufficient: "
             f"{storage_contract}"
         )
+    runtime_quota_authority = _authenticate_runtime_quota_authority(
+        plan.get("runtime_quota_authority"),
+        storage=storage_contract,
+    )
     return {
         "path": str(resolved),
         "sha256": sha256_file(resolved),
@@ -811,6 +1022,7 @@ def authenticate_execution_plan(
         "tool_payload_sha256": tool_hash,
         "dispatch": expected_dispatch,
         "output_storage": storage_contract,
+        "runtime_quota_authority": runtime_quota_authority,
         "plan_payload_sha256": payload_hash,
     }
 
@@ -918,62 +1130,6 @@ def clone_checkpoint(
         raise
 
 
-def _quota_snapshot(filesystem: str) -> dict[str, Any]:
-    if not GPFS_QUOTA_BINARY.is_file():
-        raise ContinuationError(
-            f"required GPFS quota binary is unavailable: {GPFS_QUOTA_BINARY}"
-        )
-    process = subprocess.run(
-        [
-            str(GPFS_QUOTA_BINARY),
-            "-u",
-            str(os.getuid()),
-            "-Y",
-            filesystem,
-        ],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if process.returncode:
-        raise ContinuationError(
-            f"mmlsquota failed rc={process.returncode}: "
-            f"{process.stderr[-1000:]}"
-        )
-    rows = [
-        row
-        for row in process.stdout.splitlines()
-        if row.startswith("mmlsquota:user:0:")
-    ]
-    if len(rows) != 1:
-        raise ContinuationError(
-            f"mmlsquota returned {len(rows)} user rows"
-        )
-    values = rows[0].split(":")
-    if len(values) < 20:
-        raise ContinuationError(f"unexpected mmlsquota row: {rows[0]}")
-    snapshot = {
-        "filesystem": values[6],
-        "quota_type": values[7],
-        "uid": int(values[8]),
-        "name": values[9],
-        "usage_bytes": int(values[10]) * 1024,
-        "soft_limit_bytes": int(values[11]) * 1024,
-        "hard_limit_bytes": int(values[12]) * 1024,
-        "in_doubt_bytes": int(values[13]) * 1024,
-        "files_used": int(values[15]),
-        "files_soft_limit": int(values[16]),
-        "files_hard_limit": int(values[17]),
-        "files_in_doubt": int(values[18]),
-    }
-    if snapshot["uid"] != os.getuid() or snapshot["quota_type"] != "USR":
-        raise ContinuationError(
-            f"GPFS quota identity mismatch: {snapshot}"
-        )
-    return snapshot
-
-
 def admit_retained_output_storage(
     authentication: Mapping[str, Any],
     execution_plan: Mapping[str, Any],
@@ -1023,25 +1179,31 @@ def admit_retained_output_storage(
         raise ContinuationError(
             "minimum retention root is not on the checkpoint GPFS device"
         )
-    quota = _quota_snapshot(storage["retained_filesystem"])
+    authority = _required_mapping(
+        execution_plan.get("runtime_quota_authority"),
+        "authenticated runtime quota authority",
+        {"quota", "payload_sha256", "age_seconds_at_execution"},
+    )
+    quota = dict(
+        _required_mapping(
+            authority["quota"],
+            "authenticated runtime quota snapshot",
+            _RUNTIME_QUOTA_FIELDS,
+        )
+    )
     budget_bytes = int(storage["maximum_minimum_bundle_bytes"])
-    clone_inodes = 32
-    usage = int(quota["usage_bytes"]) + int(quota["in_doubt_bytes"])
-    files_used = int(quota["files_used"]) + int(quota["files_in_doubt"])
-    shadow = {
-        "soft_headroom_after_bytes": (
-            int(quota["soft_limit_bytes"]) - usage - budget_bytes
-        ),
-        "hard_headroom_after_bytes": (
-            int(quota["hard_limit_bytes"]) - usage - budget_bytes
-        ),
-        "soft_inode_headroom_after": (
-            int(quota["files_soft_limit"]) - files_used - clone_inodes
-        ),
-        "hard_inode_headroom_after": (
-            int(quota["files_hard_limit"]) - files_used - clone_inodes
-        ),
-    }
+    shadow = dict(
+        _required_mapping(
+            authority.get("shadow"),
+            "authenticated conservative quota shadow",
+            {
+                "soft_headroom_after_bytes",
+                "hard_headroom_after_bytes",
+                "soft_inode_headroom_after",
+                "hard_inode_headroom_after",
+            },
+        )
+    )
     minimum_bytes = int(storage["minimum_retained_headroom_after_bytes"])
     minimum_inodes = int(storage["minimum_retained_inode_headroom_after"])
     if (
@@ -1055,15 +1217,55 @@ def admit_retained_output_storage(
             f"minimum_bytes={minimum_bytes}, "
             f"minimum_inodes={minimum_inodes}"
         )
+    if not hasattr(os, "statvfs"):
+        raise ContinuationError(
+            "retained-output statvfs is unavailable on this executor"
+        )
+    retained_statvfs = os.statvfs(retained_parent)
+    retained_flags = int(getattr(retained_statvfs, "f_flag", 0))
+    if retained_flags & int(getattr(os, "ST_RDONLY", 1)):
+        raise ContinuationError("retained-output GPFS is read-only")
+    retained_fsid = int(getattr(retained_statvfs, "f_fsid", -1))
+    expected_fsid = int(
+        authentication["filesystem_evidence"]["after_copy"]["fsid"]
+    )
+    if retained_fsid != expected_fsid:
+        raise ContinuationError(
+            "retained-output GPFS filesystem identity drifted: "
+            f"{retained_fsid} != {expected_fsid}"
+        )
+    retained_physical_free = int(
+        retained_statvfs.f_bavail
+    ) * int(retained_statvfs.f_frsize)
+    retained_physical_required = (
+        budget_bytes + PHYSICAL_FREE_RESERVE_BYTES
+    )
+    if retained_physical_free < retained_physical_required:
+        raise ContinuationError(
+            "retained-output physical free space is insufficient: "
+            f"{retained_physical_free} < {retained_physical_required}"
+        )
     return {
         "schema": "mft-corrected-thermal-retained-output-admission-v1",
         "scratch_root": str(actual_scratch),
         "scratch_free_bytes": scratch_free,
         "scratch_required_bytes": scratch_required,
         "quota_before": quota,
+        "quota_source": "sealed_fresh_login_node_mmlsquota_authority",
+        "quota_authority_payload_sha256": authority["payload_sha256"],
+        "quota_authority_age_seconds": authority[
+            "age_seconds_at_execution"
+        ],
         "clone_logical_bytes": clone_bytes,
         "minimum_bundle_budget_bytes": budget_bytes,
         "retained_root": str(retained_root),
+        "retained_device": int(retained_parent.stat().st_dev),
+        "checkpoint_device": int(checkpoint_root.stat().st_dev),
+        "retained_fsid": retained_fsid,
+        "expected_checkpoint_fsid": expected_fsid,
+        "retained_readonly": False,
+        "retained_physical_free_bytes": retained_physical_free,
+        "retained_physical_required_bytes": retained_physical_required,
         "shadow": shadow,
         "passed": True,
     }

@@ -288,6 +288,52 @@ def test_partial_claim_directory_fails_closed_without_repost(tmp_path):
     assert not (claim_directory / claims.FINALIZED_CLAIM_NAME).exists()
 
 
+def test_infrastructure_retry_ancestry_is_distinct_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    root, _authority, reference = _authority_and_reference(tmp_path)
+    winner = _winner(
+        immediate_task_id=96308,
+        immediate_retry_kind="infrastructure",
+    )
+    acquired = claims.acquire_claim(
+        root,
+        reference,
+        winner,
+        nonce="7" * 32,
+        now=PENDING_TIME,
+    )
+    assert acquired["claim"]["winner"]["immediate_retry_kind"] == (
+        "infrastructure"
+    )
+
+    other_root = tmp_path / "invalid"
+    authority = claims.initialize_claim_root(
+        other_root,
+        campaign_id=CAMPAIGN_ID,
+        campaign_authority_sha256=CAMPAIGN_AUTHORITY_SHA,
+        root_id="2" * 32,
+        now=PENDING_TIME,
+    )
+    other_reference = claims.build_claim_reference(
+        authority,
+        candidate_physics_sha256=CANDIDATE_SHA,
+        logical_authority_task_id=LOGICAL_TASK_ID,
+        retry_generation=RETRY_GENERATION,
+    )
+    with pytest.raises(claims.ClaimContractError, match="ancestry"):
+        claims.acquire_claim(
+            other_root,
+            other_reference,
+            _winner(
+                immediate_task_id=LOGICAL_TASK_ID,
+                immediate_retry_kind="infrastructure",
+            ),
+            nonce="8" * 32,
+            now=PENDING_TIME,
+        )
+
+
 def test_crash_before_post_stays_pending_and_zero_or_many_fail_closed(
     tmp_path,
 ):
