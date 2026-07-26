@@ -4,11 +4,29 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 from tools import mft_goal_snapshot_live_aedt as snapshot
 from tools import mft_goal_transport_live_aedt_snapshot as transport
+
+
+def test_absolute_script_path_supports_standalone_execution(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        [sys.executable, str(Path(transport.__file__).resolve()), "--help"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--snapshot-relative-directory" in completed.stdout
 
 
 def _fixture(tmp_path: Path, *, lane: str = "full"):

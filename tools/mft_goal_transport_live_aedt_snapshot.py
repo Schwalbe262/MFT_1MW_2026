@@ -16,6 +16,9 @@ import socket
 import sys
 from typing import Any, Mapping
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from tools import mft_goal_snapshot_live_aedt as snapshot
 
 
