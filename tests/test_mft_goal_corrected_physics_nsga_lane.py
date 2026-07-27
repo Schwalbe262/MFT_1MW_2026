@@ -429,8 +429,11 @@ def test_installed_evaluator_excludes_raw_predictor_and_replaces_G(
         out["frame"].iloc[0]["split_repair_neighbor_upper_N2_main"]
         == 31
     )
-    assert out["raw_two_net_capacitance_predictor_authority_used"] is False
-    assert out["single_0p759701_transfer_ratio_used"] is False
+    assert (
+        out["raw_two_net_capacitance_predictor_authority_used"].tolist()
+        == [False]
+    )
+    assert out["single_0p759701_transfer_ratio_used"].tolist() == [False]
     assert evidence["raw_C_rx_rx_F_UCB_gate_installed"] is False
     assert evidence["single_0p759701_transfer_ratio_installed"] is False
     assert evidence["legacy_half_magnetizing_resonance_G_installed"] is False
@@ -481,6 +484,15 @@ def test_split_repair_excludes_unevaluable_zero_side_endpoint(
     )
     assert np.isfinite(out["F"]).all()
     assert np.isfinite(out["G"]).all()
+    assert all(len(value) == 2 for value in out.values())
+    assert (
+        out["raw_two_net_capacitance_predictor_authority_used"].tolist()
+        == [False, False]
+    )
+    assert out["single_0p759701_transfer_ratio_used"].tolist() == [
+        False,
+        False,
+    ]
 
 
 def test_plain_decode_bypasses_expensive_split_enumeration(

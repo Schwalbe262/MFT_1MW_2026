@@ -1315,8 +1315,15 @@ def _install_search_profile(
         out["physics_delta_Crx_q90_ucb_F"] = c_ucb
         out["physics_delta_fRx_q90_lcb_Hz"] = f_lcb
         out["physics_delta_extrapolation_distance"] = extrapolation
-        out["raw_two_net_capacitance_predictor_authority_used"] = False
-        out["single_0p759701_transfer_ratio_used"] = False
+        # Every value emitted from ``Problem._evaluate`` must be population
+        # sized because pymoo stores each key on the evaluated population.
+        # Scalar audit booleans make ``Population.set`` call ``len(False)``.
+        out["raw_two_net_capacitance_predictor_authority_used"] = np.zeros(
+            len(valid), dtype=bool
+        )
+        out["single_0p759701_transfer_ratio_used"] = np.zeros(
+            len(valid), dtype=bool
+        )
 
     base_contract = copy.deepcopy(problem.hard_constraint_contract)
     if canonical_sha256(base_contract) != problem.hard_constraint_contract_sha256:
