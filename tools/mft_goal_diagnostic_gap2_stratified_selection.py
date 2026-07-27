@@ -42,10 +42,8 @@ from module.mft_goal_20260726_contract import (  # noqa: E402
     CORE_TEMPERATURE_TARGETS,
     FIXED_COOLING_IDENTITY,
     FIXED_OPERATING_IDENTITY,
-    GOAL_SIZE_LIMITS_MM,
     PRIMARY_WINDING_TEMPERATURE_TARGETS,
     SECONDARY_WINDING_TEMPERATURE_TARGETS,
-    TEMPERATURE_TARGET_LIMITS_C,
     attest_fixed_identity,
     canonical_sha256,
 )
@@ -85,6 +83,10 @@ GAP2_MAX_MM = scout.VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
 GAP2_STEP_MM = scout.VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM
 CW2_MIN_MM = scout.SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM
 CW2_MAX_MM = scout.SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+ACCEPTANCE_SIZE_LIMITS_MM = dict(scout.EFFECTIVE_SIZE_LIMITS_MM)
+ACCEPTANCE_TEMPERATURE_LIMITS_C = dict(
+    scout.EFFECTIVE_TEMPERATURE_TARGET_LIMITS_C
+)
 GAP_STRATA = (
     ("low", 0.35, 0.90, False),
     ("mid", 0.90, 1.45, False),
@@ -118,7 +120,7 @@ REQUIRED_PHYSICAL_CONSTRAINTS = frozenset(
         CORRECTED_CAP_CONSTRAINT,
         *(
             f"temperature_robust_limit:{target}"
-            for target in TEMPERATURE_TARGET_LIMITS_C
+            for target in ACCEPTANCE_TEMPERATURE_LIMITS_C
         ),
     }
 )
@@ -128,6 +130,14 @@ CANONICAL_TRUE_COLUMNS = (
     "surrogate_physicality_passed",
     "physical_constraint_feasible",
     "physical_feasible",
+)
+RECOMPUTED_BASE_TRUE_COLUMNS = CANONICAL_TRUE_COLUMNS[:3]
+REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS = frozenset(
+    {
+        CORRECTED_CAP_CONSTRAINT,
+        scout.RAW_CRX_CONSTRAINT_NAME,
+        "half_magnetizing_resonance_minimum",
+    }
 )
 IDENTITY_COLUMNS = collector.IDENTITY_COLUMNS
 FAIL_CLOSED_FLAGS = collector.FAIL_CLOSED_FLAGS
@@ -327,7 +337,7 @@ def _file_record(path: Path, *, relative_to: Path | None = None) -> dict[str, An
 
 
 def _validate_bounded_cap_contract(record: Mapping[str, Any]) -> dict[str, Any]:
-    """Authenticate the acquisition-only capacitance authority."""
+    """Authenticate, then quarantine, the legacy acquisition authority."""
 
     ratio = _finite(
         record.get("authenticated_turn_graded_transfer_ratio"),
@@ -357,9 +367,16 @@ def _validate_bounded_cap_contract(record: Mapping[str, Any]) -> dict[str, Any]:
         "normalized_column": CORRECTED_CAP_NORMALIZED_COLUMN,
         "maximum_F": CORRECTED_CAP_MAXIMUM_F,
         "authenticated_turn_graded_transfer_ratio": ratio,
-        "ratio_use": "surrogate_acquisition_only",
+        "ratio_use": "legacy_search_acquisition_only_excluded_from_rerank",
         "corrected_acquisition_formula": (
             "corrected_UCB_F=maximum_F*(1+physical_G_corrected)"
+        ),
+        "legacy_corrected_constraint_used_for_rerank_eligibility": False,
+        "legacy_corrected_constraint_used_for_rerank_NDS": False,
+        "legacy_half_magnetizing_resonance_used_for_rerank": False,
+        "replacement_constraint": (
+            "physics_delta_Crx_q90_ucb_then_"
+            "fRx_q90_lcb_at_L2_0p2H_ge_15000Hz"
         ),
         "raw_two_net_block_C_used_for_physical_truth": False,
         "raw_two_net_block_C_used_for_ranking": False,
@@ -803,24 +820,65 @@ def _temperature_evidence(
     physical_g: Mapping[str, float],
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {}
-    for target, strict_limit in TEMPERATURE_TARGET_LIMITS_C.items():
+    for target, acceptance_limit in ACCEPTANCE_TEMPERATURE_LIMITS_C.items():
         name = f"temperature_robust_limit:{target}"
         residual = _finite(physical_g.get(name), name)
-        diagnostic_limit = DIAGNOSTIC_TEMPERATURE_LIMITS_C[target]
-        robust_temperature = diagnostic_limit + residual
-        if robust_temperature > strict_limit + 1e-12:
+        active_search_limit = DIAGNOSTIC_TEMPERATURE_LIMITS_C[target]
+        if active_search_limit != acceptance_limit:
+            raise StratifiedSelectionError(
+                f"{target} search/acceptance temperature limit drifted"
+            )
+        robust_temperature = active_search_limit + residual
+        if robust_temperature > acceptance_limit + 1e-12:
             raise StratifiedSelectionError(
                 f"{target} robust temperature {robust_temperature:.9g} C "
-                f"exceeds strict {strict_limit:.9g} C"
+                f"exceeds acceptance limit {acceptance_limit:.9g} C"
             )
         evidence[target] = {
-            "diagnostic_profile_limit_C": diagnostic_limit,
+            "active_search_limit_C": active_search_limit,
             "physical_G_C": residual,
             "realized_robust_temperature_C": robust_temperature,
-            "strict_limit_C": strict_limit,
-            "strict_margin_C": strict_limit - robust_temperature,
+            "acceptance_limit_C": acceptance_limit,
+            "acceptance_margin_C": (
+                acceptance_limit - robust_temperature
+            ),
+            "acceptance_limit_passed": (
+                robust_temperature <= acceptance_limit + 1e-12
+            ),
         }
     return evidence
+
+
+def _physics_delta_provisional_resonance_G(
+    prediction: Mapping[str, Any],
+) -> float:
+    capacitance_ucb = _finite(
+        prediction.get("physics_delta_Crx_q90_ucb_F"),
+        "physics_delta_Crx_q90_ucb_F",
+    )
+    if capacitance_ucb <= 0.0:
+        raise StratifiedSelectionError(
+            "physics-delta capacitance UCB must be positive"
+        )
+    recomputed_f_lcb = 1.0 / (
+        2.0
+        * math.pi
+        * math.sqrt(physics_reranker.FIXED_L2_H * capacitance_ucb)
+    )
+    reported_f_lcb = _finite(
+        prediction.get("physics_delta_fRx_q90_lcb_Hz"),
+        "physics_delta_fRx_q90_lcb_Hz",
+    )
+    if not math.isclose(
+        reported_f_lcb,
+        recomputed_f_lcb,
+        rel_tol=1e-12,
+        abs_tol=1e-9,
+    ):
+        raise StratifiedSelectionError(
+            "physics-delta UCB/resonance formula drifted"
+        )
+    return physics_reranker.RESONANCE_MIN_HZ - recomputed_f_lcb
 
 
 def _validate_fixed_values(decoded: Mapping[str, Any]) -> dict[str, Any]:
@@ -857,9 +915,16 @@ def _candidate_contract(
     *,
     physical_constraint_columns: Sequence[str],
 ) -> dict[str, Any]:
-    for column in CANONICAL_TRUE_COLUMNS:
+    for column in RECOMPUTED_BASE_TRUE_COLUMNS:
         if not _canonical_bool(row.get(column), column):
             raise StratifiedSelectionError(f"{column} is false")
+    legacy_feasibility_flags = {
+        column: _canonical_bool(row.get(column), column)
+        for column in (
+            "physical_constraint_feasible",
+            "physical_feasible",
+        )
+    }
     geometry_sha = _require_sha(
         row.get("physical_geometry_sha256"), "physical_geometry_sha256"
     )
@@ -905,11 +970,15 @@ def _candidate_contract(
     violations = {
         name: value
         for name, value in physical_values.items()
-        if value > 1e-12
+        if (
+            name not in REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+            and value > 1e-12
+        )
     }
     if violations:
         raise StratifiedSelectionError(
-            f"search physical constraints are positive: {violations}"
+            "latest non-capacitance physical constraints are positive: "
+            f"{violations}"
         )
     temperature_evidence = _temperature_evidence(physical_values)
 
@@ -952,22 +1021,20 @@ def _candidate_contract(
         _finite(value, "exterior dimension") for value in dimensions
     )
     for axis, value in zip(("W", "L", "H"), (width, length, height)):
-        if value > GOAL_SIZE_LIMITS_MM[axis] + 1e-9:
-            raise StratifiedSelectionError(f"decoded exterior {axis} exceeds goal")
+        if value > ACCEPTANCE_SIZE_LIMITS_MM[axis] + 1e-9:
+            raise StratifiedSelectionError(
+                f"decoded exterior {axis} exceeds active search limit"
+            )
     objective_volume = _finite(row.get("objective_volume_L"), "objective_volume_L")
     if not math.isclose(
         objective_volume, float(volume_l), rel_tol=0.0, abs_tol=1e-8
     ):
         raise StratifiedSelectionError("objective/recomputed volume drifted")
 
-    corrected_g = physical_values[CORRECTED_CAP_CONSTRAINT]
-    if corrected_g <= -1.0 or corrected_g > 0.0:
-        raise StratifiedSelectionError(
-            "corrected acquisition C residual is outside physical [-1,0]"
-        )
-    corrected_c = CORRECTED_CAP_MAXIMUM_F * (1.0 + corrected_g)
-    if not 0.0 < corrected_c <= CORRECTED_CAP_MAXIMUM_F:
-        raise StratifiedSelectionError("corrected acquisition C is nonphysical")
+    legacy_corrected_g = physical_values[CORRECTED_CAP_CONSTRAINT]
+    legacy_corrected_c = CORRECTED_CAP_MAXIMUM_F * (
+        1.0 + legacy_corrected_g
+    )
     missing_inputs = [key for key in ALL_INPUT_KEYS if decoded.get(key) is None]
     if missing_inputs:
         raise StratifiedSelectionError(
@@ -1017,14 +1084,24 @@ def _candidate_contract(
         "physical_geometry_sha256": geometry_sha,
         "decoded": decoded,
         "fixed_identity_attestation": fixed_attestation,
+        "legacy_search_feasibility_flags_not_used": legacy_feasibility_flags,
         "physical_G": physical_values,
+        "replaced_legacy_capacitance_constraints": sorted(
+            REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+        ),
         "temperature_evidence": temperature_evidence,
+        "acceptance_temperature_limits_passed": all(
+            item["acceptance_limit_passed"]
+            for item in temperature_evidence.values()
+        ),
         "realized_gap2_mm": gap2,
         "gap2_grid_index": int(grid_index),
         "gap2_stratum": _gap_stratum(gap2),
         "cw2_mm": cw2,
-        "corrected_acquisition_C_rx_rx_F_UCB_F": corrected_c,
-        "corrected_acquisition_physical_G": corrected_g,
+        "legacy_corrected_acquisition_C_rx_rx_F_diagnostic": (
+            legacy_corrected_c
+        ),
+        "legacy_corrected_acquisition_physical_G": legacy_corrected_g,
         "exterior_dimensions_mm": {"W": width, "L": length, "H": height},
         "volume_L": float(volume_l),
         "total_loss_W": _finite(
@@ -1043,19 +1120,24 @@ def _select_diverse(
     *,
     count: int,
 ) -> list[dict[str, Any]]:
-    """Select corrected-C anchor then farthest feature-space candidates."""
+    """Select physics-UCB anchor then farthest feature-space candidates."""
 
     if count < 1 or len(candidates) < count:
         raise StratifiedSelectionError("diversity pool is smaller than selection")
     ordered = sorted(
         candidates,
         key=lambda item: (
-            item["corrected_acquisition_C_rx_rx_F_UCB_F"],
+            item["physics_delta_prediction"][
+                "physics_delta_Crx_q90_ucb_F"
+            ],
+            item["physics_delta_prediction"][
+                "physics_delta_extrapolation_distance"
+            ],
             item["physical_geometry_sha256"],
         ),
     )
     for rank, item in enumerate(ordered, start=1):
-        item["corrected_acquisition_rank_in_stratum"] = rank
+        item["physics_delta_ucb_rank_in_stratum"] = rank
     pool_size = min(len(ordered), max(16, count * 8))
     pool = ordered[:pool_size]
     matrix = np.array(
@@ -1070,7 +1152,7 @@ def _select_diverse(
     normalized = (matrix - low) / np.where(span > 0.0, span, 1.0)
     normalized[:, span <= 0.0] = 0.0
     chosen = [0]
-    pool[0]["selection_role"] = "minimum_corrected_acquisition_C"
+    pool[0]["selection_role"] = "minimum_physics_delta_q90_UCB"
     pool[0]["minimum_diversity_distance_at_selection"] = None
     while len(chosen) < count:
         remaining = [index for index in range(pool_size) if index not in chosen]
@@ -1083,7 +1165,11 @@ def _select_diverse(
             scored.append(
                 (
                     -float(distances.min()),
-                    float(pool[index]["corrected_acquisition_C_rx_rx_F_UCB_F"]),
+                    float(
+                        pool[index]["physics_delta_prediction"][
+                            "physics_delta_Crx_q90_ucb_F"
+                        ]
+                    ),
                     str(pool[index]["physical_geometry_sha256"]),
                     index,
                     float(distances.min()),
@@ -1190,6 +1276,11 @@ def _merge_and_rank(
     *,
     physics_delta_model: Mapping[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]], dict[str, Any]]:
+    if physics_delta_model is None:
+        raise StratifiedSelectionError(
+            "authenticated physics-delta model is required for rerank "
+            "eligibility"
+        )
     frames: list[pd.DataFrame] = []
     for collection in collections:
         frame = collection["frame"].copy()
@@ -1203,7 +1294,23 @@ def _merge_and_rank(
     first = collections[0]
     physical = first["physical_constraint_columns"]
     normalized = first["normalized_constraint_columns"]
-    comparison = [*OBJECTIVE_COLUMNS, *physical, *normalized]
+    rerank_physical = [
+        column
+        for column in physical
+        if column.removeprefix("physical_G:")
+        not in REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+    ]
+    rerank_normalized = [
+        column
+        for column in normalized
+        if column.removeprefix("normalized_G:")
+        not in REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+    ]
+    comparison = [
+        *OBJECTIVE_COLUMNS,
+        *rerank_physical,
+        *rerank_normalized,
+    ]
     try:
         unique = global_pareto.deduplicate_physical_candidates(
             merged,
@@ -1222,12 +1329,17 @@ def _merge_and_rank(
     rejection: list[str] = []
     gap_values = np.full(len(unique), np.nan, dtype=float)
     cw2_values = np.full(len(unique), np.nan, dtype=float)
-    corrected_values = np.full(len(unique), np.nan, dtype=float)
+    legacy_corrected_values = np.full(len(unique), np.nan, dtype=float)
     physics_air_c_values = np.full(len(unique), np.nan, dtype=float)
     physics_air_f_values = np.full(len(unique), np.nan, dtype=float)
     physics_delta_mean_values = np.full(len(unique), np.nan, dtype=float)
     physics_delta_ucb_values = np.full(len(unique), np.nan, dtype=float)
     physics_delta_lcb_f_values = np.full(len(unique), np.nan, dtype=float)
+    physics_delta_resonance_g_values = np.full(
+        len(unique),
+        np.nan,
+        dtype=float,
+    )
     stratum_values = np.full(len(unique), "", dtype=object)
     for index, row in unique.iterrows():
         try:
@@ -1238,18 +1350,23 @@ def _merge_and_rank(
         except StratifiedSelectionError as exc:
             rejection.append(str(exc))
             continue
-        if physics_delta_model is not None:
-            try:
-                prediction = physics_reranker._candidate_prediction(  # noqa: SLF001
-                    candidate["decoded"],
-                    physics_delta_model,
-                )
-            except physics_reranker.RerankError as exc:
-                rejection.append(
-                    "physics log-delta prediction failed: " + str(exc)
-                )
-                continue
-            candidate["physics_delta_prediction"] = prediction
+        try:
+            prediction = physics_reranker._candidate_prediction(  # noqa: SLF001
+                candidate["decoded"],
+                physics_delta_model,
+            )
+        except physics_reranker.RerankError as exc:
+            rejection.append(
+                "physics log-delta prediction failed: " + str(exc)
+            )
+            continue
+        candidate["physics_delta_prediction"] = prediction
+        provisional_resonance_g = (
+            _physics_delta_provisional_resonance_G(prediction)
+        )
+        candidate["physics_delta_provisional_resonance_G_Hz"] = (
+            provisional_resonance_g
+        )
         candidate["merged_unique_row_index"] = int(index)
         candidate["source_seed"] = int(row["source_seed"])
         candidate["source_task_id"] = str(row["source_task_id"])
@@ -1262,61 +1379,73 @@ def _merge_and_rank(
         candidate["canonical_physical_params_sha256"] = str(
             row["canonical_physical_params_sha256"]
         )
-        eligible.append(candidate)
-        eligibility[index] = True
-        rejection.append("")
         gap_values[index] = candidate["realized_gap2_mm"]
         cw2_values[index] = candidate["cw2_mm"]
-        corrected_values[index] = candidate[
-            "corrected_acquisition_C_rx_rx_F_UCB_F"
+        legacy_corrected_values[index] = candidate[
+            "legacy_corrected_acquisition_C_rx_rx_F_diagnostic"
         ]
         physics_air_c_values[index] = candidate["physics_network_air_Ceq_F"]
         physics_air_f_values[index] = candidate[
             "physics_network_air_f_at_L2_0p2H_Hz"
         ]
-        if candidate["physics_delta_prediction"] is not None:
-            physics_delta_mean_values[index] = candidate[
-                "physics_delta_prediction"
-            ]["physics_delta_Crx_mean_F"]
-            physics_delta_ucb_values[index] = candidate[
-                "physics_delta_prediction"
-            ]["physics_delta_Crx_q90_ucb_F"]
-            physics_delta_lcb_f_values[index] = candidate[
-                "physics_delta_prediction"
-            ]["physics_delta_fRx_q90_lcb_Hz"]
+        physics_delta_mean_values[index] = prediction[
+            "physics_delta_Crx_mean_F"
+        ]
+        physics_delta_ucb_values[index] = prediction[
+            "physics_delta_Crx_q90_ucb_F"
+        ]
+        physics_delta_lcb_f_values[index] = prediction[
+            "physics_delta_fRx_q90_lcb_Hz"
+        ]
+        physics_delta_resonance_g_values[index] = provisional_resonance_g
         stratum_values[index] = candidate["gap2_stratum"]
-    unique["strict_candidate_eligible"] = eligibility
-    unique["strict_rejection_reason"] = rejection
+        if provisional_resonance_g > 1e-12:
+            rejection.append(
+                "physics-delta provisional fRx q90 LCB "
+                f"{prediction['physics_delta_fRx_q90_lcb_Hz']:.9g} Hz "
+                f"is below {physics_reranker.RESONANCE_MIN_HZ:.9g} Hz"
+            )
+            continue
+        eligible.append(candidate)
+        eligibility[index] = True
+        rejection.append("")
+    unique["latest_rerank_eligible"] = eligibility
+    unique["latest_rerank_rejection_reason"] = rejection
     unique["realized_gap2_mm"] = gap_values
     unique["cw2_mm"] = cw2_values
     unique["gap2_stratum"] = stratum_values
-    unique["corrected_acquisition_C_rx_rx_F_UCB_F"] = corrected_values
+    unique[
+        "legacy_corrected_acquisition_C_rx_rx_F_diagnostic"
+    ] = legacy_corrected_values
     unique["physics_network_air_Ceq_F"] = physics_air_c_values
     unique["physics_network_air_f_at_L2_0p2H_Hz"] = physics_air_f_values
     unique["physics_delta_Crx_mean_F"] = physics_delta_mean_values
     unique["physics_delta_Crx_q90_ucb_F"] = physics_delta_ucb_values
     unique["physics_delta_fRx_q90_lcb_Hz"] = physics_delta_lcb_f_values
-    strict_ranks = np.full(len(unique), -1, dtype=np.int64)
+    unique[
+        "physics_delta_provisional_resonance_G_Hz"
+    ] = physics_delta_resonance_g_values
+    rerank_ranks = np.full(len(unique), -1, dtype=np.int64)
     if eligible:
         eligible_indices = np.array(
             [item["merged_unique_row_index"] for item in eligible],
             dtype=np.int64,
         )
-        strict_ranks[eligible_indices] = global_pareto.nondominated_ranks_2d(
+        rerank_ranks[eligible_indices] = global_pareto.nondominated_ranks_2d(
             unique.loc[
                 eligible_indices,
                 list(OBJECTIVE_COLUMNS),
             ].to_numpy(dtype=float)
         )
         for item in eligible:
-            item["strict_feasible_nds_rank"] = int(
-                strict_ranks[item["merged_unique_row_index"]]
+            item["latest_rerank_nds_rank"] = int(
+                rerank_ranks[item["merged_unique_row_index"]]
             )
-    unique["strict_feasible_nds_rank"] = strict_ranks
+    unique["latest_rerank_nds_rank"] = rerank_ranks
     unique = unique.sort_values(
         [
-            "strict_candidate_eligible",
-            "strict_feasible_nds_rank",
+            "latest_rerank_eligible",
+            "latest_rerank_nds_rank",
             "objective_nds_rank_all",
             *OBJECTIVE_COLUMNS,
             "physical_geometry_sha256",
@@ -1327,16 +1456,24 @@ def _merge_and_rank(
     return unique, eligible, {
         "terminal_row_count": len(merged),
         "unique_physical_candidate_count": len(unique),
-        "strict_candidate_eligible_count": len(eligible),
+        "latest_rerank_eligible_count": len(eligible),
         "objective_front0_all_count": int(
             np.count_nonzero(unique["objective_nds_rank_all"].to_numpy() == 0)
         ),
-        "strict_feasible_front0_count": int(
+        "latest_rerank_front0_count": int(
             np.count_nonzero(
-                unique["strict_feasible_nds_rank"].to_numpy() == 0
+                unique["latest_rerank_nds_rank"].to_numpy() == 0
             )
         ),
         "seed_local_front_union_used": False,
+        "legacy_capacitance_constraints_excluded": sorted(
+            REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+        ),
+        "physics_delta_provisional_resonance_minimum_Hz": (
+            physics_reranker.RESONANCE_MIN_HZ
+        ),
+        "rerank_physical_constraint_columns": rerank_physical,
+        "rerank_normalized_constraint_columns": rerank_normalized,
         "global_sort_scope": (
             "all_selected_seed_terminal_population_rows_then_seed-deduplicated_"
             "physical_geometry_then_exact_2d_non_dominated_sort"
@@ -1372,11 +1509,20 @@ def _write_nds(
                 collections[0]["record"]["identities"]
             ),
             "objective_columns": list(OBJECTIVE_COLUMNS),
-            "physical_constraint_columns": list(
+            "source_physical_constraint_columns": list(
                 collections[0]["physical_constraint_columns"]
             ),
-            "normalized_constraint_columns": list(
+            "source_normalized_constraint_columns": list(
                 collections[0]["normalized_constraint_columns"]
+            ),
+            "rerank_physical_constraint_columns": list(
+                summary["rerank_physical_constraint_columns"]
+            ),
+            "rerank_normalized_constraint_columns": list(
+                summary["rerank_normalized_constraint_columns"]
+            ),
+            "legacy_capacitance_constraints_excluded": list(
+                summary["legacy_capacitance_constraints_excluded"]
             ),
             "merged_initial_nds": _file_record(csv_path, relative_to=output),
             **copy.deepcopy(dict(summary)),
@@ -1547,14 +1693,14 @@ def prepare_selection(
                             "source_task_id",
                             "terminal_population_index",
                             "objective_nds_rank_all",
-                            "strict_feasible_nds_rank",
+                            "latest_rerank_nds_rank",
                             "gap2_stratum",
                             "selection_order_in_stratum",
                             "selection_role",
                             "minimum_diversity_distance_at_selection",
-                            "corrected_acquisition_rank_in_stratum",
-                            "corrected_acquisition_C_rx_rx_F_UCB_F",
-                            "corrected_acquisition_physical_G",
+                            "physics_delta_ucb_rank_in_stratum",
+                            "legacy_corrected_acquisition_C_rx_rx_F_diagnostic",
+                            "legacy_corrected_acquisition_physical_G",
                             "realized_gap2_mm",
                             "gap2_grid_index",
                             "cw2_mm",
@@ -1562,11 +1708,13 @@ def prepare_selection(
                             "volume_L",
                             "total_loss_W",
                             "temperature_evidence",
+                            "acceptance_temperature_limits_passed",
                             "fixed_identity_attestation",
                             "physics_network",
                             "physics_network_air_Ceq_F",
                             "physics_network_air_f_at_L2_0p2H_Hz",
                             "physics_delta_prediction",
+                            "physics_delta_provisional_resonance_G_Hz",
                         )
                     }
                     | {
@@ -1666,16 +1814,22 @@ def prepare_selection(
                         "gap2_max_mm": GAP2_MAX_MM,
                         "gap2_step_mm": GAP2_STEP_MM,
                     },
-                    "size_limits_mm": copy.deepcopy(GOAL_SIZE_LIMITS_MM),
-                    "strict_temperature_limits_C": copy.deepcopy(
-                        TEMPERATURE_TARGET_LIMITS_C
+                    "hard_acceptance_size_limits_mm": copy.deepcopy(
+                        ACCEPTANCE_SIZE_LIMITS_MM
                     ),
-                    "diagnostic_temperature_limits_C": copy.deepcopy(
-                        DIAGNOSTIC_TEMPERATURE_LIMITS_C
+                    "hard_acceptance_temperature_limits_C": copy.deepcopy(
+                        ACCEPTANCE_TEMPERATURE_LIMITS_C
                     ),
-                    "all_search_physical_constraints_must_be_nonpositive": True,
+                    "campaign_search_profile_matches_hard_acceptance": True,
+                    "all_latest_noncapacitance_search_constraints_must_be_"
+                    "nonpositive": True,
+                    "legacy_search_feasibility_flags_used": False,
+                    "replaced_legacy_capacitance_constraints": sorted(
+                        REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+                    ),
                     "analytical_flux_density_constraint_preserved": True,
-                    "Lm_2mH_half_magnetizing_resonance_15kHz_constraint_preserved": (
+                    "legacy_half_magnetizing_resonance_constraint_used": False,
+                    "physics_delta_Lm_2mH_fRx_q90_lcb_15kHz_constraint_used": (
                         True
                     ),
                     "fixed_cooling_identity": copy.deepcopy(
@@ -1691,7 +1845,7 @@ def prepare_selection(
                         "lower_gap2_mm": lower,
                         "upper_gap2_mm": upper,
                         "upper_inclusive": upper_inclusive,
-                        "authenticated_strict_candidate_count": len(
+                        "authenticated_latest_rerank_candidate_count": len(
                             eligible_by_stratum[name]
                         ),
                         "required_selection_count": per_stratum,
@@ -1701,16 +1855,17 @@ def prepare_selection(
                 "missing_or_underfilled_strata": missing_strata,
                 "selection_method": {
                     "primary_rank": (
-                        "corrected_turn_graded_acquisition_C_UCB_ascending_only"
+                        "physics_delta_Crx_q90_UCB_ascending_only"
                     ),
-                    "first_per_stratum": "minimum_corrected_acquisition_C",
+                    "first_per_stratum": "minimum_physics_delta_q90_UCB",
                     "remaining_per_stratum": (
                         "farthest_normalized_geometry_and_cw2_within_top_"
-                        "corrected_acquisition_pool"
+                        "physics_delta_q90_UCB_pool"
                     ),
                     "diversity_features": list(DIVERSITY_FEATURES),
                     "per_stratum": per_stratum,
                     "raw_two_net_block_C_ranked": False,
+                    "legacy_corrected_0p759701_C_ranked": False,
                 },
                 "physics_informed_reranker": {
                     "tool": _file_record(PHYSICS_RERANKER_TOOL),
@@ -1761,13 +1916,15 @@ def prepare_selection(
                         and physics_delta_model is not None
                     ),
                     "selection_influence": (
-                        "post-selection_parallel_FEA_execution_priority_only"
+                        "provisional_resonance_eligibility_and_FEA_priority"
                     ),
                     "corrected_0p759701_ratio_role": (
-                        "surrogate_acquisition_gate_only_not_network_or_final_truth"
+                        "legacy_search_only_excluded_from_rerank_and_NDS"
                     ),
                     "raw_two_net_block_C_role": "never_physical_or_final_truth",
-                    "prediction_role": "next_FEA_batch_reranking_only",
+                    "prediction_role": (
+                        "provisional_q90_resonance_screen_and_next_FEA_priority"
+                    ),
                     "physical_feasibility_authority": False,
                     "final_turn_graded_symmetric_FEA_required": True,
                 },
@@ -1860,8 +2017,8 @@ def prepare_selection(
             "unique_physical_candidate_count": nds_summary[
                 "unique_physical_candidate_count"
             ],
-            "strict_candidate_eligible_count": nds_summary[
-                "strict_candidate_eligible_count"
+            "latest_rerank_eligible_count": nds_summary[
+                "latest_rerank_eligible_count"
             ],
             "stratum_counts": {
                 name: len(candidates)

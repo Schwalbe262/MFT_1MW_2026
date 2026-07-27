@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ from tools import mft_goal_diagnostic_gap2_stratified_selection as selection
 def _diversity_candidate(
     token: str,
     *,
-    corrected_c: float,
+    physics_ucb: float,
     cw2: float,
     gap2: float,
     spread: float,
@@ -27,7 +28,10 @@ def _diversity_candidate(
     features.update({"cw2": cw2, "gap2": gap2})
     return {
         "physical_geometry_sha256": token * 64,
-        "corrected_acquisition_C_rx_rx_F_UCB_F": corrected_c,
+        "physics_delta_prediction": {
+            "physics_delta_Crx_q90_ucb_F": physics_ucb,
+            "physics_delta_extrapolation_distance": 0.0,
+        },
         "diversity_features": features,
         # A raw-like diagnostic must have no influence on selection.
         "diagnostic_raw_same_metric_C_rx_rx_F": 1e99,
@@ -108,7 +112,20 @@ def test_bounded_cap_contract_is_corrected_acquisition_only() -> None:
         ),
     }
     authority = selection._validate_bounded_cap_contract(record)
-    assert authority["ratio_use"] == "surrogate_acquisition_only"
+    assert (
+        authority["ratio_use"]
+        == "legacy_search_acquisition_only_excluded_from_rerank"
+    )
+    assert (
+        authority[
+            "legacy_corrected_constraint_used_for_rerank_eligibility"
+        ]
+        is False
+    )
+    assert (
+        authority["legacy_half_magnetizing_resonance_used_for_rerank"]
+        is False
+    )
     assert authority["raw_two_net_block_C_used_for_ranking"] is False
     assert authority["raw_two_net_block_C_used_for_physical_truth"] is False
 
@@ -122,16 +139,16 @@ def test_bounded_cap_contract_is_corrected_acquisition_only() -> None:
             selection._validate_bounded_cap_contract(invalid)
 
 
-def test_corrected_c_anchor_and_diversity_ignore_raw_block_metric() -> None:
+def test_physics_ucb_anchor_and_diversity_ignore_legacy_cap_metric() -> None:
     candidates = [
         _diversity_candidate(
-            "a", corrected_c=1.0e-10, cw2=0.5, gap2=0.5, spread=0.0
+            "a", physics_ucb=1.0e-10, cw2=0.5, gap2=0.5, spread=0.0
         ),
         _diversity_candidate(
-            "b", corrected_c=1.1e-10, cw2=0.51, gap2=0.51, spread=0.05
+            "b", physics_ucb=1.1e-10, cw2=0.51, gap2=0.51, spread=0.05
         ),
         _diversity_candidate(
-            "c", corrected_c=1.2e-10, cw2=0.9, gap2=0.85, spread=1.0
+            "c", physics_ucb=1.2e-10, cw2=0.9, gap2=0.85, spread=1.0
         ),
     ]
     first = selection._select_diverse(copy.deepcopy(candidates), count=2)
@@ -147,8 +164,8 @@ def test_corrected_c_anchor_and_diversity_ignore_raw_block_metric() -> None:
     assert [item["physical_geometry_sha256"] for item in second] == [
         item["physical_geometry_sha256"] for item in first
     ]
-    assert first[0]["corrected_acquisition_rank_in_stratum"] == 1
-    assert first[0]["selection_role"] == "minimum_corrected_acquisition_C"
+    assert first[0]["physics_delta_ucb_rank_in_stratum"] == 1
+    assert first[0]["selection_role"] == "minimum_physics_delta_q90_UCB"
 
 
 def test_missing_stratum_is_fail_closed_without_partial_fea_candidates() -> None:
@@ -156,7 +173,7 @@ def test_missing_stratum_is_fail_closed_without_partial_fea_candidates() -> None
         {
             **_diversity_candidate(
                 character,
-                corrected_c=(index + 1) * 1e-10,
+                physics_ucb=(index + 1) * 1e-10,
                 cw2=0.5,
                 gap2=0.5,
                 spread=float(index),
@@ -174,18 +191,90 @@ def test_missing_stratum_is_fail_closed_without_partial_fea_candidates() -> None
     assert proposed == []
 
 
-def test_temperature_intersection_recovers_strict_100_120_120_limits() -> None:
+def test_latest_hard_acceptance_mapping_is_l900_and_110_130_130() -> None:
+    assert selection.ACCEPTANCE_SIZE_LIMITS_MM == {
+        "W": 1200.0,
+        "L": 900.0,
+        "H": 750.0,
+    }
+    family_limits = {
+        target: selection.ACCEPTANCE_TEMPERATURE_LIMITS_C[target]
+        for target in selection.ACCEPTANCE_TEMPERATURE_LIMITS_C
+    }
+    assert {
+        family_limits[target]
+        for target in selection.PRIMARY_WINDING_TEMPERATURE_TARGETS
+    } == {110.0}
+    assert {
+        family_limits[target]
+        for target in selection.SECONDARY_WINDING_TEMPERATURE_TARGETS
+    } == {130.0}
+    assert {
+        family_limits[target]
+        for target in selection.CORE_TEMPERATURE_TARGETS
+    } == {130.0}
+
+
+def test_active_search_temperature_matches_latest_acceptance() -> None:
     physical = {
         f"temperature_robust_limit:{target}": -10.0
-        for target in selection.TEMPERATURE_TARGET_LIMITS_C
+        for target in selection.ACCEPTANCE_TEMPERATURE_LIMITS_C
     }
     evidence = selection._temperature_evidence(physical)
-    assert all(item["strict_margin_C"] == pytest.approx(0.0) for item in evidence.values())
+    assert all(
+        item["acceptance_margin_C"] == pytest.approx(10.0)
+        for item in evidence.values()
+    )
+    assert all(
+        item["acceptance_limit_passed"] is True
+        for item in evidence.values()
+    )
 
     primary = next(iter(selection.PRIMARY_WINDING_TEMPERATURE_TARGETS))
-    physical[f"temperature_robust_limit:{primary}"] = -9.999
-    with pytest.raises(selection.StratifiedSelectionError, match="exceeds strict"):
+    physical[f"temperature_robust_limit:{primary}"] = 0.001
+    with pytest.raises(
+        selection.StratifiedSelectionError, match="exceeds acceptance"
+    ):
         selection._temperature_evidence(physical)
+
+
+def test_legacy_cap_and_resonance_constraints_are_replaced() -> None:
+    assert selection.CORRECTED_CAP_CONSTRAINT in (
+        selection.REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+    )
+    assert "half_magnetizing_resonance_minimum" in (
+        selection.REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+    )
+    assert "analytical_flux_density_limit" not in (
+        selection.REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+    )
+
+
+def test_physics_delta_resonance_constraint_uses_l2_0p2H_formula() -> None:
+    threshold_c = 1.0 / (
+        (2.0 * math.pi * selection.physics_reranker.RESONANCE_MIN_HZ)
+        ** 2
+        * selection.physics_reranker.FIXED_L2_H
+    )
+    boundary = {
+        "physics_delta_Crx_q90_ucb_F": threshold_c,
+        "physics_delta_fRx_q90_lcb_Hz": (
+            selection.physics_reranker.RESONANCE_MIN_HZ
+        ),
+    }
+    assert selection._physics_delta_provisional_resonance_G(  # noqa: SLF001
+        boundary
+    ) == pytest.approx(0.0, abs=1e-9)
+
+    lower_capacitance = {
+        "physics_delta_Crx_q90_ucb_F": threshold_c * 0.81,
+        "physics_delta_fRx_q90_lcb_Hz": (
+            selection.physics_reranker.RESONANCE_MIN_HZ / 0.9
+        ),
+    }
+    assert selection._physics_delta_provisional_resonance_G(  # noqa: SLF001
+        lower_capacitance
+    ) < 0.0
 
 
 def test_seed_retry_dedupe_keeps_highest_authenticated_task(
