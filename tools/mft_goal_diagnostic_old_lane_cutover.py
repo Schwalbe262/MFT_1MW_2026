@@ -155,6 +155,23 @@ def _validate_seal(value: Mapping[str, Any], *, schema: str) -> dict[str, Any]:
     return result
 
 
+def _validate_offload_receipt_seal(
+    value: Mapping[str, Any], *, schema: str
+) -> dict[str, Any]:
+    """Validate the diagnostic offload module's historical ``sha256`` seal."""
+
+    result = copy.deepcopy(dict(value))
+    unsigned = dict(result)
+    observed = unsigned.pop("sha256", None)
+    if (
+        "payload_sha256" in result
+        or result.get("schema_version") != schema
+        or observed != _sha256_value(unsigned)
+    ):
+        raise CutoverError(f"{schema} seal mismatch")
+    return result
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.resolve(strict=True).read_text("utf-8"))
@@ -426,7 +443,9 @@ def audit_old(scheduler: Scheduler | None = None) -> dict[str, Any]:
 
 
 def _validate_new_receipt(path: Path) -> dict[str, Any]:
-    receipt = _validate_seal(_read_json(path), schema=NEW_RECEIPT_SCHEMA)
+    receipt = _validate_offload_receipt_seal(
+        _read_json(path), schema=NEW_RECEIPT_SCHEMA
+    )
     rows = receipt.get("tasks")
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise CutoverError("NEW receipt task inventory is invalid")
@@ -506,6 +525,7 @@ def _authenticate_new_row(
     receipt_row: Mapping[str, Any],
     bundle_id: str,
     profile_sha256: str,
+    require_ready_status: bool,
 ) -> dict[str, Any]:
     task_id = receipt_row.get("task_id")
     seed = receipt_row.get("seed")
@@ -532,7 +552,7 @@ def _authenticate_new_row(
         or api.get("priority") != NEW_PRIORITY
         or api_remote_cwd != html_remote_cwd
         or PurePosixPath(api_remote_cwd).name != bundle_id
-        or observed_status not in REPLACEMENT_READY_STATUSES
+        or (require_ready_status and observed_status not in REPLACEMENT_READY_STATUSES)
     ):
         raise CutoverError(f"NEW exact100 task {task_id} readback drifted")
     _validate_variable_profile(payload, profile_sha256=profile_sha256, seed=seed)
@@ -550,7 +570,7 @@ def _authenticate_new_row(
         "html_page_sha256": _sha256_bytes(page.encode("utf-8")),
         "html_submission_payload_sha256": payload["payload_sha256"],
         "identity_authenticated": True,
-        "replacement_ready_status": True,
+        "replacement_ready_status": (observed_status in REPLACEMENT_READY_STATUSES),
     }
 
 
@@ -559,6 +579,7 @@ def _fresh_new_rows(
     *,
     receipt: Mapping[str, Any],
     profile_sha256: str,
+    require_ready_status: bool = True,
 ) -> list[dict[str, Any]]:
     rows_by_id = {int(row["task_id"]): row for row in receipt["tasks"]}
     task_ids = sorted(rows_by_id)
@@ -571,6 +592,7 @@ def _fresh_new_rows(
                     receipt_row=rows_by_id[task_id],
                     bundle_id=bundle_id,
                     profile_sha256=profile_sha256,
+                    require_ready_status=require_ready_status,
                 ),
                 task_ids,
             )
@@ -601,7 +623,7 @@ def attest_new_readback(
             "observed_at": _now(),
             "new_receipt_path": str(new_receipt_path.resolve(strict=True)),
             "new_receipt_file_sha256": _sha256_file(new_receipt_path),
-            "new_receipt_payload_sha256": receipt["payload_sha256"],
+            "new_receipt_payload_sha256": receipt["sha256"],
             "new_bundle_id": receipt["bundle_id"],
             "new_profile_payload_sha256": new_profile_sha256,
             "authorized_seed_start": NEW_SEED_START,
@@ -651,7 +673,7 @@ def _validate_new_evidence(
     if (
         evidence.get("new_receipt_path") != str(receipt_path.resolve(strict=True))
         or evidence.get("new_receipt_file_sha256") != _sha256_file(receipt_path)
-        or evidence.get("new_receipt_payload_sha256") != receipt["payload_sha256"]
+        or evidence.get("new_receipt_payload_sha256") != receipt["sha256"]
         or evidence.get("new_bundle_id") != receipt["bundle_id"]
         or _SHA256.fullmatch(str(profile_sha or "")) is None
         or profile_sha == OLD_PROFILE_SHA256
@@ -687,7 +709,7 @@ def _cutover_binding(
     return {
         "new_receipt_path": str(receipt_path.resolve(strict=True)),
         "new_receipt_file_sha256": _sha256_file(receipt_path),
-        "new_receipt_payload_sha256": receipt["payload_sha256"],
+        "new_receipt_payload_sha256": receipt["sha256"],
         "new_readback_evidence_path": str(evidence_path.resolve(strict=True)),
         "new_readback_evidence_file_sha256": _sha256_file(evidence_path),
         "new_readback_evidence_payload_sha256": evidence["payload_sha256"],
@@ -723,6 +745,7 @@ def run_cutover(
         client,
         receipt=receipt,
         profile_sha256=evidence["new_profile_payload_sha256"],
+        require_ready_status=False,
     )
     evidence_identity = {
         (row["task_id"], row["seed"], row["name"], row["dedupe_key"])

@@ -71,6 +71,12 @@ def _sealed(value: dict) -> dict:
     return cutover._seal(value)
 
 
+def _offload_sealed(value: dict) -> dict:
+    result = copy.deepcopy(value)
+    result["sha256"] = cutover._sha256_value(result)
+    return result
+
+
 def _old_profile(monkeypatch: pytest.MonkeyPatch) -> dict:
     profile = _sealed(
         {
@@ -202,7 +208,7 @@ def _write_new_receipt(path: Path, scheduler: FakeScheduler) -> dict:
                 "status": task["status"],
             }
         )
-    value = _sealed(
+    value = _offload_sealed(
         {
             "schema_version": cutover.NEW_RECEIPT_SCHEMA,
             "apply": True,
@@ -291,7 +297,7 @@ def test_attest_new_binds_sealed_receipt_and_live_exact100(
         scheduler=scheduler,
     )
 
-    assert evidence["new_receipt_payload_sha256"] == receipt["payload_sha256"]
+    assert evidence["new_receipt_payload_sha256"] == receipt["sha256"]
     assert evidence["task_count"] == 100
     assert len(evidence["tasks"]) == 100
     assert evidence["scheduler_cancel_count"] == 0
@@ -321,6 +327,33 @@ def test_cutover_default_is_audit_only(
     assert result["selected_conditional_cancel_task_ids"] == [97297, 97298]
     assert scheduler.cancel_count == before_cancel_count == 0
     assert not (tmp_path / "cutover" / "pre_cutover_receipt.json").exists()
+
+
+def test_cutover_keeps_prior_ready_evidence_when_new_status_later_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, receipt_path, evidence_path = _authority(
+        tmp_path,
+        monkeypatch,
+        old_statuses={97297: "running"},
+    )
+    scheduler.tasks[98030]["status"] = "failed"
+
+    result = cutover.run_cutover(
+        new_receipt_path=receipt_path,
+        new_readback_evidence_path=evidence_path,
+        output_root=tmp_path / "cutover",
+        scheduler=scheduler,
+    )
+
+    failed = next(
+        row for row in result["fresh_new_exact100_rows"] if row["task_id"] == 98030
+    )
+    assert failed["status"] == "failed"
+    assert failed["identity_authenticated"] is True
+    assert failed["replacement_ready_status"] is False
+    assert scheduler.cancel_count == 0
 
 
 def test_apply_rejects_tampered_readback_before_scheduler_reads_or_cancel(
