@@ -78,6 +78,16 @@ HANDOFF_FILE_SHA256 = (
 HANDOFF_PAYLOAD_SHA256 = (
     "e34ffcec44cb5e477424f8651453c467a57dd7feff4f72b8308e5985ccb1df2d"
 )
+SUCCESSOR_SOURCE_ROOTS = (
+    Path(
+        r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+        r"\core_rescue_direct_fea_tranche_v4"
+    ),
+    Path(
+        r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+        r"\core_rescue_direct_fea_tranche_v7"
+    ),
+)
 SOURCE = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
     r"\anchor_core_rescue_6x60_v1\geometry_sweep_20260727T105135Z"
@@ -1047,6 +1057,220 @@ def prepare_handoff(output: Path, handoff_path: Path = HANDOFF) -> Path:
     return _write(destination / "plan.json", plan)
 
 
+def prepare_successors(
+    output: Path,
+    *,
+    solver_revision: str,
+    source_roots: Iterable[Path] = SUCCESSOR_SOURCE_ROOTS,
+) -> Path:
+    """Reissue every sealed rescue lane after a solver-only bug fix."""
+    if (
+        not HEX40.fullmatch(solver_revision)
+        or solver_revision == SOLVER_REVISION
+        or not HEX40.fullmatch(LIBRARY_REVISION)
+    ):
+        raise FeederError("a distinct full successor solver revision is required")
+    destination = output.resolve()
+    if destination.exists():
+        raise FeederError(f"output exists: {destination}")
+    destination.mkdir(parents=True)
+
+    lanes: list[dict[str, Any]] = []
+    source_records: list[dict[str, Any]] = []
+    profile_records: dict[str, dict[str, Any]] = {}
+    for source_root_raw in source_roots:
+        source_root = source_root_raw.resolve(strict=True)
+        source_plan_path = (source_root / "plan.json").resolve(strict=True)
+        source_receipt_path = (
+            source_root / "submission_receipt.json"
+        ).resolve(strict=True)
+        source_plan = _validate_seal(_read(source_plan_path), SCHEMA)
+        source_receipt = _validate_seal(
+            _read(source_receipt_path), SUBMISSION_SCHEMA
+        )
+        if (
+            source_plan["solver_revision"] != SOLVER_REVISION
+            or source_plan["library_revision"] != LIBRARY_REVISION
+            or source_receipt["plan_payload_sha256"]
+            != source_plan["payload_sha256"]
+            or source_receipt.get("complete") is not True
+            or int(source_receipt.get("submitted_lane_count", 0))
+            != len(source_plan["lanes"])
+        ):
+            raise FeederError(f"source tranche drifted: {source_root}")
+        submissions = {
+            int(item["lane_index"]): item
+            for item in source_receipt["submissions"]
+        }
+        if set(submissions) != {
+            int(item["lane_index"]) for item in source_plan["lanes"]
+        }:
+            raise FeederError("source receipt lane map drifted")
+        source_records.append(
+            {
+                "root": str(source_root),
+                "plan": _record(source_plan_path, source_root),
+                "plan_payload_sha256": source_plan["payload_sha256"],
+                "receipt": _record(source_receipt_path, source_root),
+                "receipt_payload_sha256": source_receipt["payload_sha256"],
+                "task_ids": [
+                    int(submissions[int(item["lane_index"])]["task_id"])
+                    for item in source_plan["lanes"]
+                ],
+            }
+        )
+
+        for source_lane in source_plan["lanes"]:
+            lane_index = len(lanes) + 1
+            original_lane_index = int(source_lane["lane_index"])
+            source_submission = submissions[original_lane_index]
+            params_path = (
+                source_root / source_lane["params"]["path"]
+            ).resolve(strict=True)
+            profile_path = (
+                source_root / source_lane["profile"]["path"]
+            ).resolve(strict=True)
+            if (
+                _file_sha(params_path) != source_lane["params"]["sha256"]
+                or _file_sha(profile_path) != source_lane["profile"]["sha256"]
+            ):
+                raise FeederError("source lane file SHA drifted")
+            params = _read(params_path)
+            profile = _read(profile_path)
+            ok, validated = validation_check(
+                create_input_parameter(params), strict=True
+            )
+            if not ok:
+                raise FeederError("source successor params failed validation")
+            readback = validated.iloc[0]
+            if (
+                float(readback["core_center_gap_mm"]) <= 0.0
+                or int(readback["core_equal_three_leg_air_gap"]) != 1
+                or int(readback["core_air_gap_gapped_leg_count"]) != 3
+                or int(readback["n_core_group"]) not in (4, 5)
+                or float(readback["core_plate_t"]) != 20.0
+                or float(readback["wcp_t"]) != 20.0
+                or float(readback["core_plate_pad_t"]) != 2.0
+                or float(readback["wcp_pad_t"]) != 2.0
+                or float(readback["fan_velocity"]) != 1.5
+                or int(readback["round_corner"]) != 0
+                or int(readback["full_model"]) != 0
+                or str(readback["thermal_symmetry"]) != "eighth"
+            ):
+                raise FeederError("successor physical contract drifted")
+            effective = {
+                key: _builtin(readback[key])
+                for key in sorted(ALL_INPUT_KEYS)
+            }
+            effective_path = _write(
+                destination / "params" / f"lane-{lane_index:02d}.json",
+                effective,
+            )
+            profile_sha = _file_sha(profile_path)
+            if profile_sha not in profile_records:
+                copied_profile_path = _write(
+                    destination / "profiles" / f"{profile_sha[:16]}.json",
+                    profile,
+                )
+                profile_records[profile_sha] = _record(
+                    copied_profile_path, destination
+                )
+            mode = (
+                "full"
+                if source_lane["mode"]
+                == "matrix_turngraded_cap_loss_thermal"
+                else "matrix"
+            )
+            candidate_sha = str(source_lane["candidate_sha256"])
+            gap_mm = float(source_lane["core_center_gap_mm"])
+            gap_token = f"{int(round(gap_mm * 1_000_000)):08d}"
+            name = (
+                f"mft-core-symfix-{lane_index:02d}-{mode}-"
+                f"g{gap_token}-{candidate_sha[:10]}"
+            )
+            workdir = (
+                f"mft_core_symfix_{lane_index:02d}_{mode}_"
+                f"g{gap_token}_{candidate_sha[:10]}"
+            )
+            identity = scheduler_client.verification_submission_identity(
+                name,
+                effective,
+                profile,
+                solver_revision,
+                LIBRARY_REVISION,
+            )
+            source_scheduler = source_lane["scheduler"]
+            lanes.append(
+                {
+                    "lane_index": lane_index,
+                    "candidate_index": source_lane.get("candidate_index"),
+                    "candidate_sha256": candidate_sha,
+                    "source_task_id": int(source_submission["task_id"]),
+                    "source_plan_payload_sha256": source_plan[
+                        "payload_sha256"
+                    ],
+                    "source_lane_index": original_lane_index,
+                    "core_center_gap_mm": gap_mm,
+                    "core_equal_three_leg_air_gap": 1,
+                    "expected_gapped_leg_count": 3,
+                    "mode": source_lane["mode"],
+                    "params": _record(effective_path, destination),
+                    "params_sha256": _sha(effective),
+                    "profile": profile_records[profile_sha],
+                    "scheduler": {
+                        "project": scheduler_client.MFT_PROJECT,
+                        "name": name,
+                        "workdir": workdir,
+                        "dedupe_key": identity["dedupe_key"],
+                        "parameter_digest": identity["parameter_digest"],
+                        "effective_params_sha256": _sha(identity["merged"]),
+                        "cpus": int(source_scheduler["cpus"]),
+                        "memory_mb": int(source_scheduler["memory_mb"]),
+                        "timeout_seconds": int(profile["timeout_seconds"]),
+                        "priority": int(source_scheduler["priority"]),
+                        "max_workers_per_node": int(
+                            source_scheduler["max_workers_per_node"]
+                        ),
+                        "environment": _core_environment(solver_revision),
+                    },
+                }
+            )
+    if len(lanes) != 16:
+        raise FeederError(f"expected exactly 16 successor lanes, got {len(lanes)}")
+    plan = _seal(
+        {
+            "schema_version": SCHEMA,
+            "created_at_utc": _now(),
+            "source": {
+                "tranches": source_records,
+                "source_solver_revision": SOLVER_REVISION,
+                "successor_reason": (
+                    "correct positive-y retained core-group expectation after "
+                    "XY+/XZ+/YZ- eighth-symmetry cuts"
+                ),
+            },
+            "solver_revision": solver_revision,
+            "library_revision": LIBRARY_REVISION,
+            "regression_contract": {
+                "physical_gap_contract_changed": False,
+                "equal_identical_physical_gap_all_three_legs": True,
+                "expected_gapped_leg_count": 3,
+                "n4_positive_y_retained_groups": [3, 4],
+                "n5_positive_y_retained_groups": [3, 4, 5],
+                "odd_center_group_clamped_at_y_zero": True,
+                "bounding_box_readback_attested": True,
+            },
+            "lanes": lanes,
+            "parallel_execution_requested": True,
+            "scheduler_project_source_included": False,
+            "scheduler_project_modified": False,
+            "scheduler_submission_performed": False,
+            "final_promotion_allowed": False,
+        }
+    )
+    return _write(destination / "plan.json", plan)
+
+
 def submit(plan_path: Path, output: Path, *, apply: bool) -> Path:
     plan = _validate_seal(_read(plan_path), SCHEMA)
     root = plan_path.resolve(strict=True).parent
@@ -1157,6 +1381,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     handoff_parser = sub.add_parser("prepare-handoff")
     handoff_parser.add_argument("--output", type=Path, required=True)
     handoff_parser.add_argument("--handoff", type=Path, default=HANDOFF)
+    successor_parser = sub.add_parser("prepare-successors")
+    successor_parser.add_argument("--output", type=Path, required=True)
+    successor_parser.add_argument(
+        "--solver-revision", required=True
+    )
     submit_parser = sub.add_parser("submit")
     submit_parser.add_argument("--plan", type=Path, required=True)
     submit_parser.add_argument("--output", type=Path, required=True)
@@ -1166,6 +1395,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         path = prepare(args.output)
     elif args.command == "prepare-handoff":
         path = prepare_handoff(args.output, args.handoff)
+    elif args.command == "prepare-successors":
+        path = prepare_successors(
+            args.output, solver_revision=args.solver_revision
+        )
     else:
         path = submit(args.plan, args.output, apply=args.apply)
     print(path)
