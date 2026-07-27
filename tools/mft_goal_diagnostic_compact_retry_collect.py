@@ -1,9 +1,9 @@
 """Collect one exact100 logical seed set across base and retry attempts.
 
-The immutable first-run receipt remains the authority for seeds 2607264100
-through 2607264152.  The separately sealed pre-start quota retry receipt
-replaces only failed physical attempts for seeds 2607264153 through
-2607264199.  Exactly one physical Scheduler task is selected for every logical
+The immutable first-run receipt remains the authority for the exact100 seed
+interval declared by its authenticated plan.  The separately sealed pre-start
+quota retry receipt replaces only the failed physical attempts named by its
+retry plan.  Exactly one physical Scheduler task is selected for every logical
 seed before the standard GET/SFTP collector and global NDS pipeline are used.
 
 This module has no Scheduler mutation method.
@@ -30,7 +30,6 @@ from tools import mft_goal_diagnostic_compact_slurm as offload  # noqa: E402
 
 
 OVERLAY_SCHEMA = "mft-goal-diagnostic-compact-logical-seed-overlay-v1"
-EXPECTED_RETRY_COUNT = 47
 
 
 def _validate_retry_receipt(
@@ -46,14 +45,16 @@ def _validate_retry_receipt(
     plan_by_seed = {
         int(row["seed"]): row for row in plan["tasks"]
     }
+    expected_retry_count = len(plan_by_seed)
     rows = receipt.get("tasks")
     if (
-        receipt.get("apply") is not True
+        not 1 <= expected_retry_count <= offload.EXACT_TASK_COUNT
+        or receipt.get("apply") is not True
         or receipt.get("retry_plan_file_sha256")
         != retry._sha256_file(retry_plan_path.resolve(strict=True))
         or receipt.get("retry_plan_payload_sha256")
         != plan["payload_sha256"]
-        or receipt.get("retry_task_count") != EXPECTED_RETRY_COUNT
+        or receipt.get("retry_task_count") != expected_retry_count
         or receipt.get("absent_count") != 0
         or receipt.get("scheduler_cancel_count") != 0
         or receipt.get("scheduler_preempt_count") != 0
@@ -64,7 +65,7 @@ def _validate_retry_receipt(
         or receipt.get("screening_only") is not True
         or receipt.get("production_eligible") is not False
         or not isinstance(rows, list)
-        or len(rows) != EXPECTED_RETRY_COUNT
+        or len(rows) != expected_retry_count
     ):
         raise RuntimeError("retry collector receipt contract mismatch")
     observed_seeds = []
@@ -90,7 +91,7 @@ def _validate_retry_receipt(
         task_ids.add(task_id)
     if (
         observed_seeds != sorted(plan_by_seed)
-        or len(plan_by_seed) != EXPECTED_RETRY_COUNT
+        or len(plan_by_seed) != expected_retry_count
     ):
         raise RuntimeError("retry collector seed coverage mismatch")
     return plan, receipt
@@ -139,10 +140,12 @@ def authenticate_overlay_context(
     retry_receipt_by_seed = {
         int(row["seed"]): row for row in retry_receipt["tasks"]
     }
+    authorized_seeds = tuple(int(seed) for seed in base["authorized_seeds"])
+    retry_count = len(retry_plan_by_seed)
     selected_entries = []
     selections = []
     ignored_attempt_ids = []
-    for seed in offload.EXACT_SEEDS:
+    for seed in authorized_seeds:
         base_entry = base_by_seed.get(seed)
         if base_entry is None:
             raise RuntimeError("logical exact100 base seed is missing")
@@ -193,7 +196,7 @@ def authenticate_overlay_context(
     if (
         len(selected_entries) != offload.EXACT_TASK_COUNT
         or [int(entry["seed"]) for entry in selected_entries]
-        != list(offload.EXACT_SEEDS)
+        != list(authorized_seeds)
         or len(set(selected_ids)) != offload.EXACT_TASK_COUNT
         or set(selected_ids).intersection(ignored_attempt_ids)
     ):
@@ -239,11 +242,11 @@ def authenticate_overlay_context(
             },
             "logical_seed_count": offload.EXACT_TASK_COUNT,
             "physical_submitted_attempt_count": (
-                offload.EXACT_TASK_COUNT + EXPECTED_RETRY_COUNT
+                offload.EXACT_TASK_COUNT + retry_count
             ),
             "selected_physical_attempt_count": offload.EXACT_TASK_COUNT,
             "ignored_infrastructure_prestart_attempt_count": (
-                EXPECTED_RETRY_COUNT
+                retry_count
             ),
             "ignored_infrastructure_prestart_task_ids": ignored_attempt_ids,
             "selections": selections,
@@ -281,9 +284,9 @@ def authenticate_overlay_context(
             "authority_payload_sha256": authority["payload_sha256"],
             "logical_seed_count": offload.EXACT_TASK_COUNT,
             "physical_submitted_attempt_count": (
-                offload.EXACT_TASK_COUNT + EXPECTED_RETRY_COUNT
+                offload.EXACT_TASK_COUNT + retry_count
             ),
-            "selected_retry_attempt_count": EXPECTED_RETRY_COUNT,
+            "selected_retry_attempt_count": retry_count,
             "one_selected_physical_attempt_per_logical_seed": True,
             "duplicate_physical_result_collection_allowed": False,
             "equal_three_leg_air_gap_FEA_required": True,
