@@ -46,6 +46,10 @@ DEFAULT_TARGET_AXIS_COLLECTOR_STATE_FILE = Path(
     r"\fixed_lm2mh_old16_plus_splittemp512_global_nds_v3"
     r"\collector_status.json"
 )
+DEFAULT_ACTIVE_EXACT100_ROOT = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\diagnostic_l900_gap2p35_hgap20_exact100_5823d47"
+)
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_LOCAL_SEALED_STATE_BYTES = 8 * 1024 * 1024
@@ -55,6 +59,9 @@ SYNC_SCHEMA = "mft-goal-postdeadline-ui-sync-v1"
 PID_SCHEMA = "mft-goal-postdeadline-ui-updater-pid-v1"
 LOG_SCHEMA = "mft-goal-postdeadline-ui-updater-event-v1"
 STATUS_SCHEMA = "mft-codex-work-status-v1"
+ACTIVE_EXACT100_RECEIPT_SCHEMA = (
+    "mft-goal-diagnostic-compact-submission-receipt-v1"
+)
 POSTSUCCESS_STATE_SCHEMA = "mft-goal-postdeadline-standard-postsuccess-state-v1"
 THERMAL_BRIDGE_STATE_SCHEMA = "mft-corrected-thermal-terminal-transport-watch-state-v1"
 STANDARD_FULL_CONTINUATION_STATE_SCHEMA = "mft-goal-standard-full-continuation-state-v1"
@@ -8420,6 +8427,215 @@ def _parallel_workstreams_card(
     }
 
 
+def _active_exact100_post_state(
+    root: Path = DEFAULT_ACTIVE_EXACT100_ROOT,
+) -> dict[str, Any]:
+    """Fail closed until a sealed first-clean exact-100 POST receipt exists."""
+    resolved = root.resolve()
+    state: dict[str, Any] = {
+        "phase": "preparing",
+        "submitted_count": 0,
+        "expected_count": 100,
+        "receipt_path": None,
+        "verification_error": None,
+    }
+    if not resolved.is_dir():
+        state["verification_error"] = "active exact100 preparation root is absent"
+        return state
+
+    receipt_candidates = sorted(
+        (
+            path
+            for path in resolved.rglob("*.json")
+            if "receipt" in path.name.lower()
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    matching_schema_seen = False
+    last_error: str | None = None
+    for path in receipt_candidates:
+        try:
+            if path.is_symlink() or path.stat().st_size > MAX_LOCAL_SEALED_STATE_BYTES:
+                continue
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(receipt, dict)
+                or receipt.get("schema_version")
+                != ACTIVE_EXACT100_RECEIPT_SCHEMA
+            ):
+                continue
+            matching_schema_seen = True
+            unsigned = copy.deepcopy(receipt)
+            observed_sha256 = unsigned.pop("payload_sha256", None)
+            tasks = receipt.get("tasks")
+            task_ids = [
+                row.get("task_id")
+                for row in tasks
+                if isinstance(row, dict)
+            ] if isinstance(tasks, list) else []
+            valid = bool(
+                observed_sha256 == canonical_sha256(unsigned)
+                and receipt.get("apply") is True
+                and receipt.get("task_count") == 100
+                and receipt.get("submitted_count") == 100
+                and receipt.get("existing_count") == 0
+                and receipt.get("absent_count") == 0
+                and receipt.get("campaign_authorized_post_count") == 100
+                and receipt.get("first_clean_run_exact100_scheduler_posts")
+                is True
+                and receipt.get("scheduler_post_count") == 100
+                and receipt.get("scheduler_endpoint") == "POST /api/tasks"
+                and isinstance(tasks, list)
+                and len(tasks) == 100
+                and len(task_ids) == 100
+                and all(
+                    isinstance(task_id, int) and not isinstance(task_id, bool)
+                    for task_id in task_ids
+                )
+                and len(set(task_ids)) == 100
+            )
+            if not valid:
+                last_error = (
+                    f"exact100 receipt failed closed validation: {path.name}"
+                )
+                continue
+            return {
+                "phase": "submitted",
+                "submitted_count": 100,
+                "expected_count": 100,
+                "receipt_path": str(path.resolve()),
+                "receipt_payload_sha256": observed_sha256,
+                "task_id_min": min(task_ids),
+                "task_id_max": max(task_ids),
+                "verification_error": None,
+            }
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+
+    state["verification_error"] = (
+        last_error
+        if matching_schema_seen or last_error
+        else "sealed first-clean exact100 POST receipt not found"
+    )
+    return state
+
+
+def _active_truth_ui_cards(
+    *,
+    observed_at: str,
+    exact100: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    submitted = int(exact100.get("submitted_count") or 0)
+    phase = "SUBMITTED" if submitted == 100 else "PREPARING"
+    receipt_path = exact100.get("receipt_path")
+    post_evidence = (
+        f"sealed POST receipt={receipt_path}"
+        if isinstance(receipt_path, str) and receipt_path
+        else (
+            "sealed first-clean exact100 POST receipt=not verified / "
+            "displayed submitted count is therefore fail-closed at 0"
+        )
+    )
+    return [
+        {
+            "id": "codex-active-contract-20260727",
+            "title": (
+                "ACTIVE HARD CONTRACT | 1200×900×750 | gap2 0.350 | "
+                "plates 20T/20T"
+            ),
+            "detail": (
+                "현재 탐색에 적용되는 권위 계약입니다. 외형 W≤1200 mm, "
+                "L≤900 mm, H≤750 mm, 2차 턴간격 gap2=0.350 mm hard-fixed, "
+                "코어 냉각판과 권선 콜드플레이트는 각각 정확히 20 mm입니다. "
+                "온도 gate는 1차≤110°C, 2차≤130°C, 코어≤130°C입니다."
+            ),
+            "state": "in_progress",
+            "updated_at": observed_at,
+            "progress_pct": 100,
+            "evidence": [
+                "envelope_mm: W<=1200 / L<=900 / H<=750",
+                "secondary interturn gap2=0.350mm / lower=upper=0.350 / hard-fixed",
+                "temperature_C: primary<=110 / secondary<=130 / core<=130",
+                "core cooling plate thickness=20.0mm exactly",
+                "winding cold-plate thickness=20.0mm exactly",
+                "N1/N2=6/60 / primary foil=5.0mm / primary gap=1.6mm / equal winding heights",
+                "cooling air=1.5m/s / TIM and pad contract unchanged",
+            ],
+        },
+        {
+            "id": "codex-active-exact100-gap2p35",
+            "title": (
+                f"NSGA-II EXACT100 | {phase} | SUBMITTED "
+                f"{submitted}/100 | gap2=0.350"
+            ),
+            "detail": (
+                "100개 독립 seed 캠페인을 준비·제출하는 활성 검색 lane입니다. "
+                "실제 POST를 증명하는 sealed receipt가 완전 검증되기 전에는 "
+                "Scheduler 제출 수를 추론하지 않고 0으로 표시합니다."
+            ),
+            "state": "in_progress",
+            "updated_at": observed_at,
+            "progress_pct": 45 if submitted == 100 else 15,
+            "evidence": [
+                "active code revision=5823d475b9a6bf40fd709f4efca3f069e06bd722",
+                "seeds=2607264100..2607264199 / population=320 / generations=300",
+                "resources each=8CPU+65536MiB / max_workers_per_node=8 / priority=10",
+                post_evidence,
+                (
+                    "Scheduler repository/service modification=false / "
+                    "MFT search bundle remains separate"
+                ),
+            ],
+        },
+        {
+            "id": "codex-active-capacitance-truth-boundary",
+            "title": "CAPACITANCE | RAW 2-NET METRIC IS PROVISIONAL",
+            "detail": (
+                "현재 surrogate의 raw C_rx_rx_F는 모든 2차 턴을 한 전위로 묶은 "
+                "2-net 추출값이라 턴간 전압·턴간 정전용량을 직접 나타내지 않습니다. "
+                "따라서 raw capacitance 기반 공진 판정은 provisional이며, 상위 "
+                "후보는 턴별 전압을 부여한 turn-graded electrostatic FEA로 재검증해야 합니다."
+            ),
+            "state": "in_progress",
+            "updated_at": observed_at,
+            "progress_pct": 20,
+            "evidence": [
+                "raw metric=C_rx_rx_F with all Rx turns tied to one equipotential net",
+                "interturn delta-V=0 in raw two-net solve / not an interturn metric",
+                "gap2 hard-fixed for manufacturability; raw-cap improvement is not the final validity basis",
+                "required next gate=turn-graded FEA on top compact candidates",
+                "final 15kHz resonance claim prohibited until graded-cap verification",
+            ],
+        },
+        {
+            "id": "codex-active-gui-thermal-16core",
+            "title": (
+                "GUI THERMAL 16-CORE | VERIFIED LEGACY DIAGNOSTIC | "
+                "MAX 136.247°C"
+            ),
+            "detail": (
+                "1.5 m/s 조건의 16-core GUI 열해석은 native HDF5와 solver "
+                "profile로 검증됐습니다. 실제 범위는 49.999–136.247°C이고 "
+                "clamp 없이 잔차를 통과했습니다. 다만 이 파일은 legacy diagnostic "
+                "geometry이므로 새 1200×900×750 최종 설계의 온도 PASS나 최종 "
+                "설계 주장으로 사용하지 않습니다."
+            ),
+            "state": "in_progress",
+            "updated_at": observed_at,
+            "progress_pct": 100,
+            "evidence": [
+                "project=simulation1_thermal_1p5ms_16core.aedt",
+                "solver=16 CPU cores / fan speed=1.5m/s / cells=796277",
+                "solver profile=Normal Completion / residual convergence=pass",
+                "native HDF5 temperature=49.999..136.247C / clamp=false",
+                "classification=legacy diagnostic geometry / final-design claim=false",
+                "new active NSGA candidate thermal verification remains pending",
+            ],
+        },
+    ]
+
+
 def merge_status(
     payload: Mapping[str, Any],
     tasks: Mapping[int, Mapping[str, Any]],
@@ -8442,11 +8658,17 @@ def merge_status(
     ),
     standard_full_continuation_state_file: Path | None = None,
     final_gate_root: Path | None = None,
+    compact_active_truth_ui: bool = False,
 ) -> dict[str, Any]:
     if payload.get("schema_version") != STATUS_SCHEMA:
         raise UpdaterError("Codex status schema drifted")
     result = copy.deepcopy(dict(payload))
     result.pop(SYNC_KEY, None)
+    automation_current = result.pop("_automation_current", None)
+    if automation_current is not None:
+        if not isinstance(automation_current, list):
+            raise UpdaterError("automation current-card cache is invalid")
+        result["current"] = automation_current
     protected_before = _protected_hashes(result)
     target_axis_collector = _target_axis_collector_state(
         target_axis_collector_state_file
@@ -8685,6 +8907,29 @@ def merge_status(
             queued=queued,
         ),
     )
+    if compact_active_truth_ui:
+        active_exact100 = _active_exact100_post_state()
+        active_truth_cards = _active_truth_ui_cards(
+            observed_at=observed_at,
+            exact100=active_exact100,
+        )
+        exact100_submitted = int(active_exact100.get("submitted_count") or 0)
+        exact100_phase = (
+            "submitted" if exact100_submitted == 100 else "preparing"
+        )
+        result["summary"] = (
+            "현재 권위 계약: W≤1200 × L≤900 × H≤750 mm, "
+            "gap2=0.350 mm hard-fixed, 1차≤110°C, 2차/코어≤130°C, "
+            "코어·권선 냉각판=20T 고정. "
+            f"NSGA-II exact100={exact100_phase}, submitted "
+            f"{exact100_submitted}/100 (sealed POST receipt 기준). "
+            "raw 2-net capacitance는 interturn metric이 아니므로 provisional이며 "
+            "상위 후보 turn-graded FEA가 필요합니다. "
+            "16-core GUI legacy diagnostic은 HDF5 기준 49.999–136.247°C로 "
+            "검증됐지만 새 최종 설계 PASS는 아닙니다."
+        )
+        result["_automation_current"] = result["current"]
+        result["current"] = active_truth_cards
     result["generated_at"] = observed_at
     if _protected_hashes(result) != protected_before:
         raise UpdaterError("protected completed/attention/Pareto truth changed")
@@ -9101,6 +9346,7 @@ def synchronize_once(
     ),
     standard_full_continuation_state_file: Path | None = None,
     final_gate_root: Path | None = None,
+    compact_active_truth_ui: bool = False,
 ) -> dict[str, Any]:
     tasks = fetch_tasks(scheduler_url, task_reader=task_reader)
     auxiliary_tasks = (
@@ -9190,6 +9436,7 @@ def synchronize_once(
         local_symmetric_selection_state_file=(local_symmetric_selection_state_file),
         standard_full_continuation_state_file=(standard_full_continuation_state_file),
         final_gate_root=final_gate_root,
+        compact_active_truth_ui=compact_active_truth_ui,
     )
     validate_status_sync(updated)
     if len(_json_bytes(updated)) > 256 * 1024:
@@ -9245,6 +9492,7 @@ def run_updater(
     target_axis_collector_state_file: Path | None = (
         DEFAULT_TARGET_AXIS_COLLECTOR_STATE_FILE
     ),
+    compact_active_truth_ui: bool = False,
 ) -> dict[str, Any] | None:
     if interval_seconds < 1:
         raise UpdaterError("interval-seconds must be positive")
@@ -9293,6 +9541,7 @@ def run_updater(
                         standard_full_continuation_state_file
                     ),
                     final_gate_root=final_gate_root,
+                    compact_active_truth_ui=compact_active_truth_ui,
                 )
                 _append_log(
                     log_file,
@@ -9381,6 +9630,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_axis_collector_state_file=(
             args.target_axis_collector_state_file
         ),
+        compact_active_truth_ui=True,
     )
     if args.once:
         print(json.dumps(result, sort_keys=True, ensure_ascii=False))
