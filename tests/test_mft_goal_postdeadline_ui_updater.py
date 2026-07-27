@@ -2686,6 +2686,44 @@ def test_rx_main_l5_operational_chain_card_is_stage_explicit(
             monkeypatch,
         )
     )
+    monkeypatch.setattr(
+        updater,
+        "_rx_main_l5_strict_n107_receipt",
+        lambda _root: ({"scheduler_post_calls": 1}, "authenticated"),
+    )
+    monkeypatch.setattr(
+        updater,
+        "_rx_main_l5_strict_n107_terminal",
+        lambda _root: (
+            {
+                "state": "failed",
+                "exit_code": 86,
+                "node_name": "n107",
+                "slurm_job_id": "845454",
+            },
+            "authenticated",
+        ),
+    )
+    monkeypatch.setattr(
+        updater,
+        "_rx_main_l5_strict_n107_successor_receipt",
+        lambda _root: ({"scheduler_post_calls": 1}, "authenticated"),
+    )
+    monkeypatch.setattr(
+        updater,
+        "_rx_main_l5_strict_n107_successor_live",
+        lambda _root: (
+            {
+                "state": "running",
+                "allocation_id": 14718,
+                "slurm_job_id": "845487",
+                "temp_free_kb": 721_310_408,
+                "temp_min_free_kb": 20_971_520,
+                "observed_at": OBSERVED,
+            },
+            "authenticated",
+        ),
+    )
 
     card = updater._rx_main_l5_operational_chain_card(
         OBSERVED,
@@ -2695,11 +2733,12 @@ def test_rx_main_l5_operational_chain_card_is_stage_explicit(
     )
 
     assert len(card["title"]) <= 160
-    assert "97140 AUTH FAIL PRE-SOLVER" in card["title"]
-    assert "97141 n110 MATRIX-OK/SESSION-FAIL PRE-THERMAL" in card["title"]
-    assert "97142 STRICT n107 EXCL-GATE QUEUED" in card["title"]
+    assert "97141 MATRIX-OK/SESSION-FAIL" in card["title"]
+    assert "97142 EXCL QUEUED" in card["title"]
+    assert "97143 GUARD-FALSE-NEG" in card["title"]
+    assert "97144 n107 GUARD+TEMP PASS RUNNING" in card["title"]
     assert card["state"] == "in_progress"
-    assert card["progress_pct"] == 30
+    assert card["progress_pct"] == 65
     assert any(
         "Matrix Setup1 solved 3s" in item
         and "result-extraction collapse" in item
@@ -2725,6 +2764,20 @@ def test_rx_main_l5_operational_chain_card_is_stage_explicit(
         "task97142 GET monitor authenticated=true" in item
         and "state=queued" in item
         and "placement lineage authenticated=true" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "task97143 receipt authenticated=true" in item
+        and "terminal=FAILED exit86" in item
+        and "runtime guard false-negative=true" in item
+        and "design invalidated=false" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "task97144 receipt authenticated=true" in item
+        and "state=running" in item
+        and "allocation=14718" in item
+        and "task-local temp PASS" in item
         for item in card["evidence"]
     )
 
