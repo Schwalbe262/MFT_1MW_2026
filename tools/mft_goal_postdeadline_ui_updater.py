@@ -766,6 +766,16 @@ EXACT_N1_6_GUI_THERMAL_MESH_SECONDS = 1_075.99
 EXACT_N1_6_CORRECTED_GUI_ROOT = Path(
     r"C:\w\mft-gui-6x60-corrected-b6-g065"
 )
+EXACT_N1_6_CORRECTED_GUI_FORENSIC_ROOT = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\local_gui_6x60_rx_interface_forensic_v1"
+)
+EXACT_N1_6_CORRECTED_GUI_FORENSIC_UI_SCHEMA = (
+    "mft-local-gui-rx-interface-ui-manifest-v1"
+)
+EXACT_N1_6_CORRECTED_GUI_FORENSIC_EVIDENCE_SCHEMA = (
+    "mft-local-gui-rx-interface-case-parser-evidence-v1"
+)
 EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID = 50_132
 EXACT_N1_6_CORRECTED_GUI_AEDT_PID = 45_568
 EXACT_N1_6_CORRECTED_GUI_GRPC_PORT = 64_321
@@ -4340,6 +4350,137 @@ def _corrected_n1_6_gui_launch_receipt(
     return value
 
 
+def _corrected_n1_6_gui_forensic_state(
+    root: Path = EXACT_N1_6_CORRECTED_GUI_FORENSIC_ROOT,
+) -> dict[str, Any] | None:
+    """Authenticate the immutable read-only Rx-interface failure evidence."""
+
+    manifest_path = root.resolve() / "ui_manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        if (
+            manifest_path.is_symlink()
+            or manifest_path.stat().st_size > MAX_RESPONSE_BYTES
+        ):
+            raise UpdaterError(
+                "corrected GUI forensic manifest is unavailable"
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdaterError(
+            "corrected GUI forensic manifest is unreadable"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise UpdaterError(
+            "corrected GUI forensic manifest must be an object"
+        )
+    unsigned_manifest = copy.deepcopy(manifest)
+    manifest_payload_sha256 = unsigned_manifest.pop("payload_sha256", None)
+    if manifest_payload_sha256 != canonical_sha256(unsigned_manifest):
+        raise UpdaterError(
+            "corrected GUI forensic manifest seal drifted"
+        )
+    expected_manifest = {
+        "schema": EXACT_N1_6_CORRECTED_GUI_FORENSIC_UI_SCHEMA,
+        "status": "strict_invalid_rx_main_unpaired",
+        "run_root": str(EXACT_N1_6_CORRECTED_GUI_ROOT),
+        "coverage_passed": False,
+        "scientific_valid": False,
+        "unpaired_interfaces": ["interf158", "interf160"],
+        "scheduler_mutated": False,
+        "solver_or_gui_mutated": False,
+    }
+    for key, expected_value in expected_manifest.items():
+        if manifest.get(key) != expected_value:
+            raise UpdaterError(
+                f"corrected GUI forensic manifest {key} drifted"
+            )
+    evidence_path = Path(str(manifest.get("evidence_path") or "")).resolve()
+    expected_evidence_path = root.resolve() / "sealed_case_parser_evidence.json"
+    if (
+        evidence_path != expected_evidence_path
+        or not evidence_path.is_file()
+        or evidence_path.is_symlink()
+        or evidence_path.stat().st_size > MAX_RESPONSE_BYTES
+    ):
+        raise UpdaterError(
+            "corrected GUI forensic evidence path drifted"
+        )
+    try:
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdaterError(
+            "corrected GUI forensic evidence is unreadable"
+        ) from exc
+    if not isinstance(evidence, dict):
+        raise UpdaterError(
+            "corrected GUI forensic evidence must be an object"
+        )
+    unsigned_evidence = copy.deepcopy(evidence)
+    evidence_payload_sha256 = unsigned_evidence.pop("payload_sha256", None)
+    parser_output = evidence.get("parser_output")
+    implication = evidence.get("strict_scientific_implication")
+    run_identity = evidence.get("run_identity")
+    mutation = evidence.get("mutation_attestation")
+    if (
+        evidence_payload_sha256 != canonical_sha256(unsigned_evidence)
+        or evidence_payload_sha256
+        != manifest.get("evidence_payload_sha256")
+        or evidence.get("schema")
+        != EXACT_N1_6_CORRECTED_GUI_FORENSIC_EVIDENCE_SCHEMA
+        or not isinstance(parser_output, dict)
+        or parser_output.get("schema")
+        != "thermal-rx-block-interface-coverage-v1"
+        or parser_output.get("passed") is not False
+        or parser_output.get("missing_fluid_coupling")
+        != ["Rx_main_block_xn", "Rx_main_block_yp"]
+        or parser_output.get("unpaired_interfaces")
+        != ["interf158", "interf160"]
+        or not isinstance(implication, dict)
+        or implication.get("temperature_outputs_promotion_eligible")
+        is not False
+        or implication.get("thermal_result_scientific_valid_expected")
+        is not False
+        or not isinstance(run_identity, dict)
+        or run_identity.get("canonical_geometry_sha256")
+        != EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256
+        or run_identity.get("controller_pid")
+        != EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID
+        or run_identity.get("aedt_pid")
+        != EXACT_N1_6_CORRECTED_GUI_AEDT_PID
+        or not isinstance(mutation, dict)
+        or any(
+            mutation.get(key) is not False
+            for key in (
+                "gui_mutated",
+                "jobs_cancelled_or_resubmitted",
+                "scheduler_mutated",
+                "solver_process_mutated",
+            )
+        )
+    ):
+        raise UpdaterError(
+            "corrected GUI forensic evidence contract drifted"
+        )
+    return {
+        "manifest_payload_sha256": manifest_payload_sha256,
+        "manifest_file_sha256": _file_sha256(manifest_path),
+        "evidence_payload_sha256": evidence_payload_sha256,
+        "evidence_file_sha256": _file_sha256(evidence_path),
+        "case_size_bytes": int(manifest["case_size_bytes"]),
+        "case_identity_sha256_sample": str(
+            manifest["case_identity_sha256_sample"]
+        ),
+        "unpaired_interfaces": list(parser_output["unpaired_interfaces"]),
+        "missing_fluid_coupling": list(
+            parser_output["missing_fluid_coupling"]
+        ),
+        "scientific_valid": False,
+        "coverage_passed": False,
+    }
+
+
 def _corrected_n1_6_gui_solver_stage(
     root: Path = EXACT_N1_6_CORRECTED_GUI_ROOT,
 ) -> dict[str, Any]:
@@ -4443,6 +4584,11 @@ def _corrected_n1_6_gui_fea_card(
     )
     receipt = _corrected_n1_6_gui_launch_receipt(root)
     receipt_verified = receipt is not None
+    forensic = (
+        _corrected_n1_6_gui_forensic_state()
+        if root.resolve() == EXACT_N1_6_CORRECTED_GUI_ROOT.resolve()
+        else None
+    )
     project_path = (
         root.resolve() / "simulation" / "simulation1" / "simulation1.aedt"
     )
@@ -4481,14 +4627,32 @@ def _corrected_n1_6_gui_fea_card(
     progress = progress_by_stage.get(str(stage["stage"]), 10)
     if stage["state"] == "completed":
         progress += 5
-    return {
-        "id": EXACT_N1_6_CORRECTED_GUI_FEA_CARD_ID,
-        "title": (
+    if forensic is not None:
+        progress = 100
+    title = (
+        (
+            "CORRECTED GUI STRICT INVALID | EXACT 6/60 | "
+            "RX-MAIN interf158/160 WALL | NOT DESIGN FAILURE"
+        )
+        if forensic is not None
+        else (
             "CORRECTED VISIBLE GUI | EXACT 6/60 | "
-            f"{stage_label} NATIVE {stage_state} | 4-CORE | {process_state} | "
-            f"CANARY97041 {canary_state.upper()} {canary_node}/j{canary_job}"
-        ),
-        "detail": (
+            f"{stage_label} NATIVE {stage_state} | 4-CORE | "
+            f"{process_state} | CANARY97041 {canary_state.upper()} "
+            f"{canary_node}/j{canary_job}"
+        )
+    )
+    detail = (
+        (
+            "The corrected exact 6/60 local run has now produced a native "
+            "Fluent case that proves both Rx_main block interfaces were reset "
+            "to wall without fluid coupling. Any later temperatures from this "
+            "run are diagnostic only. This is a thermal interface-generation "
+            "failure, not evidence that the physical design exceeds its "
+            "temperature limits; the live solver remains untouched."
+        )
+        if forensic is not None
+        else (
             "A fresh corrected exact 6/60 symmetric, eighth, nonrounded GUI "
             f"full-chain run is active at the {stage_label} native "
             f"{str(stage['state']).lower()} stage with a four-core local "
@@ -4497,9 +4661,51 @@ def _corrected_n1_6_gui_fea_card(
             "temperatures, and scientific validity remain pending unless "
             "their explicit markers are shown below. Corrected Slurm canary "
             f"task97041 is {canary_state.upper()} on {canary_node}."
-        ),
+        )
+    )
+    interface_evidence = (
+        (
+            "local thermal dispatch observed="
+            f"{str(stage['thermal_dispatch_observed']).lower()} / "
+            "Rx native case coverage=false / unpaired interfaces="
+            f"{','.join(forensic['unpaired_interfaces'])} / case bytes="
+            f"{forensic['case_size_bytes']} / sampled identity SHA256="
+            f"{forensic['case_identity_sha256_sample']} / temperatures="
+            "diagnostic-only"
+        )
+        if forensic is not None
+        else (
+            "local thermal dispatch observed="
+            f"{str(stage['thermal_dispatch_observed']).lower()} / "
+            "Rx native preflight marker observed="
+            f"{str(stage['thermal_preflight_observed']).lower()} / "
+            "native interface coverage=pending / temperatures=pending"
+        )
+    )
+    scientific_evidence = (
+        (
+            "scientific_valid=false / production_eligible=false / "
+            "classification=thermal interface-generation failure / "
+            "candidate temperature rejection forbidden / forensic evidence "
+            f"payload SHA256={forensic['evidence_payload_sha256']} / "
+            "manifest payload SHA256="
+            f"{forensic['manifest_payload_sha256']}"
+        )
+        if forensic is not None
+        else (
+            "scientific_valid=pending / production_eligible=false / "
+            "paired native interfaces + no 4990K limiter + authenticated "
+            "temperatures are required before any PASS"
+        )
+    )
+    return {
+        "id": EXACT_N1_6_CORRECTED_GUI_FEA_CARD_ID,
+        "title": title,
+        "detail": detail,
         "state": (
-            "in_progress"
+            "attention"
+            if forensic is not None
+            else "in_progress"
             if controller_active and aedt_active and receipt_verified
             else "attention"
         ),
@@ -4535,13 +4741,7 @@ def _corrected_n1_6_gui_fea_card(
                 f"{','.join(stage['completed_stages']) or 'none'} / "
                 f"local solver cores={EXACT_N1_6_CORRECTED_GUI_SOLVER_CORES}"
             ),
-            (
-                "local thermal dispatch observed="
-                f"{str(stage['thermal_dispatch_observed']).lower()} / "
-                "Rx native preflight marker observed="
-                f"{str(stage['thermal_preflight_observed']).lower()} / "
-                "native interface coverage=pending / temperatures=pending"
-            ),
+            interface_evidence,
             (
                 "fixed cooling unchanged: dual fan 1.5m/s / "
                 "core+winding TIM 2.0mm / k=0.2W/mK"
@@ -4561,11 +4761,7 @@ def _corrected_n1_6_gui_fea_card(
                 "canonical geometry SHA256="
                 f"{EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256}"
             ),
-            (
-                "scientific_valid=pending / production_eligible=false / "
-                "paired native interfaces + no 4990K limiter + authenticated "
-                "temperatures are required before any PASS"
-            ),
+            scientific_evidence,
             (
                 "observation mode=read-only / Scheduler method=GET / "
                 "solver process mutation=false"
