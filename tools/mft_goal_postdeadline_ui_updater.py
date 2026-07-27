@@ -4703,7 +4703,7 @@ def _corrected_n1_6_gui_fea_card(
         "title": title,
         "detail": detail,
         "state": (
-            "attention"
+            "in_progress"
             if forensic is not None
             else "in_progress"
             if controller_active and aedt_active and receipt_verified
