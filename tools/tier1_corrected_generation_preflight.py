@@ -191,15 +191,15 @@ GOAL_DIAGNOSTIC_L900_SIZE_LIMITS_MM = {
 GOAL_DIAGNOSTIC_L900_COMPACT_STRATA = {
     "compact_A": {
         "W_mm": [1160.0, 1170.0],
-        "L_mm": [875.0, 900.0],
+        "L_mm": [899.5, 900.0],
     },
     "compact_B": {
         "W_mm": [1170.0, 1200.0],
-        "L_mm": [850.0, 875.0],
+        "L_mm": [899.0, 899.5],
     },
     "compact_C": {
         "W_mm": [1160.0, 1170.0],
-        "L_mm": [850.0, 875.0],
+        "L_mm": [899.0, 899.5],
     },
     "height_boundary": {
         "H_mm": [740.0, 750.0],
@@ -2278,6 +2278,22 @@ def build_goal_compact_coordinate_bank(
             name, physical
         )
 
+    alignment = (
+        (getattr(problem, "geometry_constraint_profile", None) or {}).get(
+            "winding_height_alignment"
+        )
+        or {}
+    )
+    exact_equal_height = (
+        alignment.get("mode") == "hard"
+        and math.isclose(
+            float(alignment.get("minimum_overlap_ratio", 0.0)),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        )
+    )
+
     for stratum_index, stratum in enumerate(
         contract["active_strata_for_this_N1"]
     ):
@@ -2287,6 +2303,14 @@ def build_goal_compact_coordinate_bank(
         while accepted < required[stratum] and attempts < maximum_attempts_per_stratum:
             attempts += 1
             coordinate = rng.random(problem.n_var)
+            if exact_equal_height:
+                # wh1 cannot decode below 0.8.  Keep h1 high enough that the
+                # 40 mm secondary-yoke insulation limit also permits wh2>=0.8,
+                # then initialize both height fractions identically.
+                set_physical(coordinate, "l1", rng.uniform(60.0, 85.0))
+                equal_fraction = rng.uniform(0.80, 0.86)
+                set_physical(coordinate, "wh1", equal_fraction)
+                set_physical(coordinate, "wh2", equal_fraction)
             topology = topology_cycle[
                 (stratum_index * required[stratum] + accepted + attempts - 1)
                 % len(topology_cycle)
@@ -2323,7 +2347,12 @@ def build_goal_compact_coordinate_bank(
                 )
                 set_physical(coordinate, "w1", rng.uniform(450.0, 700.0))
                 set_physical(
-                    coordinate, "total_height", rng.uniform(560.0, 750.0)
+                    coordinate,
+                    "total_height",
+                    rng.uniform(
+                        680.0 if exact_equal_height else 560.0,
+                        750.0,
+                    ),
                 )
                 for name in (
                     "cc_w2c_space_y",
