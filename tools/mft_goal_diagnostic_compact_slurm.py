@@ -284,11 +284,14 @@ def _physics_delta_execution_contract(
             "mft_goal_corrected_physics_nsga_lane.py"
         )
         or not isinstance(split_repair, Mapping)
+        or split_repair.get("schema_version")
+        != "mft-goal-corrected-N2-split-local-repair-v3"
         or split_repair.get("fixed_total_secondary_turns") != 60
         or split_repair.get("N2_main_minimum") != 12
-        or split_repair.get("N2_main_maximum") != 60
+        or split_repair.get("N2_main_maximum") != 59
+        or split_repair.get("N2_side_minimum") != 1
         or split_repair.get("N2_main_integer_values")
-        != list(range(12, 61))
+        != list(range(12, 60))
         or split_repair.get("selection") != "minimum_robust_Llt_G"
         or split_repair.get("original_split_early_hard_rejection_allowed")
         is not False

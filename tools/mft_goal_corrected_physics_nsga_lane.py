@@ -116,7 +116,11 @@ CORRECTED_RUNTIME_TOOL_FILES = (
 )
 PHYSICS_CONSTRAINT_NAME = "physics_delta_fRx_q90_lcb_minimum"
 SPLIT_MIN_N2_MAIN = 12
-SPLIT_MAX_N2_MAIN = 60
+# The turn-graded energy network contains an explicit main/side bridge and
+# therefore requires at least one physical turn in each section.  The base
+# decoder can project the endpoint to 60/0, so the corrected local repair must
+# not admit that endpoint as an evaluable phenotype.
+SPLIT_MAX_N2_MAIN = 59
 SPLIT_VALUES = tuple(range(SPLIT_MIN_N2_MAIN, SPLIT_MAX_N2_MAIN + 1))
 L_PRIMARY_H = 0.002
 L_SECONDARY_H = 0.2
@@ -341,10 +345,11 @@ def _physics_gate(model: Mapping[str, Any]) -> dict[str, Any]:
 
 def _turn_split_repair_contract() -> dict[str, Any]:
     return {
-        "schema_version": "mft-goal-corrected-N2-split-local-repair-v2",
+        "schema_version": "mft-goal-corrected-N2-split-local-repair-v3",
         "fixed_total_secondary_turns": 60,
         "N2_main_minimum": SPLIT_MIN_N2_MAIN,
         "N2_main_maximum": SPLIT_MAX_N2_MAIN,
+        "N2_side_minimum": 1,
         "N2_main_integer_values": list(SPLIT_VALUES),
         "enumerated_split_count_per_geometry": len(SPLIT_VALUES),
         "decoder_coordinate_name": "u_N2_side",
@@ -619,7 +624,7 @@ def _expanded_fixed_geometry_split_frame(
     """Enumerate the integer secondary split without moving the geometry.
 
     The base decoder's coordinate projection depends on ``u_N2_side``.  Calling
-    that projection 49 times therefore changes l1/l2/spacing in addition to the
+    that projection 48 times therefore changes l1/l2/spacing in addition to the
     requested turn split.  A local repair must instead hold the decoded
     geometry, conductor section and insulation gaps fixed and update only the
     exact split-dependent derived quantities used by Llt inference.
@@ -840,7 +845,7 @@ def _expanded_fixed_geometry_split_frame(
 
     # A decoder exception produces an empty/NaN base row and is already
     # rejected by the finite checks.  A merely split-specific invalid base row
-    # is deliberately not copied to all 49 alternatives.
+    # is deliberately not copied to all 48 alternatives.
     base_valid = np.asarray(decoder_valid, dtype=bool).reshape(-1)
     if base_valid.shape != (count,):
         raise RuntimeError("N2 split base decoder-valid shape mismatch")
@@ -855,7 +860,7 @@ def _install_turn_split_local_repair(
 ) -> dict[str, Any]:
     """Select the minimum robust-Llt integer split before hard evaluation.
 
-    Only the Llt model is evaluated for the 49-way local enumeration.  The
+    Only the Llt model is evaluated for the 48-way local enumeration.  The
     complete thermal/core/size evaluator and the physics capacitance network
     are then evaluated once at the selected repaired phenotype.
     """
@@ -890,7 +895,7 @@ def _install_turn_split_local_repair(
             False,
         ):
             # Compact-bank construction and geometry audits need only the
-            # ordinary decoder.  Running a 49-way Llt ensemble there adds no
+            # ordinary decoder.  Running a 48-way Llt ensemble there adds no
             # optimizer evidence and made sealed prepare repeat the expensive
             # enumeration several times.
             return original_decode(values)

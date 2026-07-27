@@ -255,7 +255,8 @@ def test_frequency_lcb_is_computed_from_q90_ucb(
 
 
 class _FakeProblem:
-    def __init__(self) -> None:
+    def __init__(self, *, llt_optimum_main_turns: int = 30) -> None:
+        self.llt_optimum_main_turns = int(llt_optimum_main_turns)
         self.geometry_constraint_profile_sha256 = scout._geometry_profile(
             20.0
         )["sha256"]
@@ -344,7 +345,7 @@ class _FakeProblem:
         if target == "Llt_phys":
             main = frame["N2_main"].to_numpy(dtype=float)
             return (
-                20.0 + np.abs(main - 30.0),
+                20.0 + np.abs(main - self.llt_optimum_main_turns),
                 np.full(len(frame), 0.25, dtype=float),
             )
         return (
@@ -437,7 +438,7 @@ def test_installed_evaluator_excludes_raw_predictor_and_replaces_G(
         evidence["turn_split_local_repair_installation"][
             "enumerated_split_count_per_geometry"
         ]
-        == 49
+        == 48
     )
     assert problem.hard_constraint_contract[
         "raw_two_net_capacitance_G_present"
@@ -445,6 +446,41 @@ def test_installed_evaluator_excludes_raw_predictor_and_replaces_G(
     assert problem.hard_constraint_contract[
         "legacy_half_magnetizing_resonance_G_present"
     ] is False
+
+
+def test_split_repair_excludes_unevaluable_zero_side_endpoint(
+    profile: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        lane,
+        "_candidate_prediction",
+        lambda _row, _model: {
+            "physics_delta_Crx_mean_F": 4.0e-10,
+            "physics_delta_Crx_q90_ucb_F": 4.8e-10,
+            "physics_delta_fRx_q90_lcb_Hz": 16_250.0,
+            "physics_delta_extrapolation_distance": 1.25,
+        },
+    )
+    problem = _FakeProblem(llt_optimum_main_turns=60)
+    lane._install_search_profile(problem, profile)
+    coordinates = np.zeros((2, problem.n_var), dtype=float)
+    coordinates[:, 2] = preflight._turn_split_unit_coordinate(
+        60, fixed_primary_turns=6
+    )
+    out: dict[str, Any] = {}
+    problem._evaluate(coordinates, out)
+
+    assert out["frame"]["N2_main"].astype(int).tolist() == [59, 59]
+    assert out["frame"]["N2_side"].astype(int).tolist() == [1, 1]
+    assert (
+        out["frame"]["split_repair_enumerated_split_count"]
+        .astype(int)
+        .tolist()
+        == [48, 48]
+    )
+    assert np.isfinite(out["F"]).all()
+    assert np.isfinite(out["G"]).all()
 
 
 def test_plain_decode_bypasses_expensive_split_enumeration(
