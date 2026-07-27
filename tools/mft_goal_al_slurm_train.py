@@ -268,11 +268,15 @@ def _validate_dataset_manifest(
     admission = manifest.get("retraining_admission")
     output = manifest.get("output_dataset")
     next_campaign = manifest.get("next_campaign_contract")
+    collection_facts = manifest.get("authenticated_standard_collections")
+    thermal_truth = manifest.get("authenticated_thermal_mesh_truth")
     if (
         not isinstance(repository, Mapping)
         or not isinstance(admission, Mapping)
         or not isinstance(output, Mapping)
         or not isinstance(next_campaign, Mapping)
+        or not isinstance(collection_facts, list)
+        or not isinstance(thermal_truth, Mapping)
     ):
         raise ALTrainingError("strict AL dataset manifest is incomplete")
     revision = str(repository.get("revision") or "").lower()
@@ -325,6 +329,26 @@ def _validate_dataset_manifest(
         or manifest.get("old_generation_result_mixing_allowed") is not False
     ):
         raise ALTrainingError("strict AL retraining admission is not satisfied")
+    if (
+        len(collection_facts) < strict_al.DEFAULT_MINIMUM_USEFUL_ROWS
+        or any(
+            not isinstance(fact, Mapping)
+            or fact.get("thermal_mesh_policy")
+            != strict_al.REQUIRED_THERMAL_MESH_POLICY
+            or fact.get("thermal_mesh_plan_contract_version")
+            != strict_al.REQUIRED_THERMAL_MESH_PLAN_CONTRACT_VERSION
+            for fact in collection_facts
+        )
+        or thermal_truth.get("thermal_mesh_policy")
+        != strict_al.REQUIRED_THERMAL_MESH_POLICY
+        or thermal_truth.get("thermal_mesh_plan_contract_version")
+        != strict_al.REQUIRED_THERMAL_MESH_PLAN_CONTRACT_VERSION
+        or thermal_truth.get("authenticated_row_count") != len(collection_facts)
+        or thermal_truth.get("every_authenticated_row_exact_B7_v8") is not True
+    ):
+        raise ALTrainingError(
+            "strict AL dataset does not contain only exact B7/v8 thermal truth"
+        )
     if (
         int(next_campaign.get("seed_start", -1))
         != strict_al.NEXT_CAMPAIGN_SEED_START

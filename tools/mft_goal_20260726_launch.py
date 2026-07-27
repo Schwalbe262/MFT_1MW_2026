@@ -102,6 +102,7 @@ COMPACT_ACQUISITION_LIMIT = 12
 FRESH_AL_SEED_START = 2_607_263_000
 FRESH_AL_SEED_COUNT = 512
 FRESH_AL_SEED_END = FRESH_AL_SEED_START + FRESH_AL_SEED_COUNT - 1
+FRESH512_ACTIVATION_SCHEMA = "mft-goal-fresh512-search-activation-v1"
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -346,6 +347,364 @@ def seed_assignments(
     return result
 
 
+def _is_exact_fresh512_assignment_set(
+    assignments: list[dict[str, Any]],
+) -> bool:
+    if len(assignments) != FRESH_AL_SEED_COUNT:
+        return False
+    seeds = sorted(int(item.get("seed", -1)) for item in assignments)
+    if seeds != list(range(FRESH_AL_SEED_START, FRESH_AL_SEED_END + 1)):
+        return False
+    counts = {
+        turns: sum(
+            int(item.get("fixed_primary_turns", -1)) == turns
+            for item in assignments
+        )
+        for turns in GOAL_PRIMARY_TURN_STRATA
+    }
+    return counts == {
+        turns: FRESH_AL_SEED_COUNT // len(GOAL_PRIMARY_TURN_STRATA)
+        for turns in GOAL_PRIMARY_TURN_STRATA
+    }
+
+
+def _authenticate_fresh512_b7_v8_dataset_manifest(
+    runtime_dataset: Path,
+    *,
+    local_preflight: Mapping[str, Any],
+) -> dict[str, Any]:
+    dataset = runtime_dataset.resolve(strict=True)
+    manifest_path = (dataset.parent / "manifest.json").resolve(strict=True)
+    manifest = _validate_seal(
+        _read_json(manifest_path),
+        schema="mft-goal-strict-al-dataset-v1",
+    )
+    output = manifest.get("output_dataset") or {}
+    admission = manifest.get("retraining_admission") or {}
+    next_campaign = manifest.get("next_campaign_contract") or {}
+    collections = manifest.get("authenticated_standard_collections")
+    thermal_truth = manifest.get("authenticated_thermal_mesh_truth") or {}
+    required_policy = (
+        "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+    )
+    required_plan = "thermal-mesh-plan-v8"
+    if (
+        not isinstance(collections, list)
+        or len(collections) < 8
+        or output.get("path") != dataset.name
+        or int(output.get("size_bytes", -1)) != dataset.stat().st_size
+        or output.get("sha256") != adapter.sha256_file(dataset)
+        or output.get("sha256") != local_preflight.get("dataset_sha256")
+        or admission.get("allowed") is not True
+        or admission.get("reasons") != []
+        or int(admission.get("strict_new_rows", -1)) < 8
+        or int(admission.get("unique_source_tasks", -1)) < 4
+        or next_campaign.get("seed_start") != FRESH_AL_SEED_START
+        or next_campaign.get("seed_end_inclusive") != FRESH_AL_SEED_END
+        or next_campaign.get("seed_count") != FRESH_AL_SEED_COUNT
+        or next_campaign.get("all_four_N1_strata_required") is not True
+        or next_campaign.get("single_dataset_sha256_required")
+        != output.get("sha256")
+        or next_campaign.get("single_model_generation_required") is not True
+        or next_campaign.get("old_generation_result_mixing_allowed") is not False
+        or thermal_truth.get("thermal_mesh_policy") != required_policy
+        or thermal_truth.get("thermal_mesh_plan_contract_version")
+        != required_plan
+        or thermal_truth.get("authenticated_row_count") != len(collections)
+        or thermal_truth.get("every_authenticated_row_exact_B7_v8") is not True
+        or any(
+            not isinstance(fact, Mapping)
+            or fact.get("thermal_mesh_policy") != required_policy
+            or fact.get("thermal_mesh_plan_contract_version") != required_plan
+            for fact in collections
+        )
+    ):
+        raise RuntimeError(
+            "fresh512 activation requires one admitted exact B7/v8 strict dataset"
+        )
+    return {
+        "manifest_path": str(manifest_path),
+        "manifest_file_sha256": adapter.sha256_file(manifest_path),
+        "manifest_payload_sha256": manifest["payload_sha256"],
+        "dataset_sha256": output["sha256"],
+        "dataset_size_bytes": int(output["size_bytes"]),
+        "authenticated_row_count": len(collections),
+        "unique_source_tasks": int(admission["unique_source_tasks"]),
+        "thermal_mesh_policy": required_policy,
+        "thermal_mesh_plan_contract_version": required_plan,
+        "every_authenticated_row_exact_B7_v8": True,
+    }
+
+
+def build_fresh512_search_activation(
+    *,
+    local_preflight: Mapping[str, Any],
+    runtime_dataset: Path,
+    first_runner: preflight.Current7Tier1Runner,
+    assignments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build, but never submit, the exact B7/v8-gated compact search path."""
+
+    _validate_seal(dict(local_preflight), schema=LOCAL_PREFLIGHT_SCHEMA)
+    quality = local_preflight.get("quality") or {}
+    if (
+        not _is_exact_fresh512_assignment_set(assignments)
+        or quality.get("quality_passed") is not True
+        or local_preflight.get("search_only_proposal") is not False
+        or local_preflight.get("fixed_lm2mh_resonance_contract_sha256")
+        != preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
+        or not getattr(
+            first_runner.problem,
+            "_goal_fixed_lm2mh_resonance_installed",
+            False,
+        )
+    ):
+        raise RuntimeError(
+            "fresh512 activation is closed until valid B7/v8 retraining passes"
+        )
+    dataset_authentication = _authenticate_fresh512_b7_v8_dataset_manifest(
+        runtime_dataset,
+        local_preflight=local_preflight,
+    )
+    runners: dict[int, preflight.Current7Tier1Runner] = {
+        int(first_runner.problem.fixed_primary_turns): first_runner
+    }
+    for turns in GOAL_PRIMARY_TURN_STRATA:
+        if turns in runners:
+            continue
+        runner = preflight.runner_for_fixed_primary_turns(first_runner, turns)
+        preflight.install_goal_fixed_lm2mh_resonance(runner.problem)
+        runners[turns] = runner
+    compact: dict[str, Any] = {}
+    for turns in GOAL_PRIMARY_TURN_STRATA:
+        runner = runners[turns]
+        contract = preflight.goal_compact_search_contract(turns)
+        bank = preflight.build_goal_compact_coordinate_bank(
+            runner.problem,
+            seed=FRESH_AL_SEED_START + turns,
+            compact_contract=contract,
+        )
+        compact[str(turns)] = {
+            "contract": contract,
+            "contract_sha256": contract["sha256"],
+            "coordinate_bank": bank,
+            "coordinate_bank_sha256": bank["sha256"],
+        }
+    global_membership_counts = {
+        stratum: sum(
+            int(compact[str(turns)]["coordinate_bank"][
+                "membership_counts"
+            ][stratum])
+            for turns in GOAL_PRIMARY_TURN_STRATA
+        )
+        for stratum in preflight.GOAL_COMPACT_STRATA
+    }
+    if (
+        any(count < 1 for count in global_membership_counts.values())
+        or compact["5"]["coordinate_bank"]["membership_counts"]["compact_C"]
+        != 0
+        or not all(
+            compact[str(turns)]["coordinate_bank"]["membership_counts"][
+                "compact_C"
+            ]
+            >= 2
+            for turns in (6, 7, 8)
+        )
+    ):
+        raise RuntimeError(
+            "fresh512 compact banks do not provide exact global A/B/C/H coverage"
+        )
+    value = {
+        "schema_version": FRESH512_ACTIVATION_SCHEMA,
+        "campaign_id": "mft-goal-20260726",
+        "local_preflight_payload_sha256": local_preflight["payload_sha256"],
+        "dataset_authentication": dataset_authentication,
+        "dataset_sha256": local_preflight["dataset_sha256"],
+        "evaluation_model_sha256": local_preflight["evaluation_model_sha256"],
+        "quality_status_sha256": local_preflight["quality_status_sha256"],
+        "quality_passed": True,
+        "search_only_proposal": False,
+        "seed_start": FRESH_AL_SEED_START,
+        "seed_end_inclusive": FRESH_AL_SEED_END,
+        "seed_count": FRESH_AL_SEED_COUNT,
+        "seeds_per_N1_stratum": 128,
+        "fixed_lm2mh_resonance_contract": (
+            preflight.goal_fixed_lm2mh_resonance_contract()
+        ),
+        "fixed_lm2mh_resonance_contract_sha256": (
+            preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
+        ),
+        "effective_hard_constraint_contract_sha256": local_preflight[
+            "hard_constraint_contract_sha256"
+        ],
+        "compact_by_N1": compact,
+        "global_compact_membership_counts": global_membership_counts,
+        "global_exact_A_B_C_and_independent_H_coverage": True,
+        "core_center_gap_mm_search_coordinate": False,
+        "core_center_gap_mm_symmetric_FEA_synthesis_required": True,
+        "physical_Lm_2mH_verified": False,
+        "compact_scout_role": "surrogate_screening_only",
+        "compact_scout_production_or_final_design_claim_allowed": False,
+        "symmetric_FEA_validation_still_required": True,
+        "invalid_or_near_band_fallback_allowed": False,
+        "legacy_campaign_behavior_changed": False,
+        "scheduler_write_performed": False,
+        "scheduler_submission_performed": False,
+    }
+    return _seal(value)
+
+
+def validate_fresh512_search_activation(
+    value: Mapping[str, Any],
+    *,
+    local_preflight: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    activation = _validate_seal(
+        dict(value), schema=FRESH512_ACTIVATION_SCHEMA
+    )
+    compact = activation.get("compact_by_N1") or {}
+    resonance = activation.get("fixed_lm2mh_resonance_contract") or {}
+    dataset_authentication = activation.get("dataset_authentication") or {}
+    required_policy = (
+        "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+    )
+    if (
+        activation.get("seed_start") != FRESH_AL_SEED_START
+        or activation.get("seed_end_inclusive") != FRESH_AL_SEED_END
+        or activation.get("seed_count") != FRESH_AL_SEED_COUNT
+        or activation.get("seeds_per_N1_stratum") != 128
+        or set(compact) != {str(turns) for turns in GOAL_PRIMARY_TURN_STRATA}
+        or resonance != preflight.goal_fixed_lm2mh_resonance_contract()
+        or activation.get("fixed_lm2mh_resonance_contract_sha256")
+        != resonance.get("sha256")
+        or activation.get("quality_passed") is not True
+        or activation.get("search_only_proposal") is not False
+        or activation.get("invalid_or_near_band_fallback_allowed") is not False
+        or activation.get("compact_scout_role") != "surrogate_screening_only"
+        or activation.get(
+            "compact_scout_production_or_final_design_claim_allowed"
+        )
+        is not False
+        or activation.get("symmetric_FEA_validation_still_required") is not True
+        or activation.get("scheduler_write_performed") is not False
+        or activation.get("scheduler_submission_performed") is not False
+        or dataset_authentication.get("dataset_sha256")
+        != activation.get("dataset_sha256")
+        or int(dataset_authentication.get("authenticated_row_count", -1)) < 8
+        or int(dataset_authentication.get("unique_source_tasks", -1)) < 4
+        or dataset_authentication.get("thermal_mesh_policy")
+        != required_policy
+        or dataset_authentication.get("thermal_mesh_plan_contract_version")
+        != "thermal-mesh-plan-v8"
+        or dataset_authentication.get(
+            "every_authenticated_row_exact_B7_v8"
+        )
+        is not True
+    ):
+        raise RuntimeError("fresh512 search activation contract mismatch")
+    for turns in GOAL_PRIMARY_TURN_STRATA:
+        item = compact[str(turns)]
+        contract = preflight.validate_goal_compact_search_contract(
+            item.get("contract") or {},
+            fixed_primary_turns=turns,
+        )
+        bank = item.get("coordinate_bank") or {}
+        unsigned_bank = {
+            key: value for key, value in bank.items() if key != "sha256"
+        }
+        rows = bank.get("rows")
+        coordinates = bank.get("coordinates")
+        if not isinstance(rows, list) or not isinstance(coordinates, list):
+            raise RuntimeError("fresh512 compact bank rows are unavailable")
+        recomputed_memberships = {
+            stratum: sum(
+                stratum in (row.get("memberships") or [])
+                for row in rows
+                if isinstance(row, Mapping)
+            )
+            for stratum in contract["strata"]
+        }
+        required_memberships = {
+            stratum: (
+                int(
+                    contract["initialization"][
+                        "minimum_exact_rows_height_boundary"
+                    ]
+                )
+                if stratum == "height_boundary"
+                else int(
+                    contract["initialization"][
+                        "minimum_exact_rows_per_WL_stratum"
+                    ]
+                )
+            )
+            for stratum in contract["active_strata_for_this_N1"]
+        }
+        if (
+            item.get("contract_sha256") != contract["sha256"]
+            or item.get("coordinate_bank_sha256") != bank.get("sha256")
+            or bank.get("sha256") != canonical_sha256(unsigned_bank)
+            or bank.get("schema_version") != preflight.GOAL_COMPACT_BANK_SCHEMA
+            or bank.get("compact_search_contract_sha256")
+            != contract["sha256"]
+            or bank.get("fixed_primary_turns") != turns
+            or len(rows) != len(coordinates)
+            or bank.get("coordinate_sha256")
+            != canonical_sha256(coordinates)
+            or bank.get("membership_counts") != recomputed_memberships
+            or any(
+                recomputed_memberships[stratum] < count
+                for stratum, count in required_memberships.items()
+            )
+            or sum(
+                bool(value)
+                for value in (bank.get("topology_counts") or {}).values()
+            )
+            < int(
+                contract["initialization"][
+                    "minimum_distinct_N2_main_topologies"
+                ]
+            )
+            or bank.get(
+                "decoder_repair_and_exact_dimension_replay_performed"
+            )
+            is not True
+            or bank.get("near_band_fallback_used") is not False
+        ):
+            raise RuntimeError("fresh512 compact activation bank mismatch")
+    recomputed_global = {
+        stratum: sum(
+            int(compact[str(turns)]["coordinate_bank"][
+                "membership_counts"
+            ][stratum])
+            for turns in GOAL_PRIMARY_TURN_STRATA
+        )
+        for stratum in preflight.GOAL_COMPACT_STRATA
+    }
+    if (
+        activation.get("global_compact_membership_counts")
+        != recomputed_global
+        or activation.get(
+            "global_exact_A_B_C_and_independent_H_coverage"
+        )
+        is not True
+        or any(count < 1 for count in recomputed_global.values())
+    ):
+        raise RuntimeError("fresh512 global compact coverage is incomplete")
+    if local_preflight is not None and (
+        activation.get("local_preflight_payload_sha256")
+        != local_preflight.get("payload_sha256")
+        or activation.get("dataset_sha256")
+        != local_preflight.get("dataset_sha256")
+        or activation.get("evaluation_model_sha256")
+        != local_preflight.get("evaluation_model_sha256")
+        or activation.get("effective_hard_constraint_contract_sha256")
+        != local_preflight.get("hard_constraint_contract_sha256")
+    ):
+        raise RuntimeError("fresh512 activation differs from local preflight")
+    return activation
+
+
 def _quality_contract(
     *, quality: Mapping[str, Any], code_root: Path
 ) -> dict[str, Any]:
@@ -502,6 +861,18 @@ def run_local_preflight(
         )
         for turns in GOAL_PRIMARY_TURN_STRATA
     }
+    fixed_lm_installations = {
+        str(turns): preflight.install_goal_fixed_lm2mh_resonance(
+            runners[str(turns)].problem
+        )[1]
+        for turns in GOAL_PRIMARY_TURN_STRATA
+    }
+    effective_hard_hashes = {
+        runner.problem.hard_constraint_contract_sha256
+        for runner in runners.values()
+    }
+    if len(effective_hard_hashes) != 1:
+        raise RuntimeError("fixed-Lm effective hard contract differs by N1 stratum")
     strata: dict[str, Any] = {}
     for turns in GOAL_PRIMARY_TURN_STRATA:
         runner = runners[str(turns)]
@@ -549,6 +920,9 @@ def run_local_preflight(
             "model_smoke_sha256": canonical_sha256(model_smoke),
             "all_24_required_models_exercised": True,
             "decoded_and_finite": True,
+            "fixed_lm2mh_resonance_installation": (
+                fixed_lm_installations[str(turns)]
+            ),
         }
     artifacts = first.authenticated.report["artifacts"]
     value = {
@@ -563,6 +937,15 @@ def run_local_preflight(
         ),
         "hard_constraint_contract_sha256": (
             first.problem.hard_constraint_contract_sha256
+        ),
+        "base_hard_constraint_contract_sha256": (
+            first.problem._goal_base_hard_constraint_contract_sha256
+        ),
+        "fixed_lm2mh_resonance_contract": (
+            first.problem._goal_fixed_lm2mh_resonance_contract
+        ),
+        "fixed_lm2mh_resonance_contract_sha256": (
+            first.problem._goal_fixed_lm2mh_resonance_contract["sha256"]
         ),
         "operating_point_sha256": FIXED_OPERATING_IDENTITY_SHA256,
         "cooling_contract_sha256": FIXED_COOLING_IDENTITY_SHA256,
@@ -614,6 +997,7 @@ def build_bundle_values(
     output_root: Path,
     source: Mapping[str, str],
     code_manifest: Mapping[str, Any],
+    fresh512_search_activation: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     _validate_seal(dict(local_preflight), schema=LOCAL_PREFLIGHT_SCHEMA)
     validated_code_manifest = _validate_seal(
@@ -637,6 +1021,22 @@ def build_bundle_values(
         is not False
     ):
         raise RuntimeError("goal bundle source/code manifest mismatch")
+    exact_fresh512 = _is_exact_fresh512_assignment_set(assignments)
+    if exact_fresh512:
+        if fresh512_search_activation is None:
+            raise RuntimeError(
+                "reserved fresh512 bundle requires a valid compact activation"
+            )
+        activation = validate_fresh512_search_activation(
+            fresh512_search_activation,
+            local_preflight=local_preflight,
+        )
+    else:
+        if fresh512_search_activation is not None:
+            raise RuntimeError(
+                "fresh512 compact activation cannot change legacy/nonreserved runs"
+            )
+        activation = None
     tasks: list[dict[str, Any]] = []
     for assignment in assignments:
         seed = int(assignment["seed"])
@@ -705,6 +1105,10 @@ def build_bundle_values(
                 "legacy_current7_stage_or_release_identity_reused": False,
                 "production_eligible": False,
                 "automatic_promotion_allowed": False,
+                "fresh512_search_activation": (
+                    copy.deepcopy(activation) if exact_fresh512 else None
+                ),
+                "fresh512_compact_active": exact_fresh512,
             }
         )
         tasks.append(task)
@@ -765,6 +1169,10 @@ def build_bundle_values(
             "legacy_current7_bundle_or_release_identity_reused": False,
             "production_eligible": False,
             "automatic_promotion_allowed": False,
+            "fresh512_search_activation_payload_sha256": (
+                None if activation is None else activation["payload_sha256"]
+            ),
+            "fresh512_compact_active": exact_fresh512,
         }
     )
     canary = [task["seed"] for task in tasks if task["phase"] == "canary"]
@@ -811,6 +1219,10 @@ def build_bundle_values(
             "scheduler_submission_performed": False,
             "production_eligible": False,
             "automatic_promotion_allowed": False,
+            "fresh512_search_activation_payload_sha256": (
+                None if activation is None else activation["payload_sha256"]
+            ),
+            "fresh512_compact_active": exact_fresh512,
         }
     )
     return bundle, tasks, scheduler
@@ -833,6 +1245,30 @@ def validate_task_payload(value: Any) -> dict[str, Any]:
             "code_inventory_sha256",
         )
     ]
+    compact_active = task.get("fresh512_compact_active")
+    if not isinstance(compact_active, bool):
+        raise RuntimeError("goal task compact activation flag is invalid")
+    activation = task.get("fresh512_search_activation")
+    if compact_active:
+        if not isinstance(activation, Mapping):
+            raise RuntimeError("fresh512 task lacks compact search activation")
+        activation = validate_fresh512_search_activation(activation)
+        turns = int(task.get("fixed_primary_turns", -1))
+        compact_item = (activation.get("compact_by_N1") or {}).get(str(turns))
+        if (
+            not FRESH_AL_SEED_START
+            <= int(task.get("seed", -1))
+            <= FRESH_AL_SEED_END
+            or not isinstance(compact_item, Mapping)
+            or activation.get("dataset_sha256") != task.get("dataset_sha256")
+            or activation.get("evaluation_model_sha256")
+            != task.get("evaluation_model_sha256")
+            or activation.get("effective_hard_constraint_contract_sha256")
+            != task.get("hard_constraint_contract_sha256")
+        ):
+            raise RuntimeError("fresh512 task activation identity mismatch")
+    elif activation is not None:
+        raise RuntimeError("noncompact task cannot carry fresh512 activation")
     if (
         task.get("goal_contract_schema") != GOAL_CONTRACT_SCHEMA
         or task.get("stage_spec_sha256") != GOAL_STAGE_SPEC_SHA256
@@ -983,12 +1419,25 @@ def prepare_bundle(args: argparse.Namespace) -> Path:
         seed_count=args.seed_count,
         wave_size=args.wave_size,
     )
+    fresh512_activation = None
+    if _is_exact_fresh512_assignment_set(assignments):
+        if args.runtime_dataset is None:
+            raise RuntimeError(
+                "reserved fresh512 preparation requires a strict runtime dataset"
+            )
+        fresh512_activation = build_fresh512_search_activation(
+            local_preflight=local_preflight,
+            runtime_dataset=args.runtime_dataset,
+            first_runner=runner,
+            assignments=assignments,
+        )
     bundle, tasks, scheduler = build_bundle_values(
         local_preflight=local_preflight,
         assignments=assignments,
         output_root=output,
         source=source,
         code_manifest=code_manifest,
+        fresh512_search_activation=fresh512_activation,
     )
     _atomic_json(output / "local_preflight.json", local_preflight)
     for task in tasks:
@@ -999,6 +1448,11 @@ def prepare_bundle(args: argparse.Namespace) -> Path:
         )
         _atomic_json(path, task)
     _atomic_json(output / "scheduler_manifest.json", scheduler)
+    if fresh512_activation is not None:
+        _atomic_json(
+            output / "fresh512_search_activation.json",
+            fresh512_activation,
+        )
     _atomic_json(output / "bundle_manifest.json", bundle)
     return output / "bundle_manifest.json"
 
@@ -1041,6 +1495,9 @@ def execute_seed(args: argparse.Namespace) -> Path:
             if relocated
             else None
         ),
+    )
+    _base_physical_evaluate, fixed_lm_installation = (
+        preflight.install_goal_fixed_lm2mh_resonance(runner.problem)
     )
     source_identity = task["source_identity"]
     if (
@@ -1087,6 +1544,22 @@ def execute_seed(args: argparse.Namespace) -> Path:
             int(task["fixed_primary_turns"])
         )
     )
+    compact_contract = None
+    compact_bank = None
+    if task["fresh512_compact_active"]:
+        activation = validate_fresh512_search_activation(
+            task["fresh512_search_activation"]
+        )
+        compact_item = activation["compact_by_N1"][
+            str(task["fixed_primary_turns"])
+        ]
+        compact_contract = compact_item["contract"]
+        compact_bank = compact_item["coordinate_bank"]
+        preflight.validate_goal_compact_coordinate_bank(
+            runner.problem,
+            compact_bank,
+            compact_contract=compact_contract,
+        )
 
     def seal_pre_optimization(value: Mapping[str, Any]) -> None:
         if (
@@ -1117,6 +1590,8 @@ def execute_seed(args: argparse.Namespace) -> Path:
             preflight.FIXED_GENERATION_TERMINATION_STRATEGY
         ),
         pre_optimization_callback=seal_pre_optimization,
+        compact_search_contract=compact_contract,
+        compact_coordinate_bank=compact_bank,
     )
     artifacts = preflight.persist_search_outputs(
         runner,
@@ -1180,6 +1655,16 @@ def execute_seed(args: argparse.Namespace) -> Path:
             "constraint_names": list(runner.problem.constraint_names),
             "temperature_targets": list(GOAL_TEMPERATURE_TARGETS),
             "optimizer_scaling_contract": scaling,
+            "fixed_lm2mh_resonance_installation": fixed_lm_installation,
+            "fixed_lm2mh_resonance_contract": (
+                runner.problem._goal_fixed_lm2mh_resonance_contract
+            ),
+            "fresh512_compact_active": task["fresh512_compact_active"],
+            "fresh512_search_activation_payload_sha256": (
+                None
+                if not task["fresh512_compact_active"]
+                else task["fresh512_search_activation"]["payload_sha256"]
+            ),
             "optimizer_repair_audit": result.tier1_repair_audit,
             "optimizer_topology_evolution_audit": (
                 result.tier1_topology_evolution_audit
@@ -1319,6 +1804,32 @@ def load_bundle_task_ledger(
         raise RuntimeError("goal bundle task ledger is incomplete")
     if count > 1 and set(turns) != set(GOAL_PRIMARY_TURN_STRATA):
         raise RuntimeError("goal bundle task ledger lacks all N1 strata")
+    compact_active = bundle.get("fresh512_compact_active")
+    activation_sha = bundle.get(
+        "fresh512_search_activation_payload_sha256"
+    )
+    if not isinstance(compact_active, bool):
+        raise RuntimeError("goal bundle compact activation flag is invalid")
+    task_values = list(ledger.values())
+    if compact_active:
+        if (
+            not _is_exact_fresh512_assignment_set(task_values)
+            or not isinstance(activation_sha, str)
+            or any(
+                task.get("fresh512_compact_active") is not True
+                or (task.get("fresh512_search_activation") or {}).get(
+                    "payload_sha256"
+                )
+                != activation_sha
+                for task in task_values
+            )
+        ):
+            raise RuntimeError("goal bundle fresh512 activation ledger mismatch")
+    elif (
+        activation_sha is not None
+        or any(task.get("fresh512_compact_active") is not False for task in task_values)
+    ):
+        raise RuntimeError("legacy goal bundle unexpectedly activated fresh512")
     return bundle, ledger
 
 
@@ -1380,6 +1891,15 @@ def _validated_seed_table(
         or result.get("automatic_promotion_allowed") is not False
         or result.get("legacy_current7_stage_or_release_identity_reused")
         is not False
+        or bool(result.get("fresh512_compact_active", False))
+        is not bool(expected_task.get("fresh512_compact_active", False))
+        or (
+            expected_task.get("fresh512_compact_active") is True
+            and result.get("fresh512_search_activation_payload_sha256")
+            != expected_task["fresh512_search_activation"][
+                "payload_sha256"
+            ]
+        )
     ):
         raise RuntimeError(f"goal seed result contract mismatch: {path}")
     inventory = result.get("artifact_inventory") or {}

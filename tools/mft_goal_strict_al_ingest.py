@@ -111,6 +111,10 @@ NEXT_CAMPAIGN_SEED_COUNT = 512
 NEXT_CAMPAIGN_SEED_END = (
     NEXT_CAMPAIGN_SEED_START + NEXT_CAMPAIGN_SEED_COUNT - 1
 )
+REQUIRED_THERMAL_MESH_POLICY = (
+    "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+)
+REQUIRED_THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v8"
 KST = timezone(timedelta(hours=9))
 STANDARD_MODE = {
     "full_model": 0,
@@ -844,6 +848,14 @@ def _validate_truth_row(
             "authenticated result is not the retained eighth-symmetry "
             "Standard mode"
         )
+    if (
+        result.get("thermal_mesh_policy") != REQUIRED_THERMAL_MESH_POLICY
+        or result.get("thermal_mesh_plan_contract_version")
+        != REQUIRED_THERMAL_MESH_PLAN_CONTRACT_VERSION
+    ):
+        raise StrictALIngestError(
+            "authenticated result is not exact B7/thermal-mesh-plan-v8 truth"
+        )
     observed_temperatures = {}
     for target in GOAL_TEMPERATURE_TARGETS:
         try:
@@ -992,6 +1004,10 @@ def _validate_truth_row(
         "project_name": project_name,
         "saved_at": saved_at,
         "N1": int(n1_number),
+        "thermal_mesh_policy": REQUIRED_THERMAL_MESH_POLICY,
+        "thermal_mesh_plan_contract_version": (
+            REQUIRED_THERMAL_MESH_PLAN_CONTRACT_VERSION
+        ),
         "strict_full_valid": True,
         "all_25_targets_trainable": True,
         "target_readiness": target_readiness,
@@ -1524,6 +1540,22 @@ def build_immutable_bundle(
             "authenticated_standard_collections": list(
                 prepared.collection_records
             ),
+            "authenticated_thermal_mesh_truth": {
+                "thermal_mesh_policy": REQUIRED_THERMAL_MESH_POLICY,
+                "thermal_mesh_plan_contract_version": (
+                    REQUIRED_THERMAL_MESH_PLAN_CONTRACT_VERSION
+                ),
+                "authenticated_row_count": len(
+                    prepared.collection_records
+                ),
+                "every_authenticated_row_exact_B7_v8": all(
+                    record.get("thermal_mesh_policy")
+                    == REQUIRED_THERMAL_MESH_POLICY
+                    and record.get("thermal_mesh_plan_contract_version")
+                    == REQUIRED_THERMAL_MESH_PLAN_CONTRACT_VERSION
+                    for record in prepared.collection_records
+                ),
+            },
             "output_dataset": dataset_record,
             "base_target_eligible_rows": dict(prepared.base_target_rows),
             "output_target_eligible_rows": dict(prepared.output_target_rows),

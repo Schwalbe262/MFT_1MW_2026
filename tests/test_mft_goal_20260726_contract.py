@@ -358,6 +358,115 @@ def test_goal_contract_is_exact_and_forbids_legacy_scalar_fields():
             goal.validate_goal_stage_spec(mutated)
 
 
+def test_fixed_lm2mh_resonance_uses_leakage_and_reflected_turn_ratio():
+    screen = preflight.derive_fixed_lm2mh_self_resonance(
+        {
+            "Llt_phys": 27.5,
+            "C_tx_tx_F": 1.2e-9,
+            "C_rx_rx_F": 12.0e-12,
+        },
+        {
+            "N1_main": 6,
+            "N1_side": 0,
+            "N2_main": 60,
+            "N2_side": 0,
+        },
+    )
+    l_tx = 0.002 + 27.5e-6
+    l_rx = l_tx * 100.0
+    assert screen["primary_resonant_inductance_H"] == pytest.approx(l_tx)
+    assert screen["secondary_resonant_inductance_H"] == pytest.approx(l_rx)
+    assert screen["f_res_tx_fixed_lm2mh_Hz"] == pytest.approx(
+        1.0 / (2.0 * np.pi * np.sqrt(l_tx * 1.2e-9))
+    )
+    assert screen["f_res_rx_fixed_lm2mh_Hz"] == pytest.approx(
+        1.0 / (2.0 * np.pi * np.sqrt(l_rx * 12.0e-12))
+    )
+    assert screen["resonance_contract_schema"] == (
+        preflight.GOAL_FIXED_LM_RESONANCE_SCHEMA
+    )
+
+
+def test_fixed_lm2mh_wrapper_changes_only_resonance_G_before_scaling():
+    problem = _goal_problem(6)
+    coordinate = _coordinate(problem, cw1_unit=0.5, side_unit=0.4)
+    before = {}
+    problem._evaluate(coordinate, before)
+    base_hash = problem.hard_constraint_contract_sha256
+
+    _base_evaluate, installation = (
+        preflight.install_goal_fixed_lm2mh_resonance(problem)
+    )
+    after = {}
+    problem._evaluate(coordinate, after)
+    resonance_index = problem.constraint_index[
+        preflight.RESONANCE_MINIMUM_CONSTRAINT
+    ]
+    other = [
+        index
+        for index in range(problem.n_ieq_constr)
+        if index != resonance_index
+    ]
+    assert np.array_equal(before["G"][:, other], after["G"][:, other])
+    row = after["frame"].iloc[0]
+    expected = preflight.derive_fixed_lm2mh_self_resonance(
+        {
+            "Llt_phys": 27.5,
+            "C_tx_tx_F": 1.0e-12,
+            "C_rx_rx_F": 1.0e-14,
+        },
+        row,
+    )
+    assert after["G"][0, resonance_index] == pytest.approx(
+        goal.GOAL_RESONANCE_MIN_HZ
+        - expected["f_res_min_tx_rx_only_Hz"]
+    )
+    assert problem.hard_constraint_contract_sha256 != base_hash
+    assert installation["base_hard_constraint_contract_sha256"] == base_hash
+    assert installation["other_physical_constraints_mutated"] is False
+    assert (
+        problem._goal_fixed_lm2mh_resonance_contract["surrogate_k_used"]
+        is False
+    )
+
+
+def test_n1_6_compact_bank_bridges_exact_A_B_C_and_independent_H():
+    problem = _goal_problem(6)
+    contract = preflight.goal_compact_search_contract(6)
+    bank = preflight.build_goal_compact_coordinate_bank(
+        problem,
+        seed=2_607_263_006,
+        compact_contract=contract,
+        maximum_attempts_per_stratum=128,
+    )
+    repaired, audit = preflight.validate_goal_compact_coordinate_bank(
+        problem,
+        bank,
+        compact_contract=contract,
+    )
+    assert repaired.shape[1] == problem.n_var
+    assert bank["membership_counts"] == {
+        "compact_A": 2,
+        "compact_B": 2,
+        "compact_C": 2,
+        "height_boundary": 4,
+    }
+    assert audit["exact_stratum_membership_verified"] is True
+    assert sum(bool(value) for value in bank["topology_counts"].values()) >= 4
+    assert all(
+        record["W_mm"] <= 1200.0
+        and record["L_mm"] <= 1000.0
+        and record["H_mm"] <= 750.0
+        for record in bank["rows"]
+    )
+    assert any(
+        "compact_C" in record["memberships"]
+        and 1160.0 <= record["W_mm"] <= 1170.0
+        and 960.0 <= record["L_mm"] <= 975.0
+        for record in bank["rows"]
+    )
+
+
 def test_cw1_grid_has_exact_endpoints_and_no_independent_f1_split():
     assert goal.cw1_from_unit_coordinate(0.0) == 1.0
     assert goal.cw1_from_unit_coordinate(0.5) == 5.5
@@ -687,6 +796,183 @@ def test_goal_launcher_scales_to_authenticated_512_seed_rollout():
         for turns in goal.GOAL_PRIMARY_TURN_STRATA
     } == {5: 128, 6: 128, 7: 128, 8: 128}
     assert max(item["wave"] for item in assignments) == 16
+
+
+def _synthetic_compact_activation_bank(turns, contract):
+    required = {
+        name: (
+            contract["initialization"][
+                "minimum_exact_rows_height_boundary"
+            ]
+            if name == "height_boundary"
+            else contract["initialization"][
+                "minimum_exact_rows_per_WL_stratum"
+            ]
+        )
+        for name in contract["active_strata_for_this_N1"]
+    }
+    rows = [
+        {"memberships": [name]}
+        for name, count in required.items()
+        for _index in range(count)
+    ]
+    coordinates = [[float(index)] for index in range(len(rows))]
+    memberships = {
+        name: sum(name in row["memberships"] for row in rows)
+        for name in contract["strata"]
+    }
+    topology_counts = {
+        str(topology): int(index < 4)
+        for index, topology in enumerate(
+            contract["turn_split_topologies_N2_main"]
+        )
+    }
+    unsigned = {
+        "schema_version": preflight.GOAL_COMPACT_BANK_SCHEMA,
+        "fixed_primary_turns": turns,
+        "seed": launch.FRESH_AL_SEED_START + turns,
+        "compact_search_contract_sha256": contract["sha256"],
+        "coordinates": coordinates,
+        "coordinate_sha256": goal.canonical_sha256(coordinates),
+        "rows": rows,
+        "membership_counts": memberships,
+        "topology_counts": topology_counts,
+        "generation_attempts": {name: 1 for name in required},
+        "decoder_repair_and_exact_dimension_replay_performed": True,
+        "archive_coordinate_donor_used": False,
+        "near_band_fallback_used": False,
+    }
+    return {**unsigned, "sha256": goal.canonical_sha256(unsigned)}
+
+
+def test_reserved_fresh512_dry_run_manifest_seals_compact_activation_without_post(
+    tmp_path,
+):
+    local = launch._seal(
+        {
+            "schema_version": launch.LOCAL_PREFLIGHT_SCHEMA,
+            "hard_constraint_contract_sha256": "d" * 64,
+            "base_hard_constraint_contract_sha256": "0" * 64,
+            "fixed_lm2mh_resonance_contract": (
+                preflight.goal_fixed_lm2mh_resonance_contract()
+            ),
+            "fixed_lm2mh_resonance_contract_sha256": (
+                preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
+            ),
+            "dataset_sha256": "a" * 64,
+            "profile_sha256": "2" * 64,
+            "evaluation_model_sha256": "b" * 64,
+            "train_report_sha256": "e" * 64,
+            "candidate_sha256": "f" * 64,
+            "quality_status_sha256": "1" * 64,
+            "quality": {"quality_passed": True},
+            "code": {"revision": "c" * 40},
+            "search_only_proposal": False,
+        }
+    )
+    compact = {}
+    for turns in goal.GOAL_PRIMARY_TURN_STRATA:
+        contract = preflight.goal_compact_search_contract(turns)
+        bank = _synthetic_compact_activation_bank(turns, contract)
+        compact[str(turns)] = {
+            "contract": contract,
+            "contract_sha256": contract["sha256"],
+            "coordinate_bank": bank,
+            "coordinate_bank_sha256": bank["sha256"],
+        }
+    global_counts = {
+        name: sum(
+            compact[str(turns)]["coordinate_bank"]["membership_counts"][
+                name
+            ]
+            for turns in goal.GOAL_PRIMARY_TURN_STRATA
+        )
+        for name in preflight.GOAL_COMPACT_STRATA
+    }
+    activation = launch._seal(
+        {
+            "schema_version": launch.FRESH512_ACTIVATION_SCHEMA,
+            "campaign_id": "mft-goal-20260726",
+            "local_preflight_payload_sha256": local["payload_sha256"],
+            "dataset_authentication": {
+                "dataset_sha256": local["dataset_sha256"],
+                "authenticated_row_count": 8,
+                "unique_source_tasks": 4,
+                "thermal_mesh_policy": (
+                    "b7-rxmain-l5-shared-region-wcp-pad-"
+                    "symmetry-contact-clipped-v1"
+                ),
+                "thermal_mesh_plan_contract_version": "thermal-mesh-plan-v8",
+                "every_authenticated_row_exact_B7_v8": True,
+            },
+            "dataset_sha256": local["dataset_sha256"],
+            "evaluation_model_sha256": local[
+                "evaluation_model_sha256"
+            ],
+            "quality_status_sha256": local["quality_status_sha256"],
+            "quality_passed": True,
+            "search_only_proposal": False,
+            "seed_start": launch.FRESH_AL_SEED_START,
+            "seed_end_inclusive": launch.FRESH_AL_SEED_END,
+            "seed_count": launch.FRESH_AL_SEED_COUNT,
+            "seeds_per_N1_stratum": 128,
+            "fixed_lm2mh_resonance_contract": (
+                preflight.goal_fixed_lm2mh_resonance_contract()
+            ),
+            "fixed_lm2mh_resonance_contract_sha256": (
+                preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
+            ),
+            "effective_hard_constraint_contract_sha256": local[
+                "hard_constraint_contract_sha256"
+            ],
+            "compact_by_N1": compact,
+            "global_compact_membership_counts": global_counts,
+            "global_exact_A_B_C_and_independent_H_coverage": True,
+            "core_center_gap_mm_search_coordinate": False,
+            "core_center_gap_mm_symmetric_FEA_synthesis_required": True,
+            "physical_Lm_2mH_verified": False,
+            "compact_scout_role": "surrogate_screening_only",
+            "compact_scout_production_or_final_design_claim_allowed": False,
+            "symmetric_FEA_validation_still_required": True,
+            "invalid_or_near_band_fallback_allowed": False,
+            "legacy_campaign_behavior_changed": False,
+            "scheduler_write_performed": False,
+            "scheduler_submission_performed": False,
+        }
+    )
+    assignments = launch.seed_assignments(
+        mode="rolling",
+        seed_start=launch.FRESH_AL_SEED_START,
+        seed_count=launch.FRESH_AL_SEED_COUNT,
+        wave_size=32,
+    )
+    bundle, tasks, scheduler = launch.build_bundle_values(
+        local_preflight=local,
+        assignments=assignments,
+        output_root=tmp_path,
+        source={
+            "generation": "G0",
+            "candidate": "candidate.json",
+            "quality_status": "quality.json",
+            "code_root": "repo",
+            "dataset": "strict.parquet",
+            "profile": "profile.json",
+            "expected_code_revision": "c" * 40,
+        },
+        code_manifest=_synthetic_goal_code_manifest(),
+        fresh512_search_activation=activation,
+    )
+    assert bundle["task_count"] == 512
+    assert bundle["fresh512_compact_active"] is True
+    assert scheduler["maximum_parallel_tasks"] == 512
+    assert scheduler["scheduler_submission_performed"] is False
+    assert scheduler["scheduler_write_performed"] is False
+    assert tasks[0]["fresh512_compact_active"] is True
+    assert tasks[-1]["fresh512_search_activation"]["payload_sha256"] == (
+        activation["payload_sha256"]
+    )
+    launch.validate_task_payload(tasks[0])
+    launch.validate_task_payload(tasks[-1])
 
 
 def test_failed_g0_quality_is_sealed_as_search_only_without_lowering_thresholds():

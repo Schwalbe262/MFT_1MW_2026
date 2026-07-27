@@ -29,6 +29,27 @@ def _admitted_dataset(tmp_path: Path, revision: str = "a" * 40):
         "schema_version": al_train.strict_al.MANIFEST_SCHEMA,
         "repository": {"revision": revision},
         "goal_targets": list(al_train.TARGETS),
+        "authenticated_standard_collections": [
+            {
+                "thermal_mesh_policy": (
+                    al_train.strict_al.REQUIRED_THERMAL_MESH_POLICY
+                ),
+                "thermal_mesh_plan_contract_version": (
+                    al_train.strict_al.REQUIRED_THERMAL_MESH_PLAN_CONTRACT_VERSION
+                ),
+            }
+            for _index in range(8)
+        ],
+        "authenticated_thermal_mesh_truth": {
+            "thermal_mesh_policy": (
+                al_train.strict_al.REQUIRED_THERMAL_MESH_POLICY
+            ),
+            "thermal_mesh_plan_contract_version": (
+                al_train.strict_al.REQUIRED_THERMAL_MESH_PLAN_CONTRACT_VERSION
+            ),
+            "authenticated_row_count": 8,
+            "every_authenticated_row_exact_B7_v8": True,
+        },
         "output_dataset": {
             "path": dataset.name,
             "sha256": dataset_sha,

@@ -84,6 +84,10 @@ def _strict_row(*, task_id: int, n1: int, **updates) -> dict:
         "git_hash": SOLVER_REVISION,
         "pyaedt_library_git_hash": LIBRARY_REVISION,
         "physics_data_revision": PHYSICS_DATA_REVISION,
+        "thermal_mesh_policy": ingest.REQUIRED_THERMAL_MESH_POLICY,
+        "thermal_mesh_plan_contract_version": (
+            ingest.REQUIRED_THERMAL_MESH_PLAN_CONTRACT_VERSION
+        ),
         "thermal_rx_block_interface_contract_version": (
             "thermal-rx-block-interface-coverage-v1"
         ),

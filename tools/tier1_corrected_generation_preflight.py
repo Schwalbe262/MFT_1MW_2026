@@ -147,6 +147,50 @@ SEMLOCK_SAFE_HELPER_SHA256 = (
 REMOTE_PREFLIGHT_SCHEMA = "mft-tier1-current7-remote-model-load-v1"
 SEARCH_RESULT_SCHEMA = "mft-tier1-current7-search-seed-v1"
 WARM_ROLE_PARTITION_SCHEMA = "mft-tier1-authenticated-warm-role-partition-v1"
+GOAL_FIXED_LM_RESONANCE_SCHEMA = "mft-goal-fixed-lm2mh-resonance-v1"
+GOAL_COMPACT_SEARCH_SCHEMA = "mft-goal-fresh512-compact-search-v1"
+GOAL_COMPACT_BANK_SCHEMA = "mft-goal-fresh512-compact-coordinate-bank-v1"
+GOAL_FIXED_PRIMARY_MAGNETIZING_INDUCTANCE_H = 0.002
+GOAL_COMPACT_MUTATION_PERIOD_GENERATIONS = 5
+GOAL_COMPACT_STRATA = {
+    "compact_A": {
+        "W_mm": [1160.0, 1170.0],
+        "L_mm": [975.0, 1000.0],
+    },
+    "compact_B": {
+        "W_mm": [1170.0, 1200.0],
+        "L_mm": [960.0, 975.0],
+    },
+    "compact_C": {
+        "W_mm": [1160.0, 1170.0],
+        "L_mm": [960.0, 975.0],
+    },
+    "height_boundary": {
+        "H_mm": [740.0, 750.0],
+    },
+}
+GOAL_COMPACT_JOINT_COORDINATE_NAMES = (
+    "l1",
+    "total_length",
+    "total_height",
+    "w1",
+    "wh1",
+    "wcp_t",
+    "wcp_len_pct",
+    "u_ngroup",
+    "u_N2_side",
+    "f1_split",
+    "gap2",
+    "cc_w2c_space_x",
+    "cc_w2c_space_y",
+    "w2c_w1c_space_x",
+    "w2c_w1c_space_y",
+    "w1c_w2s_space_x",
+    "w1s_cs_space_x",
+    "cs_w1s_space_y",
+    "w2s_w1s_space_x",
+    "w1s_w2s_space_y",
+)
 BIG = 1e6
 
 BASE_CONSTRAINT_NAMES = (
@@ -1108,6 +1152,698 @@ def goal_topology_contract(fixed_primary_turns: int) -> dict[str, Any]:
     return value
 
 
+def goal_fixed_lm2mh_resonance_contract() -> dict[str, Any]:
+    """Return the fresh512-only fixed-primary-Lm resonance authority."""
+
+    value = {
+        "schema_version": GOAL_FIXED_LM_RESONANCE_SCHEMA,
+        "primary_magnetizing_inductance_H": (
+            GOAL_FIXED_PRIMARY_MAGNETIZING_INDUCTANCE_H
+        ),
+        "primary_resonant_inductance": "0.002_H_plus_Llt_phys_H",
+        "secondary_resonant_inductance": (
+            "primary_resonant_inductance_times_(N2_total/N1_total)^2"
+        ),
+        "frequency_equation": "1/(2*pi*sqrt(L_resonant*C_self))",
+        "minimum_frequency_Hz": GOAL_RESONANCE_MIN_HZ,
+        "screened_capacitances": ["C_tx_tx_F", "C_rx_rx_F"],
+        "interwinding_capacitance_included": False,
+        "surrogate_k_used": False,
+        "core_center_gap_mm_search_coordinate": False,
+        "core_center_gap_mm_policy": (
+            "synthesize_and_verify_later_in_symmetric_FEA"
+        ),
+        "physical_Lm_2mH_claimed_before_symmetric_FEA": False,
+        "legacy_half_magnetizing_screen_reused": False,
+        "fresh512_only": True,
+    }
+    value["sha256"] = canonical_sha256(value)
+    return value
+
+
+def goal_compact_search_contract(fixed_primary_turns: int) -> dict[str, Any]:
+    """Seal compact initialization and mutation for one fresh512 N1 stratum."""
+
+    turns = int(fixed_primary_turns)
+    topology = goal_topology_contract(turns)
+    active_strata = [
+        name
+        for name in GOAL_COMPACT_STRATA
+        if not (turns == 5 and name == "compact_C")
+    ]
+    inactive_strata = (
+        {
+            "compact_C": (
+                "N1=5 repaired-decoder reachability gap: targeted probes "
+                "remain above W=1170 while L is 960..975; aggregate fresh512 "
+                "coverage is assigned to N1=6..8"
+            )
+        }
+        if turns == 5
+        else {}
+    )
+    value = {
+        "schema_version": GOAL_COMPACT_SEARCH_SCHEMA,
+        "fixed_primary_turns": turns,
+        "strata": copy.deepcopy(GOAL_COMPACT_STRATA),
+        "active_strata_for_this_N1": active_strata,
+        "inactive_strata_for_this_N1": inactive_strata,
+        "global_fresh512_all_strata_required": True,
+        "compact_C_exact_coverage_required_in_N1": [6, 7, 8],
+        "height_boundary_is_independent_stratum": True,
+        "cartesian_intersection_of_all_strata_required": False,
+        "hard_size_limits_mm": dict(GOAL_SIZE_LIMITS_MM),
+        "joint_coordinate_names": list(GOAL_COMPACT_JOINT_COORDINATE_NAMES),
+        "derived_physical_dimensions_jointly_explored": [
+            "l2",
+            "h1",
+            "nwh1",
+            "n_core_group",
+            "cw2",
+            "N2_main",
+            "N2_side",
+        ],
+        "initialization": {
+            "minimum_exact_rows_per_WL_stratum": 2,
+            "minimum_exact_rows_height_boundary": 4,
+            "minimum_distinct_N2_main_topologies": 4,
+            "archive_coordinate_donor_required": False,
+            "decoder_repair_and_exact_dimension_replay_required": True,
+            "near_band_fallback_allowed": False,
+        },
+        "mutation": {
+            "period_generations": GOAL_COMPACT_MUTATION_PERIOD_GENERATIONS,
+            "one_exact_repaired_offspring_per_stratum_per_event": True,
+            "joint_coordinate_perturbation_required": True,
+            "exact_membership_replay_required": True,
+            "near_band_fallback_allowed": False,
+        },
+        "turn_split_topologies_N2_main": list(
+            topology["turn_split_sub_islands_N2_main"]
+        ),
+        "topology_evolution_contract_sha256": topology["sha256"],
+        "physical_gap2mH_policy": (
+            "core_center_gap_mm_deferred_to_symmetric_FEA_synthesis"
+        ),
+        "physical_Lm_claim_from_surrogate_allowed": False,
+        "terminal_physical_replay_required": True,
+        "legacy_campaign_behavior_changed": False,
+        "fresh512_only": True,
+    }
+    value["sha256"] = canonical_sha256(value)
+    return value
+
+
+def validate_goal_compact_search_contract(
+    value: Mapping[str, Any],
+    *,
+    fixed_primary_turns: int,
+) -> dict[str, Any]:
+    """Authenticate an exact compact-search contract or fail closed."""
+
+    if not isinstance(value, Mapping):
+        raise RuntimeError("compact search contract must be a mapping")
+    contract = copy.deepcopy(dict(value))
+    unsigned = {key: item for key, item in contract.items() if key != "sha256"}
+    expected = goal_compact_search_contract(int(fixed_primary_turns))
+    if (
+        contract.get("sha256") != canonical_sha256(unsigned)
+        or contract != expected
+        or contract.get("fresh512_only") is not True
+        or contract.get("initialization", {}).get("near_band_fallback_allowed")
+        is not False
+        or contract.get("mutation", {}).get("near_band_fallback_allowed")
+        is not False
+    ):
+        raise RuntimeError("compact search contract authentication failed")
+    return contract
+
+
+def _compact_stratum_memberships(
+    width_mm: float,
+    length_mm: float,
+    height_mm: float,
+    *,
+    strata: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[str, ...]:
+    dimensions = {
+        "W_mm": _finite_number(width_mm, "compact exterior W"),
+        "L_mm": _finite_number(length_mm, "compact exterior L"),
+        "H_mm": _finite_number(height_mm, "compact exterior H"),
+    }
+    memberships = []
+    for name, bounds_by_axis in (strata or GOAL_COMPACT_STRATA).items():
+        if all(
+            float(bounds[0]) <= dimensions[axis] <= float(bounds[1])
+            for axis, bounds in bounds_by_axis.items()
+        ):
+            memberships.append(str(name))
+    return tuple(memberships)
+
+
+def _goal_compact_coordinate_replay(
+    problem: Any,
+    coordinates: Any,
+    *,
+    strata: Mapping[str, Mapping[str, Any]],
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Repair, decode, and independently replay exterior membership."""
+
+    import numpy as np
+
+    values = np.asarray(coordinates, dtype=float)
+    if values.ndim == 1:
+        values = values.reshape(1, -1)
+    if values.ndim != 2 or values.shape[1] != int(problem.n_var):
+        raise RuntimeError("compact coordinate bank shape mismatch")
+    if not np.isfinite(values).all():
+        raise RuntimeError("compact coordinate bank contains nonfinite values")
+    repaired = np.asarray(problem.repair_unit_coordinates(values), dtype=float)
+    if not np.array_equal(repaired, values):
+        raise RuntimeError("compact coordinate bank is not a repair fixed point")
+    frame, _shrink, valid = problem.decode_batch(repaired)
+    records: list[dict[str, Any]] = []
+    for index in range(len(repaired)):
+        if not bool(valid[index]):
+            raise RuntimeError("compact coordinate bank contains decoder-invalid row")
+        row = _frame_row(frame, index)
+        _volume, dimensions = problem._goal_bounding_box_lit(row)
+        width, length, height = (
+            _finite_number(value, "compact exterior dimension")
+            for value in dimensions
+        )
+        if (
+            width > float(GOAL_SIZE_LIMITS_MM["W"])
+            or length > float(GOAL_SIZE_LIMITS_MM["L"])
+            or height > float(GOAL_SIZE_LIMITS_MM["H"])
+        ):
+            raise RuntimeError("compact coordinate bank escaped hard size limits")
+        memberships = _compact_stratum_memberships(
+            width, length, height, strata=strata
+        )
+        records.append(
+            {
+                "row": index,
+                "W_mm": width,
+                "L_mm": length,
+                "H_mm": height,
+                "memberships": list(memberships),
+                "N2_main": int(
+                    _finite_number(_row_value(row, "N2_main"), "N2_main")
+                ),
+                "N2_side": int(
+                    _finite_number(_row_value(row, "N2_side"), "N2_side")
+                ),
+                "n_core_group": int(
+                    _finite_number(
+                        _row_value(row, "n_core_group"), "n_core_group"
+                    )
+                ),
+                "cw1_mm": _finite_number(_row_value(row, "cw1"), "cw1"),
+                "cw2_mm": _finite_number(_row_value(row, "cw2"), "cw2"),
+                "gap2_mm": _finite_number(_row_value(row, "gap2"), "gap2"),
+                "l1_mm": _finite_number(_row_value(row, "l1"), "l1"),
+                "l2_mm": _finite_number(_row_value(row, "l2"), "l2"),
+                "h1_mm": _finite_number(_row_value(row, "h1"), "h1"),
+            }
+        )
+    return repaired, records
+
+
+def validate_goal_compact_coordinate_bank(
+    problem: Any,
+    bank: Mapping[str, Any],
+    *,
+    compact_contract: Mapping[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    """Authenticate a prepared compact bank from coordinates, not metadata."""
+
+    import numpy as np
+
+    contract = validate_goal_compact_search_contract(
+        compact_contract,
+        fixed_primary_turns=problem.fixed_primary_turns,
+    )
+    if not isinstance(bank, Mapping):
+        raise RuntimeError("compact coordinate bank must be a mapping")
+    value = copy.deepcopy(dict(bank))
+    unsigned = {key: item for key, item in value.items() if key != "sha256"}
+    coordinates = np.asarray(value.get("coordinates"), dtype=float)
+    if (
+        value.get("schema_version") != GOAL_COMPACT_BANK_SCHEMA
+        or value.get("fixed_primary_turns") != problem.fixed_primary_turns
+        or value.get("compact_search_contract_sha256") != contract["sha256"]
+        or value.get("sha256") != canonical_sha256(unsigned)
+        or coordinates.ndim != 2
+        or coordinates.shape[1] != int(problem.n_var)
+        or value.get("coordinate_sha256")
+        != canonical_sha256(coordinates.tolist())
+    ):
+        raise RuntimeError("compact coordinate bank authentication failed")
+    repaired, records = _goal_compact_coordinate_replay(
+        problem,
+        coordinates,
+        strata=contract["strata"],
+    )
+    membership_counts = {
+        name: sum(name in record["memberships"] for record in records)
+        for name in contract["strata"]
+    }
+    initialization = contract["initialization"]
+    required_counts = {
+        name: (
+            int(initialization["minimum_exact_rows_height_boundary"])
+            if name == "height_boundary"
+            else int(initialization["minimum_exact_rows_per_WL_stratum"])
+        )
+        for name in contract["active_strata_for_this_N1"]
+    }
+    topology_counts = {
+        str(topology): sum(record["N2_main"] == int(topology) for record in records)
+        for topology in contract["turn_split_topologies_N2_main"]
+    }
+    if (
+        any(membership_counts[name] < required for name, required in required_counts.items())
+        or sum(bool(count) for count in topology_counts.values())
+        < int(initialization["minimum_distinct_N2_main_topologies"])
+        or value.get("membership_counts") != membership_counts
+        or value.get("topology_counts") != topology_counts
+        or value.get("rows") != records
+        or value.get("near_band_fallback_used") is not False
+    ):
+        raise RuntimeError("compact coordinate bank exact replay failed")
+    audit = {
+        "schema_version": "mft-goal-compact-coordinate-bank-replay-v1",
+        "fixed_primary_turns": problem.fixed_primary_turns,
+        "coordinate_count": len(repaired),
+        "coordinate_sha256": canonical_sha256(repaired.tolist()),
+        "membership_counts": membership_counts,
+        "required_membership_counts": required_counts,
+        "topology_counts": topology_counts,
+        "minimum_distinct_topologies_verified": True,
+        "decoder_repair_fixed_point_verified": True,
+        "hard_size_limits_verified": True,
+        "exact_stratum_membership_verified": True,
+        "near_band_fallback_used": False,
+    }
+    audit["sha256"] = canonical_sha256(audit)
+    return repaired, audit
+
+
+def build_goal_compact_coordinate_bank(
+    problem: Any,
+    *,
+    seed: int,
+    compact_contract: Mapping[str, Any],
+    maximum_attempts_per_stratum: int = 512,
+) -> dict[str, Any]:
+    """Construct exact decoder-valid bridge donors without archive fallback."""
+
+    import numpy as np
+
+    contract = validate_goal_compact_search_contract(
+        compact_contract,
+        fixed_primary_turns=problem.fixed_primary_turns,
+    )
+    if (
+        isinstance(maximum_attempts_per_stratum, bool)
+        or int(maximum_attempts_per_stratum) < 32
+    ):
+        raise ValueError("compact bank requires at least 32 attempts per stratum")
+    maximum_attempts_per_stratum = int(maximum_attempts_per_stratum)
+    rng = np.random.default_rng(int(seed))
+    coordinate_index = {
+        name: index
+        for index, name in enumerate(problem.sobol_dimension_names)
+    }
+    missing_joint = set(contract["joint_coordinate_names"]) - set(coordinate_index)
+    if missing_joint:
+        raise RuntimeError(
+            f"compact joint coordinates are unavailable: {sorted(missing_joint)}"
+        )
+    topology_cycle = tuple(contract["turn_split_topologies_N2_main"])
+    targets = {
+        "compact_A": (1165.0, 987.5, None),
+        "compact_B": (1185.0, 967.5, None),
+        # Bias toward the lower-W interior.  N1=5 has a decoder discontinuity
+        # close to W=1170, so the band midpoint is a poor bridge target.
+        "compact_C": (1162.0, 967.5, None),
+        "height_boundary": (None, None, 745.0),
+    }
+    required = {
+        name: (
+            int(contract["initialization"]["minimum_exact_rows_height_boundary"])
+            if name == "height_boundary"
+            else int(contract["initialization"]["minimum_exact_rows_per_WL_stratum"])
+        )
+        for name in contract["active_strata_for_this_N1"]
+    }
+    selected: list[Any] = []
+    selected_hashes: set[str] = set()
+    generation_attempts: dict[str, int] = {}
+
+    def set_physical(coordinate: Any, name: str, physical: float) -> None:
+        coordinate[coordinate_index[name]] = problem._unit_from_physical(
+            name, physical
+        )
+
+    for stratum_index, stratum in enumerate(
+        contract["active_strata_for_this_N1"]
+    ):
+        target = targets[stratum]
+        accepted = 0
+        attempts = 0
+        while accepted < required[stratum] and attempts < maximum_attempts_per_stratum:
+            attempts += 1
+            coordinate = rng.random(problem.n_var)
+            topology = topology_cycle[
+                (stratum_index * required[stratum] + accepted + attempts - 1)
+                % len(topology_cycle)
+            ]
+            coordinate[2] = _turn_split_unit_coordinate(
+                topology,
+                fixed_primary_turns=problem.fixed_primary_turns,
+            )
+            if stratum == "height_boundary":
+                set_physical(coordinate, "total_height", rng.uniform(740.0, 750.0))
+                set_physical(
+                    coordinate, "total_length", rng.uniform(800.0, 1000.0)
+                )
+                set_physical(coordinate, "w1", rng.uniform(350.0, 550.0))
+                for name in (
+                    "cc_w2c_space_y",
+                    "w2c_w1c_space_y",
+                    "cs_w1s_space_y",
+                    "w1s_w2s_space_y",
+                ):
+                    set_physical(coordinate, name, rng.uniform(40.0, 45.0))
+                set_physical(coordinate, "gap2", rng.uniform(0.3, 0.55))
+            else:
+                target_w, target_l, _target_h = target
+                set_physical(
+                    coordinate,
+                    "total_length",
+                    float(target_w) - rng.uniform(0.0, 90.0),
+                )
+                set_physical(coordinate, "w1", rng.uniform(450.0, 700.0))
+                set_physical(
+                    coordinate, "total_height", rng.uniform(560.0, 750.0)
+                )
+                for name in (
+                    "cc_w2c_space_y",
+                    "w2c_w1c_space_y",
+                    "cs_w1s_space_y",
+                    "w1s_w2s_space_y",
+                ):
+                    set_physical(coordinate, name, rng.uniform(40.0, 48.0))
+                set_physical(coordinate, "gap2", rng.uniform(0.3, 0.65))
+            coordinate = np.asarray(
+                problem.repair_unit_coordinates(coordinate), dtype=float
+            )
+            for _feedback in range(14):
+                frame, _shrink, valid = problem.decode_batch(
+                    coordinate.reshape(1, -1)
+                )
+                if not bool(valid[0]):
+                    break
+                _volume, dimensions = problem._goal_bounding_box_lit(frame.iloc[0])
+                width, length, height = tuple(map(float, dimensions))
+                memberships = _compact_stratum_memberships(
+                    width,
+                    length,
+                    height,
+                    strata=contract["strata"],
+                )
+                hard_dimensions = (
+                    width <= float(GOAL_SIZE_LIMITS_MM["W"])
+                    and length <= float(GOAL_SIZE_LIMITS_MM["L"])
+                    and height <= float(GOAL_SIZE_LIMITS_MM["H"])
+                )
+                if stratum in memberships and hard_dimensions:
+                    identity = canonical_sha256(coordinate.tolist())
+                    if identity not in selected_hashes:
+                        selected.append(coordinate.copy())
+                        selected_hashes.add(identity)
+                        accepted += 1
+                    break
+                if stratum == "height_boundary":
+                    current = problem._physical_from_unit(
+                        "total_height",
+                        coordinate[coordinate_index["total_height"]],
+                    )
+                    set_physical(
+                        coordinate,
+                        "total_height",
+                        current + (float(target[2]) - height),
+                    )
+                    if width > float(GOAL_SIZE_LIMITS_MM["W"]):
+                        current_length = problem._physical_from_unit(
+                            "total_length",
+                            coordinate[coordinate_index["total_length"]],
+                        )
+                        set_physical(
+                            coordinate,
+                            "total_length",
+                            current_length
+                            - (width - float(GOAL_SIZE_LIMITS_MM["W"])),
+                        )
+                    if length > float(GOAL_SIZE_LIMITS_MM["L"]):
+                        current_w1 = problem._physical_from_unit(
+                            "w1", coordinate[coordinate_index["w1"]]
+                        )
+                        set_physical(
+                            coordinate,
+                            "w1",
+                            current_w1
+                            - (length - float(GOAL_SIZE_LIMITS_MM["L"])),
+                        )
+                else:
+                    current_length = problem._physical_from_unit(
+                        "total_length",
+                        coordinate[coordinate_index["total_length"]],
+                    )
+                    current_w1 = problem._physical_from_unit(
+                        "w1", coordinate[coordinate_index["w1"]]
+                    )
+                    set_physical(
+                        coordinate,
+                        "total_length",
+                        current_length + 0.8 * (float(target[0]) - width),
+                    )
+                    set_physical(
+                        coordinate,
+                        "w1",
+                        current_w1 + 0.8 * (float(target[1]) - length),
+                    )
+                coordinate = np.asarray(
+                    problem.repair_unit_coordinates(coordinate), dtype=float
+                )
+        generation_attempts[stratum] = attempts
+        if accepted < required[stratum]:
+            raise RuntimeError(
+                f"compact exact stratum underfilled without fallback: {stratum}"
+            )
+
+    coordinates = np.asarray(selected, dtype=float)
+    repaired, records = _goal_compact_coordinate_replay(
+        problem,
+        coordinates,
+        strata=contract["strata"],
+    )
+    membership_counts = {
+        name: sum(name in record["memberships"] for record in records)
+        for name in contract["strata"]
+    }
+    topology_counts = {
+        str(topology): sum(record["N2_main"] == topology for record in records)
+        for topology in topology_cycle
+    }
+    # Height-boundary rows are cheap and independent.  If the bridge rows did
+    # not span four topologies, generate exact H rows for the missing lanes.
+    distinct = sum(bool(value) for value in topology_counts.values())
+    if distinct < int(contract["initialization"]["minimum_distinct_N2_main_topologies"]):
+        raise RuntimeError(
+            "compact bank lacks four exact topology-aware lanes; no fallback allowed"
+        )
+    value = {
+        "schema_version": GOAL_COMPACT_BANK_SCHEMA,
+        "fixed_primary_turns": problem.fixed_primary_turns,
+        "seed": int(seed),
+        "compact_search_contract_sha256": contract["sha256"],
+        "coordinates": repaired.tolist(),
+        "coordinate_sha256": canonical_sha256(repaired.tolist()),
+        "rows": records,
+        "membership_counts": membership_counts,
+        "topology_counts": topology_counts,
+        "generation_attempts": generation_attempts,
+        "decoder_repair_and_exact_dimension_replay_performed": True,
+        "archive_coordinate_donor_used": False,
+        "near_band_fallback_used": False,
+    }
+    value["sha256"] = canonical_sha256(value)
+    validate_goal_compact_coordinate_bank(
+        problem, value, compact_contract=contract
+    )
+    return value
+
+
+def derive_fixed_lm2mh_self_resonance(
+    measurements: Mapping[str, Any],
+    params: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply the requested 2 mH primary-Lm plus physical-leakage screen."""
+
+    if not isinstance(measurements, Mapping) or not callable(
+        getattr(params, "get", None)
+    ):
+        raise RuntimeError("fixed-Lm resonance inputs must be mappings")
+    leakage_h = _positive_number(
+        measurements.get("Llt_phys"), "Llt_phys"
+    ) * 1e-6
+    c_tx = _positive_number(measurements.get("C_tx_tx_F"), "C_tx_tx_F")
+    c_rx = _positive_number(measurements.get("C_rx_rx_F"), "C_rx_rx_F")
+    n1 = _finite_number(params.get("N1_main", 0.0), "N1_main") + _finite_number(
+        params.get("N1_side", 0.0), "N1_side"
+    )
+    n2 = _finite_number(params.get("N2_main", 0.0), "N2_main") + _finite_number(
+        params.get("N2_side", 0.0), "N2_side"
+    )
+    if n1 <= 0.0 or n2 <= 0.0:
+        raise RuntimeError("positive primary and secondary turns are required")
+    tx_inductance_h = GOAL_FIXED_PRIMARY_MAGNETIZING_INDUCTANCE_H + leakage_h
+    rx_inductance_h = tx_inductance_h * (n2 / n1) ** 2
+
+    def lc_hz(inductance_h: float, capacitance_f: float) -> float:
+        return _positive_number(
+            1.0 / (2.0 * math.pi * math.sqrt(inductance_h * capacitance_f)),
+            "fixed-Lm self resonance frequency",
+        )
+
+    tx_frequency = lc_hz(tx_inductance_h, c_tx)
+    rx_frequency = lc_hz(rx_inductance_h, c_rx)
+    return {
+        "f_res_tx_fixed_lm2mh_Hz": tx_frequency,
+        "f_res_rx_fixed_lm2mh_Hz": rx_frequency,
+        "f_res_min_tx_rx_only_Hz": min(tx_frequency, rx_frequency),
+        # Stable aliases keep terminal consumers source-compatible.  The
+        # attached contract explicitly forbids interpreting them as half-Lm.
+        "f_res_tx_half_magnetizing_Hz": tx_frequency,
+        "f_res_rx_half_magnetizing_Hz": rx_frequency,
+        "primary_resonant_inductance_H": tx_inductance_h,
+        "secondary_resonant_inductance_H": rx_inductance_h,
+        "primary_magnetizing_inductance_H": (
+            GOAL_FIXED_PRIMARY_MAGNETIZING_INDUCTANCE_H
+        ),
+        "magnetizing_inductance_factor": 1.0,
+        "resonance_contract_schema": GOAL_FIXED_LM_RESONANCE_SCHEMA,
+        "interwinding_resonance_included": False,
+    }
+
+
+def install_goal_fixed_lm2mh_resonance(
+    problem: Any,
+) -> tuple[Any, dict[str, Any]]:
+    """Replace only the goal resonance G with the fixed-2mH authority."""
+
+    import numpy as np
+
+    if not getattr(problem, "goal_campaign", False):
+        raise RuntimeError("fixed-Lm resonance may only wrap a goal problem")
+    if getattr(problem, "_tier1_optimizer_scaling_installed", False):
+        raise RuntimeError("fixed-Lm resonance must precede optimizer scaling")
+    if getattr(problem, "_goal_fixed_lm2mh_resonance_installed", False):
+        raise RuntimeError("fixed-Lm resonance was already installed")
+    if RESONANCE_MINIMUM_CONSTRAINT not in problem.constraint_names:
+        raise RuntimeError("goal problem has no minimum resonance constraint")
+    base_contract = copy.deepcopy(problem.hard_constraint_contract)
+    base_contract_sha = canonical_sha256(base_contract)
+    if base_contract_sha != problem.hard_constraint_contract_sha256:
+        raise RuntimeError("base hard-constraint contract is unauthenticated")
+    resonance_contract = goal_fixed_lm2mh_resonance_contract()
+    effective_contract = copy.deepcopy(base_contract)
+    effective_contract["base_hard_constraint_contract_sha256"] = base_contract_sha
+    effective_contract["resonance_authority"] = copy.deepcopy(resonance_contract)
+    effective_contract["resonance_authority_sha256"] = resonance_contract["sha256"]
+    effective_contract["core_center_gap_mm_FEA_synthesis_required"] = True
+    effective_contract["physical_Lm_2mH_verified"] = False
+    physical_evaluate = problem._evaluate
+    resonance_index = problem.constraint_index[RESONANCE_MINIMUM_CONSTRAINT]
+
+    def fixed_lm_evaluate(
+        values: Any,
+        out: dict[str, Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        physical_evaluate(values, out, *args, **kwargs)
+        constraints = np.asarray(out.get("G"), dtype=float)
+        valid = np.asarray(out.get("decoder_valid"), dtype=bool).reshape(-1)
+        frame = out.get("frame")
+        if (
+            constraints.ndim != 2
+            or constraints.shape != (len(valid), len(problem.constraint_names))
+            or frame is None
+            or len(frame) != len(valid)
+        ):
+            raise RuntimeError("fixed-Lm base evaluation shape mismatch")
+        indices = np.flatnonzero(valid)
+        if len(indices):
+            sub = frame.iloc[indices]
+            problem._prediction_cache = {}
+            try:
+                mean_llt, _ = problem._predict("Llt_phys", sub)
+                mean_c_tx, _ = problem._predict("C_tx_tx_F", sub)
+                mean_c_rx, _ = problem._predict("C_rx_rx_F", sub)
+            finally:
+                problem._prediction_cache = None
+            for local_index, global_index in enumerate(indices):
+                row = _frame_row(sub, local_index)
+                try:
+                    screen = derive_fixed_lm2mh_self_resonance(
+                        {
+                            "Llt_phys": mean_llt[local_index],
+                            "C_tx_tx_F": mean_c_tx[local_index],
+                            "C_rx_rx_F": mean_c_rx[local_index],
+                        },
+                        row,
+                    )
+                    constraints[global_index, resonance_index] = (
+                        GOAL_RESONANCE_MIN_HZ
+                        - float(screen["f_res_min_tx_rx_only_Hz"])
+                    )
+                except (
+                    RuntimeError,
+                    ValueError,
+                    OverflowError,
+                    ZeroDivisionError,
+                ):
+                    constraints[global_index, resonance_index] = BIG
+        constraints[~np.isfinite(constraints)] = BIG
+        out["G"] = constraints
+
+    problem._evaluate = fixed_lm_evaluate
+    problem._goal_fixed_lm2mh_resonance_installed = True
+    problem._goal_base_hard_constraint_contract_sha256 = base_contract_sha
+    problem._goal_fixed_lm2mh_resonance_contract = resonance_contract
+    problem.hard_constraint_contract = effective_contract
+    problem.hard_constraint_contract_sha256 = canonical_sha256(effective_contract)
+    evidence = {
+        "schema_version": "mft-goal-fixed-lm2mh-installation-v1",
+        "base_hard_constraint_contract_sha256": base_contract_sha,
+        "effective_hard_constraint_contract_sha256": (
+            problem.hard_constraint_contract_sha256
+        ),
+        "resonance_contract": resonance_contract,
+        "resonance_contract_sha256": resonance_contract["sha256"],
+        "minimum_resonance_constraint_replaced_only": True,
+        "other_physical_constraints_mutated": False,
+        "core_center_gap_mm_FEA_synthesis_required": True,
+        "physical_Lm_2mH_verified": False,
+    }
+    evidence["sha256"] = canonical_sha256(evidence)
+    return physical_evaluate, evidence
+
+
 def _turn_split_main_values(
     coordinates: Any,
     *,
@@ -1638,10 +2374,173 @@ def build_topology_niche_initial_population(
     return repaired, audit
 
 
+def _goal_compact_joint_mutant(
+    problem: Any,
+    donor_coordinates: Any,
+    *,
+    stratum: str,
+    compact_contract: Mapping[str, Any],
+    random_state: Any,
+) -> tuple[Any, dict[str, Any]]:
+    """Emit one genuinely perturbed, repaired, exact compact offspring."""
+
+    import numpy as np
+
+    contract = validate_goal_compact_search_contract(
+        compact_contract,
+        fixed_primary_turns=problem.fixed_primary_turns,
+    )
+    if stratum not in contract["strata"]:
+        raise RuntimeError("compact mutation requested an unknown stratum")
+    donors = np.asarray(donor_coordinates, dtype=float)
+    if donors.ndim != 2 or donors.shape[1] != int(problem.n_var) or not len(donors):
+        raise RuntimeError("compact mutation donor reservoir is empty")
+    names = {
+        name: index for index, name in enumerate(problem.sobol_dimension_names)
+    }
+    joint_indices = np.asarray(
+        [names[name] for name in contract["joint_coordinate_names"]],
+        dtype=int,
+    )
+    target_bounds = contract["strata"][stratum]
+    target_w = (
+        sum(map(float, target_bounds["W_mm"])) / 2.0
+        if "W_mm" in target_bounds
+        else None
+    )
+    target_l = (
+        sum(map(float, target_bounds["L_mm"])) / 2.0
+        if "L_mm" in target_bounds
+        else None
+    )
+    target_h = (
+        sum(map(float, target_bounds["H_mm"])) / 2.0
+        if "H_mm" in target_bounds
+        else None
+    )
+
+    def set_physical(coordinate: Any, name: str, physical: float) -> None:
+        coordinate[names[name]] = problem._unit_from_physical(name, physical)
+
+    for attempt in range(24):
+        donor_index = int(random_state.integers(0, len(donors)))
+        donor = donors[donor_index].copy()
+        coordinate = donor.copy()
+        scale = 0.025 / (1.0 + attempt // 6)
+        coordinate[joint_indices] = np.clip(
+            coordinate[joint_indices]
+            + random_state.normal(0.0, scale, size=len(joint_indices)),
+            0.0,
+            1.0,
+        )
+        coordinate = np.asarray(
+            problem.repair_unit_coordinates(coordinate), dtype=float
+        )
+        for feedback in range(10):
+            frame, _shrink, valid = problem.decode_batch(
+                coordinate.reshape(1, -1)
+            )
+            if not bool(valid[0]):
+                break
+            _volume, dimensions = problem._goal_bounding_box_lit(frame.iloc[0])
+            width, length, height = tuple(map(float, dimensions))
+            memberships = _compact_stratum_memberships(
+                width,
+                length,
+                height,
+                strata=contract["strata"],
+            )
+            changed = int(
+                np.count_nonzero(
+                    np.abs(coordinate[joint_indices] - donor[joint_indices])
+                    > 1e-12
+                )
+            )
+            hard_dimensions = (
+                width <= float(GOAL_SIZE_LIMITS_MM["W"])
+                and length <= float(GOAL_SIZE_LIMITS_MM["L"])
+                and height <= float(GOAL_SIZE_LIMITS_MM["H"])
+            )
+            if stratum in memberships and changed >= 3 and hard_dimensions:
+                evidence = {
+                    "schema_version": "mft-goal-compact-joint-mutation-v1",
+                    "stratum": stratum,
+                    "attempt": attempt + 1,
+                    "feedback_iterations": feedback,
+                    "donor_index": donor_index,
+                    "joint_coordinate_count": len(joint_indices),
+                    "joint_coordinates_changed_after_repair": changed,
+                    "W_mm": width,
+                    "L_mm": length,
+                    "H_mm": height,
+                    "exact_memberships": list(memberships),
+                    "coordinate_sha256": canonical_sha256(coordinate.tolist()),
+                    "near_band_fallback_used": False,
+                }
+                evidence["sha256"] = canonical_sha256(evidence)
+                return coordinate, evidence
+            if target_h is not None:
+                current = problem._physical_from_unit(
+                    "total_height", coordinate[names["total_height"]]
+                )
+                set_physical(
+                    coordinate,
+                    "total_height",
+                    current + (target_h - height),
+                )
+                if width > float(GOAL_SIZE_LIMITS_MM["W"]):
+                    current_length = problem._physical_from_unit(
+                        "total_length", coordinate[names["total_length"]]
+                    )
+                    set_physical(
+                        coordinate,
+                        "total_length",
+                        current_length
+                        - (width - float(GOAL_SIZE_LIMITS_MM["W"])),
+                    )
+                if length > float(GOAL_SIZE_LIMITS_MM["L"]):
+                    current_w1 = problem._physical_from_unit(
+                        "w1", coordinate[names["w1"]]
+                    )
+                    set_physical(
+                        coordinate,
+                        "w1",
+                        current_w1
+                        - (length - float(GOAL_SIZE_LIMITS_MM["L"])),
+                    )
+            if target_w is not None and target_l is not None:
+                current_length = problem._physical_from_unit(
+                    "total_length", coordinate[names["total_length"]]
+                )
+                current_w1 = problem._physical_from_unit(
+                    "w1", coordinate[names["w1"]]
+                )
+                set_physical(
+                    coordinate,
+                    "total_length",
+                    current_length + 0.8 * (target_w - width),
+                )
+                set_physical(
+                    coordinate,
+                    "w1",
+                    current_w1 + 0.8 * (target_l - length),
+                )
+            coordinate = np.asarray(
+                problem.repair_unit_coordinates(coordinate), dtype=float
+            )
+    raise RuntimeError(
+        f"compact joint mutation could not preserve exact {stratum}; "
+        "near-band fallback is forbidden"
+    )
+
+
 def create_deep_topology_components(
     problem: Any,
     contract: Mapping[str, Any],
     repair: Any,
+    *,
+    compact_search_contract: Mapping[str, Any] | None = None,
+    compact_coordinate_bank: Mapping[str, Any] | None = None,
 ) -> tuple[Any, Any, Any]:
     """Create paired mating, periodic migration and epsilon survival."""
 
@@ -1657,6 +2556,41 @@ def create_deep_topology_components(
     topologies = tuple(
         int(value) for value in contract["turn_split_sub_islands_N2_main"]
     )
+    if (compact_search_contract is None) != (compact_coordinate_bank is None):
+        raise RuntimeError(
+            "compact topology components require both contract and coordinate bank"
+        )
+    active_compact_contract = None
+    compact_coordinates_by_stratum: dict[str, Any] = {}
+    compact_bank_audit = None
+    if compact_search_contract is not None:
+        active_compact_contract = validate_goal_compact_search_contract(
+            compact_search_contract,
+            fixed_primary_turns=problem.fixed_primary_turns,
+        )
+        compact_coordinates, compact_bank_audit = (
+            validate_goal_compact_coordinate_bank(
+                problem,
+                compact_coordinate_bank or {},
+                compact_contract=active_compact_contract,
+            )
+        )
+        replay_rows = (compact_coordinate_bank or {}).get("rows") or []
+        for stratum in active_compact_contract[
+            "active_strata_for_this_N1"
+        ]:
+            indices = [
+                index
+                for index, record in enumerate(replay_rows)
+                if stratum in record["memberships"]
+            ]
+            if not indices:
+                raise RuntimeError(
+                    f"compact topology components lack {stratum} donors"
+                )
+            compact_coordinates_by_stratum[stratum] = compact_coordinates[
+                np.asarray(indices, dtype=int)
+            ]
     parent_pairs = tuple(
         tuple(int(value) for value in pair)
         for pair in contract["turn_split_parent_pair_schedule"]
@@ -1844,6 +2778,19 @@ def create_deep_topology_components(
             self.last_migration_generation = None
             self.cross_36x37_offspring_attributed = 0
             self.generation_cross_offspring_counts: list[dict[str, Any]] = []
+            self.compact_mutation_events = 0
+            self.compact_mutants_created = 0
+            self.last_compact_mutation_generation = None
+            self.compact_mutation_counts = {
+                stratum: 0
+                for stratum in (
+                    active_compact_contract["active_strata_for_this_N1"]
+                    if active_compact_contract is not None
+                    else ()
+                )
+            }
+            self.compact_mutation_records: list[dict[str, Any]] = []
+            self.compact_bank_replay_audit = compact_bank_audit
 
         def _do(
             self,
@@ -1959,6 +2906,75 @@ def create_deep_topology_components(
                 for index, coordinate in enumerate(repaired_cross):
                     offspring[index].set("X", coordinate)
                 self.cross_36x37_offspring_attributed += cross_offspring_count
+            compact_event_due = (
+                active_compact_contract is not None
+                and len(offspring)
+                >= len(active_compact_contract["active_strata_for_this_N1"])
+                and (
+                    self.last_compact_mutation_generation is None
+                    or generation - self.last_compact_mutation_generation
+                    >= int(
+                        active_compact_contract["mutation"][
+                            "period_generations"
+                        ]
+                    )
+                )
+            )
+            if compact_event_due:
+                event_records = []
+                offset = max(
+                    0,
+                    len(offspring)
+                    - len(active_compact_contract["active_strata_for_this_N1"]),
+                )
+                for compact_index, stratum in enumerate(
+                    active_compact_contract["active_strata_for_this_N1"]
+                ):
+                    mutant, mutation_evidence = _goal_compact_joint_mutant(
+                        problem,
+                        compact_coordinates_by_stratum[stratum],
+                        stratum=stratum,
+                        compact_contract=active_compact_contract,
+                        random_state=random_state,
+                    )
+                    repaired_mutant = np.asarray(
+                        repair._do(
+                            active_problem,
+                            mutant.reshape(1, -1),
+                            algorithm=algorithm,
+                        ),
+                        dtype=float,
+                    )
+                    if (
+                        repaired_mutant.shape != (1, int(active_problem.n_var))
+                        or not np.array_equal(repaired_mutant[0], mutant)
+                    ):
+                        raise RuntimeError(
+                            "compact joint mutant changed during optimizer repair"
+                        )
+                    offspring[offset + compact_index].set(
+                        "X", repaired_mutant[0]
+                    )
+                    self.compact_mutation_counts[stratum] += 1
+                    self.compact_mutants_created += 1
+                    event_records.append(mutation_evidence)
+                compact_record = {
+                    "algorithm_generation": generation,
+                    "event_index": self.compact_mutation_events + 1,
+                    "strata": list(
+                        active_compact_contract[
+                            "active_strata_for_this_N1"
+                        ]
+                    ),
+                    "mutants_created": len(event_records),
+                    "mutation_evidence": event_records,
+                    "exact_membership_verified": True,
+                    "near_band_fallback_used": False,
+                }
+                compact_record["sha256"] = canonical_sha256(compact_record)
+                self.compact_mutation_records.append(compact_record)
+                self.compact_mutation_events += 1
+                self.last_compact_mutation_generation = generation
             cross_record = {
                 "algorithm_generation": generation,
                 "cross_36x37_parent_pair_count": int(cross_pair_count),
@@ -2383,6 +3399,7 @@ def create_current7_problem_class(
             self.n_ieq_constr = len(constraint_names)
             self.variable_cooling_dimensions = VARIABLE_COOLING_DIMENSIONS
             self.sobol_dimension_names = tuple(names)
+            self._goal_bounding_box_lit = bounding_box_lit
             self.fixed_cooling_pads_mm = dict(FIXED_COOLING_PADS_MM)
             self._last_decode = None
             self._prediction_cache = None
@@ -4268,6 +5285,8 @@ class Current7Tier1Runner:
             FIXED_GENERATION_TERMINATION_STRATEGY
         ),
         pre_optimization_callback: Any | None = None,
+        compact_search_contract: Mapping[str, Any] | None = None,
+        compact_coordinate_bank: Mapping[str, Any] | None = None,
     ) -> Any:
         """Run current NSGA semantics with one repair on every path."""
 
@@ -4287,6 +5306,41 @@ class Current7Tier1Runner:
             pre_optimization_callback
         ):
             raise TypeError("pre_optimization_callback must be callable")
+        if (compact_search_contract is None) != (
+            compact_coordinate_bank is None
+        ):
+            raise RuntimeError(
+                "compact run requires both search contract and coordinate bank"
+            )
+        compact_active = compact_search_contract is not None
+        if compact_active and (
+            not getattr(self.problem, "goal_campaign", False)
+            or not getattr(
+                self.problem, "_goal_fixed_lm2mh_resonance_installed", False
+            )
+            or warm_start_path is not None
+            or warm_start_sha256 is not None
+            or warm_start_role_partition is not None
+            or warm_start_niche_partition is not None
+        ):
+            raise RuntimeError(
+                "compact path is fresh512-only and requires fixed-Lm goal physics"
+            )
+        active_compact_contract = None
+        compact_bank_coordinates = None
+        compact_bank_replay = None
+        if compact_active:
+            active_compact_contract = validate_goal_compact_search_contract(
+                compact_search_contract or {},
+                fixed_primary_turns=self.problem.fixed_primary_turns,
+            )
+            compact_bank_coordinates, compact_bank_replay = (
+                validate_goal_compact_coordinate_bank(
+                    self.problem,
+                    compact_coordinate_bank or {},
+                    compact_contract=active_compact_contract,
+                )
+            )
         niche_active = warm_start_niche_partition is not None
         if niche_active and (
             self.problem.fixed_primary_turns != 6 or population != 320
@@ -4460,6 +5514,8 @@ class Current7Tier1Runner:
             "structural_donor_selection": donor_selection_audit,
             "structural_donors_excluded_from_ordinary_warm_sampling": True,
             "topology_niche_initialization": niche_initialization_audit,
+            "compact_search_active": compact_active,
+            "compact_coordinate_bank_replay": compact_bank_replay,
         }
         current_initialization_audit["sha256"] = canonical_sha256(
             current_initialization_audit
@@ -4484,6 +5540,42 @@ class Current7Tier1Runner:
                 topology_contract,
                 warm_donor_count=donor_count or standard_count,
                 protected_warm_donors_only=bool(donor_count),
+            )
+        compact_initialization_audit = None
+        if compact_active:
+            protected_topology_slots = (
+                int(topology_contract["initial_repaired_copies_per_sub_island"])
+                * len(topology_contract["turn_split_sub_islands_N2_main"])
+            )
+            compact_start = max(protected_topology_slots, authenticated_count)
+            compact_stop = compact_start + len(compact_bank_coordinates)
+            if compact_stop > len(initial):
+                raise RuntimeError(
+                    "population has no room for exact compact initialization"
+                )
+            initial[compact_start:compact_stop] = compact_bank_coordinates
+            replayed, replay_audit = validate_goal_compact_coordinate_bank(
+                self.problem,
+                compact_coordinate_bank or {},
+                compact_contract=active_compact_contract or {},
+            )
+            if not np.array_equal(
+                initial[compact_start:compact_stop], replayed
+            ):
+                raise RuntimeError("compact initialization coordinate copy drifted")
+            compact_initialization_audit = {
+                "schema_version": "mft-goal-compact-initialization-v1",
+                "start": compact_start,
+                "stop": compact_stop,
+                "count": len(replayed),
+                "coordinate_sha256": canonical_sha256(replayed.tolist()),
+                "bank_replay": replay_audit,
+                "exact_A_B_C_bridge_inserted": True,
+                "height_boundary_inserted_independently": True,
+                "near_band_fallback_used": False,
+            }
+            compact_initialization_audit["sha256"] = canonical_sha256(
+                compact_initialization_audit
             )
         if donor_count and not all(
             item["source_is_authenticated_warm"]
@@ -4520,6 +5612,7 @@ class Current7Tier1Runner:
                 "current_run_nsga2": current_initialization_audit,
                 "base_repair": base_initial_repair,
                 "turn_split_sub_islands": topology_initialization,
+                "compact_strata": compact_initialization_audit,
                 "repair": initial_audit,
                 "role_partition_preservation": role_partition_preservation,
             },
@@ -4535,7 +5628,13 @@ class Current7Tier1Runner:
         if pre_optimization_callback is not None:
             pre_optimization_callback(pre_optimization_evidence)
         selection, mating, survival = create_deep_topology_components(
-            self.problem, topology_contract, repair_operator
+            self.problem,
+            topology_contract,
+            repair_operator,
+            compact_search_contract=active_compact_contract,
+            compact_coordinate_bank=(
+                compact_coordinate_bank if compact_active else None
+            ),
         )
         algorithm = NSGA2(
             pop_size=population,
@@ -4640,6 +5739,21 @@ class Current7Tier1Runner:
             ),
             "migration_events": int(executed.mating.migration_events),
             "migrants_created": int(executed.mating.migrants_created),
+            "compact_mutation_events": int(
+                executed.mating.compact_mutation_events
+            ),
+            "compact_mutants_created": int(
+                executed.mating.compact_mutants_created
+            ),
+            "compact_mutation_counts": dict(
+                executed.mating.compact_mutation_counts
+            ),
+            "compact_mutation_records": list(
+                executed.mating.compact_mutation_records
+            ),
+            "compact_bank_replay_audit": (
+                executed.mating.compact_bank_replay_audit
+            ),
             "survival_calls": int(executed.survival.survival_calls),
             "last_optimizer_epsilon": float(executed.survival.last_epsilon),
             "minimum_topology_count_observed": int(
@@ -4701,6 +5815,54 @@ class Current7Tier1Runner:
             )
             or operator_audit["migration_events"] < 1
             or operator_audit["migrants_created"] < len(topologies)
+            or (
+                compact_active
+                and (
+                    operator_audit["compact_mutation_events"] < 1
+                    or operator_audit["compact_mutants_created"]
+                    < len(
+                        (active_compact_contract or {})[
+                            "active_strata_for_this_N1"
+                        ]
+                    )
+                    or set(operator_audit["compact_mutation_counts"])
+                    != set(
+                        (active_compact_contract or {})[
+                            "active_strata_for_this_N1"
+                        ]
+                    )
+                    or any(
+                        count < 1
+                        for count in operator_audit[
+                            "compact_mutation_counts"
+                        ].values()
+                    )
+                    or not operator_audit["compact_mutation_records"]
+                    or any(
+                        record.get("exact_membership_verified") is not True
+                        or record.get("near_band_fallback_used") is not False
+                        or record.get("sha256")
+                        != canonical_sha256({
+                            key: value
+                            for key, value in record.items()
+                            if key != "sha256"
+                        })
+                        for record in operator_audit[
+                            "compact_mutation_records"
+                        ]
+                    )
+                )
+            )
+            or (
+                not compact_active
+                and (
+                    operator_audit["compact_mutation_events"] != 0
+                    or operator_audit["compact_mutants_created"] != 0
+                    or operator_audit["compact_mutation_counts"] != {}
+                    or operator_audit["compact_mutation_records"] != []
+                    or operator_audit["compact_bank_replay_audit"] is not None
+                )
+            )
             or operator_audit["survival_calls"] < 2
             or operator_audit["minimum_topology_count_observed"] < minimum_each
             or operator_audit["maximum_single_topology_count_observed"]
@@ -4758,6 +5920,14 @@ class Current7Tier1Runner:
             "topology_niche_diversity_budget": niche_diversity_budget,
             "all_required_topologies_preserved": True,
             "single_topology_collapse_prevented": True,
+            "compact_search_active": compact_active,
+            "compact_search_contract_sha256": (
+                None
+                if active_compact_contract is None
+                else active_compact_contract["sha256"]
+            ),
+            "compact_initialization": compact_initialization_audit,
+            "compact_exact_mutation_coverage_verified": bool(compact_active),
             "exact_topology_quota_every_generation_verified": exact_quota_mode,
             "terminal_epsilon_zero": bool(expected_last_epsilon == 0.0),
             "physical_constraint_G_mutation": False,
@@ -4774,6 +5944,7 @@ class Current7Tier1Runner:
                 "current_run_nsga2": current_initialization_audit,
                 "base_repair": base_initial_repair,
                 "turn_split_sub_islands": topology_initialization,
+                "compact_strata": compact_initialization_audit,
                 "repair": initial_audit,
                 "role_partition_preservation": role_partition_preservation,
             },
@@ -4795,6 +5966,10 @@ class Current7Tier1Runner:
         result.tier1_repair_audit = execution_audit
         result.tier1_topology_evolution_contract = topology_contract
         result.tier1_topology_evolution_audit = topology_audit
+        result.tier1_compact_search_contract = active_compact_contract
+        result.tier1_compact_initialization_audit = (
+            compact_initialization_audit
+        )
         result.tier1_evaluated_generations = max_generations
         result.tier1_completed_generations = observed_generation_counter
         result.tier1_terminal_physical_replay = replay
@@ -6464,18 +7639,30 @@ def _candidate_records(
         analytical_b = _finite_number(
             design_report["B_design_analytic_T"], "analytical B"
         )
-        resonance = derive_half_magnetizing_self_resonance(
-            {
-                "Llt_phys": means["Llt_phys"],
-                "k": means["k"],
-                "C_tx_tx_F": means["C_tx_tx_F"],
-                "C_rx_rx_F": means["C_rx_rx_F"],
-            },
-            row,
-            magnetizing_inductance_factor=runner.problem.spec[
-                "magnetizing_inductance_factor"
-            ],
-        )
+        if getattr(
+            runner.problem, "_goal_fixed_lm2mh_resonance_installed", False
+        ):
+            resonance = derive_fixed_lm2mh_self_resonance(
+                {
+                    "Llt_phys": means["Llt_phys"],
+                    "C_tx_tx_F": means["C_tx_tx_F"],
+                    "C_rx_rx_F": means["C_rx_rx_F"],
+                },
+                row,
+            )
+        else:
+            resonance = derive_half_magnetizing_self_resonance(
+                {
+                    "Llt_phys": means["Llt_phys"],
+                    "k": means["k"],
+                    "C_tx_tx_F": means["C_tx_tx_F"],
+                    "C_rx_rx_F": means["C_rx_rx_F"],
+                },
+                row,
+                magnetizing_inductance_factor=runner.problem.spec[
+                    "magnetizing_inductance_factor"
+                ],
+            )
         cross_frequency = 1.0 / (
             2.0
             * math.pi
