@@ -748,6 +748,7 @@ def collect(
     diagnostic_task_ids: Sequence[int],
     output_dir: Path,
     allow_nonterminal: bool,
+    allow_result_json_failures: bool,
 ) -> tuple[Path, Path]:
     bindings, sources = _plan_bindings(plan_paths)
     candidates = _candidate_table(candidate_csv)
@@ -768,7 +769,7 @@ def collect(
                 )
                 continue
             raise CollectionError(f"task {task_id} is nonterminal: {state}")
-        if state != "succeeded":
+        if state != "succeeded" and not allow_result_json_failures:
             raise CollectionError(
                 f"authoritative task {task_id} did not succeed: "
                 f"{task.get('failure_message')}"
@@ -907,6 +908,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--allow-nonterminal", action="store_true")
+    parser.add_argument(
+        "--allow-result-json-failures",
+        action="store_true",
+        help=(
+            "harvest failed tasks only when stdout still contains one "
+            "RESULT_JSON; contract/thermal gates remain failed"
+        ),
+    )
     return parser
 
 
@@ -919,6 +928,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         diagnostic_task_ids=args.diagnostic_task_id,
         output_dir=args.output_dir,
         allow_nonterminal=args.allow_nonterminal,
+        allow_result_json_failures=args.allow_result_json_failures,
     )
     print(json_path)
     print(csv_path)
