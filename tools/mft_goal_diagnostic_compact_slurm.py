@@ -187,14 +187,66 @@ def _safe_relative(value: str, label: str) -> str:
     return path.as_posix()
 
 
+def _authorized_activation_seeds(
+    activation: Mapping[str, Any],
+) -> tuple[int, ...]:
+    profile = activation.get("manufacturing_search_profile")
+    if profile is None:
+        return EXACT_SEEDS
+    normalized = scout._validate_search_profile(profile)
+    if (
+        activation.get("manufacturing_search_profile_payload_sha256")
+        != normalized["payload_sha256"]
+    ):
+        raise RuntimeError("diagnostic profile seed authority is unbound")
+    start = int(normalized["authorized_seed_start"])
+    count = int(normalized["authorized_seed_count"])
+    seeds = tuple(range(start, start + count))
+    if (
+        count != EXACT_TASK_COUNT
+        or seeds[-1] != normalized["authorized_seed_end_inclusive"]
+    ):
+        raise RuntimeError("diagnostic profile seed authority is not exact32")
+    return seeds
+
+
+def _authorized_plan_seeds(plan: Mapping[str, Any]) -> tuple[int, ...]:
+    raw = plan.get("authorized_seeds")
+    if raw is None:
+        return EXACT_SEEDS
+    if (
+        not isinstance(raw, list)
+        or len(raw) != EXACT_TASK_COUNT
+        or any(
+            isinstance(seed, bool) or not isinstance(seed, int)
+            for seed in raw
+        )
+    ):
+        raise RuntimeError("diagnostic plan seed authority is invalid")
+    seeds = tuple(raw)
+    if (
+        len(set(seeds)) != EXACT_TASK_COUNT
+        or seeds != tuple(range(seeds[0], seeds[0] + EXACT_TASK_COUNT))
+        or plan.get("seed_start") != seeds[0]
+        or plan.get("seed_end_inclusive") != seeds[-1]
+    ):
+        raise RuntimeError("diagnostic plan seed authority is not contiguous exact32")
+    return seeds
+
+
 def _exact_task_inventory(
     task_values: Iterable[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     tasks = [scout._validate_task(dict(value)) for value in task_values]
+    if not tasks:
+        raise RuntimeError("diagnostic offload task inventory is empty")
+    first = tasks[0]
+    activation = scout._validate_activation(first["activation"])
+    authorized_seeds = _authorized_activation_seeds(activation)
     seeds = [int(task["seed"]) for task in tasks]
     if (
         len(tasks) != EXACT_TASK_COUNT
-        or sorted(seeds) != list(EXACT_SEEDS)
+        or sorted(seeds) != list(authorized_seeds)
         or len(set(seeds)) != EXACT_TASK_COUNT
         or any(
             task.get("fixed_primary_turns") != FIXED_PRIMARY_TURNS
@@ -206,8 +258,6 @@ def _exact_task_inventory(
         )
     ):
         raise RuntimeError("diagnostic offload requires exact32 N1=6 seed inventory")
-    first = tasks[0]
-    activation = scout._validate_activation(first["activation"])
     source_identity = first["source_identity"]
     source = first["source"]
     code_manifest_sha = first["code_manifest_payload_sha256"]
@@ -265,6 +315,15 @@ def _exact_task_inventory(
         "final_design_claim_allowed": False,
         "automatic_promotion_allowed": False,
         "fresh512_activation_evidence": False,
+        "authorized_seeds": list(authorized_seeds),
+        "seed_start": authorized_seeds[0],
+        "seed_end_inclusive": authorized_seeds[-1],
+        "manufacturing_search_profile_payload_sha256": activation.get(
+            "manufacturing_search_profile_payload_sha256"
+        ),
+        "geometry_constraint_profile_sha256": activation.get(
+            "geometry_constraint_profile_sha256"
+        ),
     }
     return ordered, common
 
@@ -355,6 +414,21 @@ def _bundle_tasks(
         != code_manifest["payload_sha256"]
     ):
         raise RuntimeError("diagnostic bundle code/activation identity mismatch")
+    if common["manufacturing_search_profile_payload_sha256"] is not None and (
+        bundle.get("manufacturing_search_profile_payload_sha256")
+        != common["manufacturing_search_profile_payload_sha256"]
+        or scheduler.get("manufacturing_search_profile_payload_sha256")
+        != common["manufacturing_search_profile_payload_sha256"]
+        or bundle.get("geometry_constraint_profile_sha256")
+        != common["geometry_constraint_profile_sha256"]
+        or scheduler.get("geometry_constraint_profile_sha256")
+        != common["geometry_constraint_profile_sha256"]
+        or bundle.get("authorized_seed_start") != common["seed_start"]
+        or bundle.get("authorized_seed_count") != EXACT_TASK_COUNT
+        or bundle.get("authorized_seed_end_inclusive")
+        != common["seed_end_inclusive"]
+    ):
+        raise RuntimeError("diagnostic bundle search profile identity mismatch")
     return (
         bundle,
         scheduler,
@@ -665,8 +739,8 @@ def build_plan(
         },
         "execution_contract": {
             "task_count": EXACT_TASK_COUNT,
-            "seed_start": EXACT_SEED_START,
-            "seed_end_inclusive": EXACT_SEEDS[-1],
+            "seed_start": common["seed_start"],
+            "seed_end_inclusive": common["seed_end_inclusive"],
             "fixed_primary_turns": FIXED_PRIMARY_TURNS,
             "population": scout.POPULATION,
             "generations": scout.GENERATIONS,
@@ -679,6 +753,24 @@ def build_plan(
             "fresh512_activation_evidence": False,
             "aedt_used": False,
             "gpus": 0,
+            **(
+                {}
+                if common[
+                    "manufacturing_search_profile_payload_sha256"
+                ]
+                is None
+                else {
+                    "authorized_seeds": common["authorized_seeds"],
+                    "manufacturing_search_profile_payload_sha256": common[
+                        "manufacturing_search_profile_payload_sha256"
+                    ],
+                    "geometry_constraint_profile_sha256": common[
+                        "geometry_constraint_profile_sha256"
+                    ],
+                    "aligned_initialization_and_repair_required": True,
+                    "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+                }
+            ),
         },
         "source_checkout_authentication": source_checkout,
         "clean_source_authenticated_during_prepare": True,
@@ -713,6 +805,15 @@ def build_plan(
         "goal_bundle_root": str(bundle_root),
         "goal_bundle_payload_sha256": bundle["payload_sha256"],
         "task_count": EXACT_TASK_COUNT,
+        "authorized_seeds": common["authorized_seeds"],
+        "seed_start": common["seed_start"],
+        "seed_end_inclusive": common["seed_end_inclusive"],
+        "manufacturing_search_profile_payload_sha256": common[
+            "manufacturing_search_profile_payload_sha256"
+        ],
+        "geometry_constraint_profile_sha256": common[
+            "geometry_constraint_profile_sha256"
+        ],
         "task_paths": [str(path) for path in task_paths],
         "relocation_sources": relocation_sources,
         "scheduler_claim_root": str(plan_dir / "scheduler-claims"),
@@ -742,10 +843,11 @@ def _validate_deployment_inventory(
     deployment: Mapping[str, Any],
     files: Mapping[str, Any],
 ) -> None:
+    authorized_seeds = _authorized_plan_seeds(plan)
     expected_execution = {
         "task_count": EXACT_TASK_COUNT,
-        "seed_start": EXACT_SEED_START,
-        "seed_end_inclusive": EXACT_SEEDS[-1],
+        "seed_start": authorized_seeds[0],
+        "seed_end_inclusive": authorized_seeds[-1],
         "fixed_primary_turns": FIXED_PRIMARY_TURNS,
         "population": scout.POPULATION,
         "generations": scout.GENERATIONS,
@@ -759,6 +861,20 @@ def _validate_deployment_inventory(
         "aedt_used": False,
         "gpus": 0,
     }
+    if plan.get("manufacturing_search_profile_payload_sha256") is not None:
+        expected_execution.update(
+            {
+                "authorized_seeds": list(authorized_seeds),
+                "manufacturing_search_profile_payload_sha256": plan[
+                    "manufacturing_search_profile_payload_sha256"
+                ],
+                "geometry_constraint_profile_sha256": plan[
+                    "geometry_constraint_profile_sha256"
+                ],
+                "aligned_initialization_and_repair_required": True,
+                "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+            }
+        )
     expected_resources = {
         "cpus": CPUS_PER_TASK,
         "memory_mb": MEMORY_MB_PER_TASK,
@@ -913,6 +1029,7 @@ def authenticate_plan(
     plan, deployment, source_map = transport.load_plan(
         plan_path.resolve(strict=True)
     )
+    authorized_seeds = _authorized_plan_seeds(plan)
     unsigned_plan = {
         key: item
         for key, item in plan.items()
@@ -987,12 +1104,18 @@ def authenticate_plan(
         or code_manifest["code_revision"] != deployment["code_revision"]
         or common["source_identity"] != deployment["source_identity"]
         or (
-            set(plan["relocation_sources"]) != set(EXACT_SEEDS)
+            set(plan["relocation_sources"]) != set(authorized_seeds)
             and {
                 str(key) for key in plan["relocation_sources"]
             }
-            != {str(seed) for seed in EXACT_SEEDS}
+            != {str(seed) for seed in authorized_seeds}
         )
+        or common.get("authorized_seeds", list(EXACT_SEEDS))
+        != list(authorized_seeds)
+        or common.get("manufacturing_search_profile_payload_sha256")
+        != plan.get("manufacturing_search_profile_payload_sha256")
+        or common.get("geometry_constraint_profile_sha256")
+        != plan.get("geometry_constraint_profile_sha256")
     ):
         raise RuntimeError("diagnostic plan/bundle source binding mismatch")
     claim_authority = _load_claim_root(plan=plan, tasks=tasks)
@@ -1010,8 +1133,15 @@ def authenticate_plan(
             "code_manifest_payload_sha256": code_manifest["payload_sha256"],
             "code_revision": code_manifest["code_revision"],
             "task_count": EXACT_TASK_COUNT,
-            "seed_start": EXACT_SEED_START,
-            "seed_end_inclusive": EXACT_SEEDS[-1],
+            "seed_start": authorized_seeds[0],
+            "seed_end_inclusive": authorized_seeds[-1],
+            "authorized_seeds": list(authorized_seeds),
+            "manufacturing_search_profile_payload_sha256": plan.get(
+                "manufacturing_search_profile_payload_sha256"
+            ),
+            "geometry_constraint_profile_sha256": plan.get(
+                "geometry_constraint_profile_sha256"
+            ),
             "fixed_primary_turns": FIXED_PRIMARY_TURNS,
             "compact_search_contract_sha256": common[
                 "compact_search_contract_sha256"
@@ -1174,6 +1304,7 @@ def _claim_root_authority(
     plan: Mapping[str, Any],
     tasks: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    authorized_seeds = _authorized_plan_seeds(plan)
     inventory = []
     for task in sorted(tasks, key=lambda item: int(item["seed"])):
         payload = scheduler_payload(
@@ -1192,7 +1323,7 @@ def _claim_root_authority(
         )
     if (
         len(inventory) != EXACT_TASK_COUNT
-        or [item["seed"] for item in inventory] != list(EXACT_SEEDS)
+        or [item["seed"] for item in inventory] != list(authorized_seeds)
     ):
         raise RuntimeError("diagnostic claim inventory is not exact32")
     return _seal(
@@ -1202,6 +1333,10 @@ def _claim_root_authority(
             "plan_contract_sha256": plan["contract_sha256"],
             "diagnostic_plan_sha256": plan["diagnostic_plan_sha256"],
             "task_count": EXACT_TASK_COUNT,
+            "authorized_seeds": list(authorized_seeds),
+            "manufacturing_search_profile_payload_sha256": plan.get(
+                "manufacturing_search_profile_payload_sha256"
+            ),
             "task_inventory": inventory,
             "screening_only": True,
             "production_eligible": False,
@@ -1281,7 +1416,7 @@ def _claim_directory(
     payload: Mapping[str, Any],
 ) -> Path:
     seed = int(payload["payload_json"]["seed"])
-    if seed not in EXACT_SEEDS:
+    if seed not in _authorized_plan_seeds(plan):
         raise RuntimeError("diagnostic claim seed is outside exact32")
     claims = _plain_directory(
         Path(plan["scheduler_claim_root"]) / "claims",
@@ -1602,6 +1737,7 @@ def _validate_receipt(
     ready: Mapping[str, Any],
     scheduler_url: str,
 ) -> dict[str, Any]:
+    authorized_seeds = _authorized_plan_seeds(plan)
     receipt = _validate_seal(value, schema=RECEIPT_SCHEMA)
     rows = receipt.get("tasks")
     required = {
@@ -1704,7 +1840,7 @@ def _validate_receipt(
         or receipt.get("scheduler_cancel_count") != 0
         or receipt.get("scheduler_preempt_count") != 0
         or len(rows) != EXACT_TASK_COUNT
-        or {row.get("seed") for row in rows} != set(EXACT_SEEDS)
+        or {row.get("seed") for row in rows} != set(authorized_seeds)
         or len({row.get("task_id") for row in rows}) != EXACT_TASK_COUNT
         or len({row.get("dedupe_key") for row in rows}) != EXACT_TASK_COUNT
     ):

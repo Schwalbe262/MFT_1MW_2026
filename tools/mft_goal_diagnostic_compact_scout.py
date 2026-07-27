@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 from datetime import datetime, timezone
+import math
 import os
 from pathlib import Path
 import sys
@@ -49,6 +50,491 @@ INFERENCE_THREADS = goal_launch.INFERENCE_THREADS
 DEFAULT_SEED_START = 2_607_264_000
 DEFAULT_SEED_COUNT = 32
 MAXIMUM_SEED_COUNT = 128
+SEARCH_PROFILE_SCHEMA = "mft-goal-diagnostic-manufacturing-search-profile-v1"
+SEARCH_PROFILE_INSTALLATION_SCHEMA = (
+    "mft-goal-diagnostic-manufacturing-search-installation-v1"
+)
+ALIGNED_BANK_PROOF_SCHEMA = "mft-goal-diagnostic-aligned-bank-proof-v1"
+RAW_CRX_CONSTRAINT_NAME = (
+    "diagnostic_raw_same_metric_C_rx_rx_F_q90_ucb_maximum"
+)
+RAW_CRX_UCB_MAXIMUM_F = 5.553658e-10
+PROFILE_SEED_STARTS = {
+    20: 2_607_264_100,
+    30: 2_607_264_200,
+    40: 2_607_264_300,
+}
+PROFILE_SEED_COUNT = 32
+FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM = 5.0
+FIXED_PRIMARY_INTERTURN_GAP_MM = 1.6
+FIXED_SECONDARY_TURNS = 60
+MINIMUM_WINDING_HEIGHT_OVERLAP_RATIO = 0.9
+
+
+def _profile_clearance_mm(value: Any) -> int:
+    if isinstance(value, bool):
+        raise RuntimeError("diagnostic clearance profile is invalid")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("diagnostic clearance profile is invalid") from exc
+    for allowed in PROFILE_SEED_STARTS:
+        if math.isclose(number, float(allowed), rel_tol=0.0, abs_tol=1e-12):
+            return allowed
+    raise RuntimeError("diagnostic clearance profile must be 20, 30 or 40 mm")
+
+
+def _geometry_profile(clearance_mm: Any) -> dict[str, Any]:
+    clearance = _profile_clearance_mm(clearance_mm)
+    return preflight.goal_geometry_constraint_profile(
+        primary_axial_clearance_min_mm=float(clearance),
+        winding_height_alignment_mode="hard",
+        winding_height_minimum_overlap_ratio=(
+            MINIMUM_WINDING_HEIGHT_OVERLAP_RATIO
+        ),
+        diagnostic_override=clearance < 40,
+    )
+
+
+def _build_search_profile(
+    runner: preflight.Current7Tier1Runner,
+    *,
+    geometry_profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    geometry = preflight.validate_goal_geometry_constraint_profile(
+        geometry_profile
+    )
+    clearance = _profile_clearance_mm(
+        geometry["primary_axial_clearance"]["minimum_mm"]
+    )
+    artifacts = runner.authenticated.report.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise RuntimeError("authenticated model artifact inventory is absent")
+    model_sha = artifacts.get("C_rx_rx_F/models.pkl")
+    meta_sha = artifacts.get("C_rx_rx_F/meta.json")
+    if any(
+        not isinstance(value, str) or len(value) != 64
+        for value in (model_sha, meta_sha)
+    ):
+        raise RuntimeError("authenticated raw C_rx_rx_F model is unavailable")
+    recovery = runner.authenticated.report.get("capacitance_recovery")
+    if (
+        not isinstance(recovery, Mapping)
+        or recovery.get("status") != adapter.RECOVERY_STATUS
+        or recovery.get("eligible_row_count") != recovery.get("row_count")
+    ):
+        raise RuntimeError("raw C_rx_rx_F calibration cohort is incomplete")
+    value = {
+        "schema_version": SEARCH_PROFILE_SCHEMA,
+        "profile_id": f"hard-aligned-hgap{clearance}-exact32",
+        "fixed_primary_turns": FIXED_PRIMARY_TURNS,
+        "fixed_secondary_turns": FIXED_SECONDARY_TURNS,
+        "turns_ratio_N2_over_N1": 10.0,
+        "fixed_primary_conductor_thickness_mm": (
+            FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM
+        ),
+        "fixed_primary_interturn_gap_mm": (
+            FIXED_PRIMARY_INTERTURN_GAP_MM
+        ),
+        "geometry_constraint_profile": copy.deepcopy(geometry),
+        "geometry_constraint_profile_sha256": geometry["sha256"],
+        "winding_height_alignment_initialization_and_repair_required": True,
+        "authorized_seed_start": PROFILE_SEED_STARTS[clearance],
+        "authorized_seed_count": PROFILE_SEED_COUNT,
+        "authorized_seed_end_inclusive": (
+            PROFILE_SEED_STARTS[clearance] + PROFILE_SEED_COUNT - 1
+        ),
+        "raw_same_metric_capacitance_gate": {
+            "constraint_name": RAW_CRX_CONSTRAINT_NAME,
+            "target": "C_rx_rx_F",
+            "measurement_identity": (
+                "authenticated_strict_full_raw_two_net_CapMatrix_C_rx_rx_F"
+            ),
+            "turn_graded_or_corrected_metric_used": False,
+            "statistic": "surrogate_mu_plus_q90_conformal_half_width",
+            "maximum_F": RAW_CRX_UCB_MAXIMUM_F,
+            "optimizer_hard_gate_active": True,
+            "constraint_value": "UCB_F/maximum_F-1",
+            "predictor_conformal_argument": True,
+            "model_artifact_sha256": model_sha,
+            "model_metadata_sha256": meta_sha,
+            "dataset_sha256": runner.authenticated.evidence["dataset"][
+                "sha256"
+            ],
+            "calibration_recovery_status": recovery["status"],
+            "calibration_row_count": int(recovery["row_count"]),
+        },
+        "fixed_lm2mh_resonance_contract_sha256": (
+            preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
+        ),
+        "temperature_contract_sha256": GOAL_TEMPERATURE_CONTRACT_SHA256,
+        "cooling_or_TIM_contract_mutated": False,
+        "screening_only": True,
+        "production_eligible": False,
+        "final_design_claim_allowed": False,
+    }
+    return goal_launch._seal(value)
+
+
+def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
+    profile = goal_launch._validate_seal(
+        dict(value), schema=SEARCH_PROFILE_SCHEMA
+    )
+    geometry = preflight.validate_goal_geometry_constraint_profile(
+        profile.get("geometry_constraint_profile") or {}
+    )
+    clearance = _profile_clearance_mm(
+        geometry["primary_axial_clearance"]["minimum_mm"]
+    )
+    cap = profile.get("raw_same_metric_capacitance_gate") or {}
+    expected_keys = {
+        "schema_version",
+        "profile_id",
+        "fixed_primary_turns",
+        "fixed_secondary_turns",
+        "turns_ratio_N2_over_N1",
+        "fixed_primary_conductor_thickness_mm",
+        "fixed_primary_interturn_gap_mm",
+        "geometry_constraint_profile",
+        "geometry_constraint_profile_sha256",
+        "winding_height_alignment_initialization_and_repair_required",
+        "authorized_seed_start",
+        "authorized_seed_count",
+        "authorized_seed_end_inclusive",
+        "raw_same_metric_capacitance_gate",
+        "fixed_lm2mh_resonance_contract_sha256",
+        "temperature_contract_sha256",
+        "cooling_or_TIM_contract_mutated",
+        "screening_only",
+        "production_eligible",
+        "final_design_claim_allowed",
+        "payload_sha256",
+    }
+    cap_keys = {
+        "constraint_name",
+        "target",
+        "measurement_identity",
+        "turn_graded_or_corrected_metric_used",
+        "statistic",
+        "maximum_F",
+        "optimizer_hard_gate_active",
+        "constraint_value",
+        "predictor_conformal_argument",
+        "model_artifact_sha256",
+        "model_metadata_sha256",
+        "dataset_sha256",
+        "calibration_recovery_status",
+        "calibration_row_count",
+    }
+    digest_fields = (
+        "model_artifact_sha256",
+        "model_metadata_sha256",
+        "dataset_sha256",
+    )
+    if (
+        set(profile) != expected_keys
+        or profile.get("profile_id")
+        != f"hard-aligned-hgap{clearance}-exact32"
+        or profile.get("fixed_primary_turns") != FIXED_PRIMARY_TURNS
+        or profile.get("fixed_secondary_turns") != FIXED_SECONDARY_TURNS
+        or profile.get("turns_ratio_N2_over_N1") != 10.0
+        or profile.get("fixed_primary_conductor_thickness_mm")
+        != FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM
+        or profile.get("fixed_primary_interturn_gap_mm")
+        != FIXED_PRIMARY_INTERTURN_GAP_MM
+        or profile.get("geometry_constraint_profile_sha256")
+        != geometry["sha256"]
+        or profile.get(
+            "winding_height_alignment_initialization_and_repair_required"
+        )
+        is not True
+        or profile.get("authorized_seed_start")
+        != PROFILE_SEED_STARTS[clearance]
+        or profile.get("authorized_seed_count") != PROFILE_SEED_COUNT
+        or profile.get("authorized_seed_end_inclusive")
+        != PROFILE_SEED_STARTS[clearance] + PROFILE_SEED_COUNT - 1
+        or set(cap) != cap_keys
+        or cap.get("constraint_name") != RAW_CRX_CONSTRAINT_NAME
+        or cap.get("target") != "C_rx_rx_F"
+        or cap.get("measurement_identity")
+        != "authenticated_strict_full_raw_two_net_CapMatrix_C_rx_rx_F"
+        or cap.get("turn_graded_or_corrected_metric_used") is not False
+        or cap.get("statistic")
+        != "surrogate_mu_plus_q90_conformal_half_width"
+        or not math.isclose(
+            float(cap.get("maximum_F", 0.0)),
+            RAW_CRX_UCB_MAXIMUM_F,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        )
+        or cap.get("optimizer_hard_gate_active") is not True
+        or cap.get("constraint_value") != "UCB_F/maximum_F-1"
+        or cap.get("predictor_conformal_argument") is not True
+        or any(
+            not isinstance(cap.get(name), str)
+            or len(cap[name]) != 64
+            or any(character not in "0123456789abcdef" for character in cap[name])
+            for name in digest_fields
+        )
+        or cap.get("calibration_recovery_status") != adapter.RECOVERY_STATUS
+        or isinstance(cap.get("calibration_row_count"), bool)
+        or not isinstance(cap.get("calibration_row_count"), int)
+        or cap["calibration_row_count"] < 1
+        or profile.get("fixed_lm2mh_resonance_contract_sha256")
+        != preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
+        or profile.get("temperature_contract_sha256")
+        != GOAL_TEMPERATURE_CONTRACT_SHA256
+        or profile.get("cooling_or_TIM_contract_mutated") is not False
+        or profile.get("screening_only") is not True
+        or profile.get("production_eligible") is not False
+        or profile.get("final_design_claim_allowed") is not False
+    ):
+        raise RuntimeError("diagnostic manufacturing search profile mismatch")
+    return profile
+
+
+def _install_search_profile(
+    problem: Any,
+    search_profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    import numpy as np
+
+    profile = _validate_search_profile(search_profile)
+    if getattr(problem, "_diagnostic_search_profile_installed", False):
+        raise RuntimeError("diagnostic search profile was already installed")
+    if problem.geometry_constraint_profile_sha256 != profile[
+        "geometry_constraint_profile_sha256"
+    ]:
+        raise RuntimeError("diagnostic geometry profile was not installed")
+    coordinate_names = tuple(problem.sobol_dimension_names)
+    if "gap1" not in coordinate_names:
+        raise RuntimeError("primary gap coordinate is unavailable")
+    cw1_index = int(problem.cw1_coordinate_index)
+    gap1_index = coordinate_names.index("gap1")
+    cw1_coordinate = float(
+        preflight.cw1_unit_coordinate(
+            FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM
+        )
+    )
+    gap1_coordinate = float(
+        problem._unit_from_physical(
+            "gap1", FIXED_PRIMARY_INTERTURN_GAP_MM
+        )
+    )
+    problem.xl[cw1_index] = cw1_coordinate
+    problem.xu[cw1_index] = cw1_coordinate
+    problem.xl[gap1_index] = gap1_coordinate
+    problem.xu[gap1_index] = gap1_coordinate
+
+    base_evaluate = problem._evaluate
+    base_names = tuple(problem.constraint_names)
+    base_index = dict(problem.constraint_index)
+    base_count = int(problem.n_ieq_constr)
+    if RAW_CRX_CONSTRAINT_NAME in base_names:
+        raise RuntimeError("raw C_rx_rx_F gate already exists")
+    effective_names = (*base_names, RAW_CRX_CONSTRAINT_NAME)
+    effective_index = {
+        name: index for index, name in enumerate(effective_names)
+    }
+    cap_contract = profile["raw_same_metric_capacitance_gate"]
+    cap_limit = float(cap_contract["maximum_F"])
+
+    def profiled_evaluate(
+        values: Any,
+        out: dict[str, Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        problem.constraint_names = base_names
+        problem.constraint_index = base_index
+        problem.n_ieq_constr = base_count
+        try:
+            base_evaluate(values, out, *args, **kwargs)
+        finally:
+            problem.constraint_names = effective_names
+            problem.constraint_index = effective_index
+            problem.n_ieq_constr = len(effective_names)
+        constraints = np.asarray(out.get("G"), dtype=float)
+        valid = np.asarray(out.get("decoder_valid"), dtype=bool).reshape(-1)
+        frame = out.get("frame")
+        if (
+            constraints.shape != (len(valid), base_count)
+            or frame is None
+            or len(frame) != len(valid)
+        ):
+            raise RuntimeError("diagnostic profiled evaluation shape mismatch")
+        indices = np.flatnonzero(valid)
+        cap_g = np.full(len(valid), preflight.BIG, dtype=float)
+        if len(indices):
+            sub = frame.iloc[indices]
+            for local_index in range(len(sub)):
+                row = sub.iloc[local_index]
+                n1 = float(row["N1_main"]) + float(row["N1_side"])
+                n2 = float(row["N2_main"]) + float(row["N2_side"])
+                if (
+                    not math.isclose(
+                        float(row["cw1"]),
+                        FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    or not math.isclose(
+                        float(row["gap1"]),
+                        FIXED_PRIMARY_INTERTURN_GAP_MM,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    or not math.isclose(
+                        n1, float(FIXED_PRIMARY_TURNS), rel_tol=0.0, abs_tol=0.0
+                    )
+                    or not math.isclose(
+                        n2, float(FIXED_SECONDARY_TURNS), rel_tol=0.0, abs_tol=0.0
+                    )
+                ):
+                    raise RuntimeError(
+                        "diagnostic fixed manufacturing controls escaped"
+                    )
+            problem._prediction_cache = {}
+            try:
+                mean, half_width = problem._predict("C_rx_rx_F", sub)
+            finally:
+                problem._prediction_cache = None
+            ucb = np.asarray(mean, dtype=float) + np.asarray(
+                half_width, dtype=float
+            )
+            if (
+                ucb.shape != (len(indices),)
+                or not np.isfinite(ucb).all()
+                or np.any(ucb <= 0.0)
+            ):
+                raise RuntimeError("raw C_rx_rx_F UCB inference is invalid")
+            cap_g[indices] = ucb / cap_limit - 1.0
+        out["G"] = np.column_stack((constraints, cap_g))
+
+    base_contract = copy.deepcopy(problem.hard_constraint_contract)
+    if canonical_sha256(base_contract) != problem.hard_constraint_contract_sha256:
+        raise RuntimeError("diagnostic base hard contract is unauthenticated")
+    effective_contract = copy.deepcopy(base_contract)
+    effective_contract["diagnostic_manufacturing_search_profile"] = (
+        copy.deepcopy(profile)
+    )
+    effective_contract["diagnostic_manufacturing_search_profile_sha256"] = (
+        profile["payload_sha256"]
+    )
+    effective_contract["raw_same_metric_capacitance_gate"] = copy.deepcopy(
+        cap_contract
+    )
+    effective_contract["screening_only"] = True
+    effective_contract["production_eligible"] = False
+    problem._evaluate = profiled_evaluate
+    problem.constraint_names = effective_names
+    problem.constraint_index = effective_index
+    problem.n_ieq_constr = len(effective_names)
+    problem.hard_constraint_contract = effective_contract
+    problem.hard_constraint_contract_sha256 = canonical_sha256(
+        effective_contract
+    )
+    problem._diagnostic_search_profile_installed = True
+    problem._diagnostic_search_profile = profile
+    evidence = goal_launch._seal(
+        {
+            "schema_version": SEARCH_PROFILE_INSTALLATION_SCHEMA,
+            "search_profile_payload_sha256": profile["payload_sha256"],
+            "geometry_constraint_profile_sha256": profile[
+                "geometry_constraint_profile_sha256"
+            ],
+            "base_hard_constraint_contract_sha256": canonical_sha256(
+                base_contract
+            ),
+            "effective_hard_constraint_contract_sha256": (
+                problem.hard_constraint_contract_sha256
+            ),
+            "cw1_coordinate_index": cw1_index,
+            "cw1_coordinate": cw1_coordinate,
+            "gap1_coordinate_index": gap1_index,
+            "gap1_coordinate": gap1_coordinate,
+            "fixed_primary_turns": FIXED_PRIMARY_TURNS,
+            "fixed_secondary_turns": FIXED_SECONDARY_TURNS,
+            "raw_C_rx_rx_F_UCB_gate_installed": True,
+            "constraint_names": list(effective_names),
+            "screening_only": True,
+            "production_eligible": False,
+        }
+    )
+    return evidence
+
+
+def _aligned_bank_proof(
+    problem: Any,
+    bank: Mapping[str, Any],
+    search_profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    import numpy as np
+
+    profile = _validate_search_profile(search_profile)
+    values = np.asarray(bank.get("coordinates"), dtype=float)
+    repaired = np.asarray(problem.repair_unit_coordinates(values), dtype=float)
+    if values.ndim != 2 or not np.array_equal(values, repaired):
+        raise RuntimeError("aligned compact bank is not a repair fixed point")
+    frame, _shrink, valid = problem.decode_batch(repaired)
+    if len(frame) != len(values) or not np.asarray(valid, dtype=bool).all():
+        raise RuntimeError("aligned compact bank is decoder-invalid")
+    clearance = float(
+        profile["geometry_constraint_profile"]["primary_axial_clearance"][
+            "minimum_mm"
+        ]
+    )
+    overlaps: list[float] = []
+    h_gap1: list[float] = []
+    for index in range(len(frame)):
+        row = frame.iloc[index]
+        nwh1 = float(row["nwh1"])
+        nwh2 = float(row["nwh2"])
+        overlap = min(nwh1, nwh2) / max(nwh1, nwh2)
+        overlaps.append(overlap)
+        h_gap1.append(float(row["h_gap1"]))
+        if (
+            overlap < MINIMUM_WINDING_HEIGHT_OVERLAP_RATIO
+            or h_gap1[-1] < clearance
+            or not math.isclose(
+                float(row["cw1"]),
+                FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                float(row["gap1"]),
+                FIXED_PRIMARY_INTERTURN_GAP_MM,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or int(row["N1_main"]) + int(row["N1_side"])
+            != FIXED_PRIMARY_TURNS
+            or int(row["N2_main"]) + int(row["N2_side"])
+            != FIXED_SECONDARY_TURNS
+        ):
+            raise RuntimeError("aligned compact bank profile proof failed")
+    return goal_launch._seal(
+        {
+            "schema_version": ALIGNED_BANK_PROOF_SCHEMA,
+            "search_profile_payload_sha256": profile["payload_sha256"],
+            "geometry_constraint_profile_sha256": profile[
+                "geometry_constraint_profile_sha256"
+            ],
+            "compact_coordinate_bank_sha256": bank["sha256"],
+            "row_count": len(values),
+            "minimum_h_gap1_mm": min(h_gap1),
+            "required_h_gap1_mm": clearance,
+            "minimum_winding_height_overlap_ratio": min(overlaps),
+            "required_winding_height_overlap_ratio": (
+                MINIMUM_WINDING_HEIGHT_OVERLAP_RATIO
+            ),
+            "all_rows_repair_fixed_points": True,
+            "all_rows_decoder_valid": True,
+            "all_rows_manufacturing_controls_attested": True,
+            "aligned_initialization_and_repair_verified": True,
+        }
+    )
 
 
 def _seed_interval(seed_start: int, seed_count: int) -> list[int]:
@@ -87,6 +573,44 @@ def _validate_activation(value: Mapping[str, Any]) -> dict[str, Any]:
         key: item for key, item in bank.items() if key != "sha256"
     }
     source = activation.get("source_identity") or {}
+    search_profile = activation.get("manufacturing_search_profile")
+    if search_profile is not None:
+        search_profile = _validate_search_profile(search_profile)
+        installation = goal_launch._validate_seal(
+            activation.get("manufacturing_search_installation") or {},
+            schema=SEARCH_PROFILE_INSTALLATION_SCHEMA,
+        )
+        aligned_proof = goal_launch._validate_seal(
+            activation.get("aligned_compact_bank_proof") or {},
+            schema=ALIGNED_BANK_PROOF_SCHEMA,
+        )
+        if (
+            activation.get("manufacturing_search_profile_payload_sha256")
+            != search_profile["payload_sha256"]
+            or activation.get("geometry_constraint_profile")
+            != search_profile["geometry_constraint_profile"]
+            or activation.get("geometry_constraint_profile_sha256")
+            != search_profile["geometry_constraint_profile_sha256"]
+            or installation.get("search_profile_payload_sha256")
+            != search_profile["payload_sha256"]
+            or installation.get(
+                "effective_hard_constraint_contract_sha256"
+            )
+            != activation.get("search_profile_hard_constraint_contract_sha256")
+            or aligned_proof.get("search_profile_payload_sha256")
+            != search_profile["payload_sha256"]
+            or aligned_proof.get("compact_coordinate_bank_sha256")
+            != bank.get("sha256")
+            or activation.get("authorized_seed_start")
+            != search_profile["authorized_seed_start"]
+            or activation.get("authorized_seed_count")
+            != search_profile["authorized_seed_count"]
+            or activation.get("authorized_seed_end_inclusive")
+            != search_profile["authorized_seed_end_inclusive"]
+        ):
+            raise RuntimeError(
+                "diagnostic manufacturing activation binding mismatch"
+            )
     if (
         activation.get("campaign_id") != CAMPAIGN_ID
         or activation.get("fixed_primary_turns") != FIXED_PRIMARY_TURNS
@@ -142,6 +666,9 @@ def _build_activation(
     compact_contract: Mapping[str, Any],
     compact_bank: Mapping[str, Any],
     fixed_lm_installation: Mapping[str, Any],
+    search_profile: Mapping[str, Any] | None = None,
+    search_profile_installation: Mapping[str, Any] | None = None,
+    aligned_bank_proof: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     artifacts = runner.authenticated.report["artifacts"]
     source_identity = {
@@ -161,8 +688,7 @@ def _build_activation(
         "evaluation_model_sha256": canonical_sha256(artifacts),
         "code_revision": runner.code_identity["revision"],
     }
-    return goal_launch._seal(
-        {
+    value = {
             "schema_version": ACTIVATION_SCHEMA,
             "campaign_id": CAMPAIGN_ID,
             "created_at": datetime.now(timezone.utc).isoformat(
@@ -206,7 +732,45 @@ def _build_activation(
             "scheduler_write_performed": False,
             "scheduler_submission_performed": False,
         }
-    )
+    if search_profile is not None:
+        profile = _validate_search_profile(search_profile)
+        installation = goal_launch._validate_seal(
+            dict(search_profile_installation or {}),
+            schema=SEARCH_PROFILE_INSTALLATION_SCHEMA,
+        )
+        proof = goal_launch._validate_seal(
+            dict(aligned_bank_proof or {}),
+            schema=ALIGNED_BANK_PROOF_SCHEMA,
+        )
+        value.update(
+            {
+                "manufacturing_search_profile": copy.deepcopy(profile),
+                "manufacturing_search_profile_payload_sha256": profile[
+                    "payload_sha256"
+                ],
+                "manufacturing_search_installation": copy.deepcopy(
+                    installation
+                ),
+                "search_profile_hard_constraint_contract_sha256": (
+                    installation[
+                        "effective_hard_constraint_contract_sha256"
+                    ]
+                ),
+                "geometry_constraint_profile": copy.deepcopy(
+                    profile["geometry_constraint_profile"]
+                ),
+                "geometry_constraint_profile_sha256": profile[
+                    "geometry_constraint_profile_sha256"
+                ],
+                "aligned_compact_bank_proof": copy.deepcopy(proof),
+                "authorized_seed_start": profile["authorized_seed_start"],
+                "authorized_seed_count": profile["authorized_seed_count"],
+                "authorized_seed_end_inclusive": profile[
+                    "authorized_seed_end_inclusive"
+                ],
+            }
+        )
+    return goal_launch._seal(value)
 
 
 def audit_source(args: argparse.Namespace) -> Path:
@@ -286,7 +850,14 @@ def prepare(args: argparse.Namespace) -> Path:
         raise RuntimeError("diagnostic scout output already exists")
     if goal_launch._path_is_below(output, code_root):
         raise RuntimeError("diagnostic output must be outside the code root")
-    seeds = _seed_interval(int(args.seed_start), int(args.seed_count))
+    geometry_profile = _geometry_profile(args.primary_axial_clearance_mm)
+    clearance = _profile_clearance_mm(args.primary_axial_clearance_mm)
+    seed_start = (
+        PROFILE_SEED_STARTS[clearance]
+        if args.seed_start is None
+        else int(args.seed_start)
+    )
+    seeds = _seed_interval(seed_start, int(args.seed_count))
     runner = preflight.build_authenticated_runner(
         generation=args.generation.resolve(strict=True),
         candidate_path=args.candidate.resolve(strict=True),
@@ -295,6 +866,7 @@ def prepare(args: argparse.Namespace) -> Path:
         expected_code_revision=args.expected_code_revision,
         fixed_primary_turns=FIXED_PRIMARY_TURNS,
         stage_spec=GOAL_STAGE_SPEC,
+        geometry_constraint_profile=geometry_profile,
         inference_threads=INFERENCE_THREADS,
         dataset_path_override=(
             None
@@ -314,6 +886,24 @@ def prepare(args: argparse.Namespace) -> Path:
         quality=runner.authenticated.quality,
         code_root=code_root,
     )
+    search_profile = _build_search_profile(
+        runner,
+        geometry_profile=geometry_profile,
+    )
+    expected_seeds = list(
+        range(
+            search_profile["authorized_seed_start"],
+            search_profile["authorized_seed_end_inclusive"] + 1,
+        )
+    )
+    if seeds != expected_seeds:
+        raise RuntimeError(
+            "diagnostic search profile requires its exact32 seed interval"
+        )
+    search_profile_installation = _install_search_profile(
+        runner.problem,
+        search_profile,
+    )
     _base, fixed_lm_installation = (
         preflight.install_goal_fixed_lm2mh_resonance(runner.problem)
     )
@@ -330,12 +920,20 @@ def prepare(args: argparse.Namespace) -> Path:
         compact_bank,
         compact_contract=compact_contract,
     )
+    aligned_bank_proof = _aligned_bank_proof(
+        runner.problem,
+        compact_bank,
+        search_profile,
+    )
     activation = _build_activation(
         runner,
         quality_contract=quality,
         compact_contract=compact_contract,
         compact_bank=compact_bank,
         fixed_lm_installation=fixed_lm_installation,
+        search_profile=search_profile,
+        search_profile_installation=search_profile_installation,
+        aligned_bank_proof=aligned_bank_proof,
     )
     _validate_activation(activation)
 
@@ -417,6 +1015,16 @@ def prepare(args: argparse.Namespace) -> Path:
                     "hard_constraint_contract_sha256": activation[
                         "effective_hard_constraint_contract_sha256"
                     ],
+                    "manufacturing_search_profile": search_profile,
+                    "manufacturing_search_profile_payload_sha256": (
+                        search_profile["payload_sha256"]
+                    ),
+                    "geometry_constraint_profile_sha256": search_profile[
+                        "geometry_constraint_profile_sha256"
+                    ],
+                    "aligned_compact_bank_proof_sha256": aligned_bank_proof[
+                        "payload_sha256"
+                    ],
                     "source": source,
                     "source_identity": activation["source_identity"],
                     "code_manifest_payload_sha256": code_manifest[
@@ -453,6 +1061,21 @@ def prepare(args: argparse.Namespace) -> Path:
                 task["payload_sha256"] for task in tasks
             ],
             "activation_payload_sha256": activation["payload_sha256"],
+            "manufacturing_search_profile_payload_sha256": search_profile[
+                "payload_sha256"
+            ],
+            "geometry_constraint_profile_sha256": search_profile[
+                "geometry_constraint_profile_sha256"
+            ],
+            "authorized_seed_start": search_profile[
+                "authorized_seed_start"
+            ],
+            "authorized_seed_count": search_profile[
+                "authorized_seed_count"
+            ],
+            "authorized_seed_end_inclusive": search_profile[
+                "authorized_seed_end_inclusive"
+            ],
             "code_manifest_payload_sha256": code_manifest["payload_sha256"],
             "source_bound_paths": source,
             "screening_only": True,
@@ -469,6 +1092,12 @@ def prepare(args: argparse.Namespace) -> Path:
             "schema_version": SCHEDULER_SCHEMA,
             "campaign_id": CAMPAIGN_ID,
             "bundle_payload_sha256": bundle["payload_sha256"],
+            "manufacturing_search_profile_payload_sha256": search_profile[
+                "payload_sha256"
+            ],
+            "geometry_constraint_profile_sha256": search_profile[
+                "geometry_constraint_profile_sha256"
+            ],
             "task_count": len(tasks),
             "maximum_parallel_tasks": len(tasks),
             "resources_per_task": {
@@ -518,6 +1147,24 @@ def _validate_task(value: Mapping[str, Any]) -> dict[str, Any]:
             task.get("compact_run_authorization") or {}
         )
     )
+    search_profile = activation.get("manufacturing_search_profile")
+    if search_profile is not None:
+        search_profile = _validate_search_profile(search_profile)
+        if (
+            task.get("manufacturing_search_profile") != search_profile
+            or task.get("manufacturing_search_profile_payload_sha256")
+            != search_profile["payload_sha256"]
+            or task.get("geometry_constraint_profile_sha256")
+            != search_profile["geometry_constraint_profile_sha256"]
+            or task.get("aligned_compact_bank_proof_sha256")
+            != activation["aligned_compact_bank_proof"]["payload_sha256"]
+            or not (
+                search_profile["authorized_seed_start"]
+                <= int(seed)
+                <= search_profile["authorized_seed_end_inclusive"]
+            )
+        ):
+            raise RuntimeError("diagnostic task search profile mismatch")
     digest_fields = (
         "train_report_sha256",
         "candidate_sha256",
@@ -609,6 +1256,15 @@ def execute(args: argparse.Namespace) -> Path:
         task, args.relocation
     )
     relocated = relocated_code_manifest is not None
+    activation = task["activation"]
+    search_profile = activation.get("manufacturing_search_profile")
+    geometry_profile = (
+        None
+        if search_profile is None
+        else _validate_search_profile(search_profile)[
+            "geometry_constraint_profile"
+        ]
+    )
     runner = preflight.build_authenticated_runner(
         generation=Path(source["generation"]),
         candidate_path=Path(source["candidate"]),
@@ -617,6 +1273,7 @@ def execute(args: argparse.Namespace) -> Path:
         expected_code_revision=source["expected_code_revision"],
         fixed_primary_turns=FIXED_PRIMARY_TURNS,
         stage_spec=GOAL_STAGE_SPEC,
+        geometry_constraint_profile=geometry_profile,
         inference_threads=INFERENCE_THREADS,
         dataset_path_override=(
             Path(source["dataset"]) if relocated else None
@@ -635,8 +1292,13 @@ def execute(args: argparse.Namespace) -> Path:
             task["code_inventory_sha256"] if relocated else None
         ),
     )
-    activation = task["activation"]
     source_identity = activation["source_identity"]
+    observed_search_installation = None
+    if search_profile is not None:
+        observed_search_installation = _install_search_profile(
+            runner.problem,
+            search_profile,
+        )
     _base, fixed_installation = preflight.install_goal_fixed_lm2mh_resonance(
         runner.problem
     )
@@ -665,6 +1327,15 @@ def execute(args: argparse.Namespace) -> Path:
         != task["hard_constraint_contract_sha256"]
         or fixed_installation["resonance_contract_sha256"]
         != activation["fixed_lm2mh_resonance_contract_sha256"]
+        or (
+            search_profile is not None
+            and (
+                observed_search_installation
+                != activation["manufacturing_search_installation"]
+                or runner.problem.geometry_constraint_profile_sha256
+                != activation["geometry_constraint_profile_sha256"]
+            )
+        )
     ):
         raise RuntimeError("diagnostic task source identity drifted")
     compact_contract = activation["compact_search_contract"]
@@ -674,6 +1345,14 @@ def execute(args: argparse.Namespace) -> Path:
         compact_bank,
         compact_contract=compact_contract,
     )
+    if search_profile is not None:
+        observed_aligned_proof = _aligned_bank_proof(
+            runner.problem,
+            compact_bank,
+            search_profile,
+        )
+        if observed_aligned_proof != activation["aligned_compact_bank_proof"]:
+            raise RuntimeError("diagnostic aligned bank proof drifted")
     output.mkdir(parents=True)
     physical_evaluate, scaling = preflight.install_optimizer_scaling(
         runner.problem,
@@ -766,6 +1445,19 @@ def execute(args: argparse.Namespace) -> Path:
             "compact_run_authorization_sha256": task[
                 "compact_run_authorization"
             ]["sha256"],
+            "manufacturing_search_profile_payload_sha256": (
+                None
+                if search_profile is None
+                else search_profile["payload_sha256"]
+            ),
+            "geometry_constraint_profile_sha256": (
+                None
+                if search_profile is None
+                else search_profile["geometry_constraint_profile_sha256"]
+            ),
+            "raw_same_metric_C_rx_rx_F_UCB_gate_active": (
+                search_profile is not None
+            ),
             "resonance_contract_schema": (
                 preflight.GOAL_FIXED_LM_RESONANCE_SCHEMA
             ),
@@ -833,11 +1525,15 @@ def _parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument(
         "--expected-documentary-generation-path"
     )
-    prepare_parser.add_argument(
-        "--seed-start", type=int, default=DEFAULT_SEED_START
-    )
+    prepare_parser.add_argument("--seed-start", type=int)
     prepare_parser.add_argument(
         "--seed-count", type=int, default=DEFAULT_SEED_COUNT
+    )
+    prepare_parser.add_argument(
+        "--primary-axial-clearance-mm",
+        type=float,
+        choices=(20.0, 30.0, 40.0),
+        default=20.0,
     )
     prepare_parser.add_argument("--output", type=Path, required=True)
     prepare_parser.set_defaults(handler=prepare)
