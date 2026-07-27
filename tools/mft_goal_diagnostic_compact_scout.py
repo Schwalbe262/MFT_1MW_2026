@@ -1040,6 +1040,39 @@ def _install_search_profile(
     return evidence
 
 
+def _bounded_secondary_length_repair(
+    *,
+    total_length_mm: float,
+    n2: int,
+    gap_count: int,
+    cw2_mm: float,
+    gap2_mm: float,
+) -> tuple[float, float]:
+    """Return a shorter length and max gap that close the cw2 hard band.
+
+    Increasing gap2 alone can miss the 1.0-mm conductor ceiling by a very
+    small pack-width residual.  Because ``l2=(total_length-4*l1)/2``, reducing
+    total length by twice that residual removes it without changing turns,
+    topology, insulation minima, or the hard gap ceiling.
+    """
+
+    target_gap = VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+    current_pack = n2 * cw2_mm + gap_count * gap2_mm
+    target_pack = (
+        n2 * SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+        + gap_count * target_gap
+    )
+    residual = max(0.0, current_pack - target_pack)
+    # Decoder total length is integer-quantized.  Floor beyond the exact
+    # continuous target so the realized cw2 cannot round above 1.000 mm.
+    target_length = math.floor(
+        float(total_length_mm) - 2.0 * residual - 1e-9
+    )
+    if not math.isfinite(target_length) or target_length <= 0.0:
+        raise RuntimeError("bounded secondary length repair is nonphysical")
+    return float(target_length), float(target_gap)
+
+
 def _project_bounded_secondary_bank(
     problem: Any,
     bank: Mapping[str, Any],
@@ -1062,10 +1095,13 @@ def _project_bounded_secondary_bank(
     )
     coordinates = np.asarray(bank.get("coordinates"), dtype=float)
     gap_index = tuple(problem.sobol_dimension_names).index("gap2")
+    total_length_index = tuple(problem.sobol_dimension_names).index(
+        "total_length"
+    )
     projected = []
     for index, source in enumerate(coordinates):
         coordinate = np.asarray(source, dtype=float).copy()
-        for _attempt in range(4):
+        for _attempt in range(8):
             coordinate = np.asarray(
                 problem.repair_unit_coordinates(coordinate), dtype=float
             )
@@ -1115,10 +1151,22 @@ def _project_bounded_secondary_bank(
             else:
                 required = VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
             if required > VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM:
-                raise RuntimeError(
-                    "bounded secondary bank needs gap2 above 2.00 mm: "
-                    f"row={index},required={required},cw2={cw2}"
+                total_length, target_gap = _bounded_secondary_length_repair(
+                    total_length_mm=(
+                        4.0 * float(row["l1"]) + 2.0 * float(row["l2"])
+                    ),
+                    n2=n2,
+                    gap_count=gap_count,
+                    cw2_mm=cw2,
+                    gap2_mm=gap2,
                 )
+                coordinate[total_length_index] = problem._unit_from_physical(
+                    "total_length", total_length
+                )
+                coordinate[gap_index] = problem._unit_from_physical(
+                    "gap2", target_gap
+                )
+                continue
             coordinate[gap_index] = problem._unit_from_physical(
                 "gap2", required
             )

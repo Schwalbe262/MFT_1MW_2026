@@ -163,6 +163,23 @@ def test_bounded_secondary_profile_is_disjoint_and_strict() -> None:
     assert "fixed_secondary_interturn_gap_mm" not in profile
 
 
+def test_bounded_secondary_length_repair_closes_small_gap_ceiling_residual() -> None:
+    total_length, gap2 = scout._bounded_secondary_length_repair(
+        total_length_mm=900.0,
+        n2=60,
+        gap_count=58,
+        cw2_mm=2.62,
+        gap2_mm=0.35,
+    )
+    current_pack = 60 * 2.62 + 58 * 0.35
+    reduced_pack = current_pack - (900.0 - total_length) / 2.0
+    realized_cw2 = (reduced_pack - 58 * gap2) / 60
+
+    assert total_length == 896.0
+    assert gap2 == 2.0
+    assert realized_cw2 <= 1.0
+
+
 def test_search_profile_accepts_only_aligned_hgap20_continuations() -> None:
     profile = _profile(20)
     unsigned = {
