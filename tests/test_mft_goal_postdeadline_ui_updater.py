@@ -2372,6 +2372,363 @@ def _write_rx_main_l5_canary_evidence(
     return successor_root
 
 
+def _write_rx_main_l5_operational_chain_evidence(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path]:
+    successor_root = _write_rx_main_l5_canary_evidence(root, monkeypatch)
+    successor_monitor = {
+        "schema": updater.RX_MAIN_L5_NATIVE_CANARY_MONITOR_STATE_SCHEMA,
+        "scheduler_mutation_performed": False,
+        "updated_at_utc": OBSERVED,
+        "task": {
+            "id": updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID,
+            "name": updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_NAME,
+            "status": "failed",
+            "exit_code": 1,
+            "failure_message": "result extraction failed",
+            "actual_node_name": "n110",
+            "slurm_job_id": updater.RX_MAIN_L5_NATIVE_CANARY_SHARED_JOB_ID,
+            "started_at": "2026-07-27 02:19:33",
+            "finished_at": "2026-07-27 02:42:57",
+        },
+    }
+    successor_monitor["payload_sha256"] = (
+        updater._rx_main_l5_monitor_payload_sha256(successor_monitor)
+    )
+    successor_process = {
+        "schema": updater.RX_MAIN_L5_NATIVE_CANARY_MONITOR_PROCESS_SCHEMA,
+        "task_id": updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID,
+        "allowed_http_method": "GET",
+        "scheduler_mutation_performed": False,
+        "post_cancel_retry_forbidden": True,
+    }
+    successor_process["payload_sha256"] = (
+        updater._rx_main_l5_monitor_payload_sha256(successor_process)
+    )
+    (successor_root / "monitor_state.json").write_text(
+        json.dumps(successor_monitor),
+        encoding="utf-8",
+    )
+    (successor_root / "monitor_process.json").write_text(
+        json.dumps(successor_process),
+        encoding="utf-8",
+    )
+    stdout_sha256 = "1" * 64
+    stderr_sha256 = "2" * 64
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_STDOUT_SHA256",
+        stdout_sha256,
+    )
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_STDERR_SHA256",
+        stderr_sha256,
+    )
+    terminal_gate = {
+        "schema": "mft-goal-rx-main-l5-terminal-gate-v1",
+        "task_id": updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID,
+        "task_status": "failed",
+        "scheduler_mutation_performed": False,
+        "physical_geometry_sha256": (
+            updater.RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256
+        ),
+        "solver_revision": updater.RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION,
+        "library_revision": updater.RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION,
+        "slurm_job_id": updater.RX_MAIN_L5_NATIVE_CANARY_SHARED_JOB_ID,
+        "stdout_sha256": stdout_sha256,
+        "stderr_sha256": stderr_sha256,
+        "interface_fix_canary_passed": False,
+        "scientific_design_promotion_passed": False,
+        "thermal_result_scientific_valid": False,
+        "one_iteration_canary_not_a_design_temperature_result": True,
+        "result_json_sha256": "",
+        "coverage": None,
+        "preflight": None,
+        "checks": {
+            "terminal_status": True,
+            "result_json_present": False,
+            "coverage_json_present": False,
+            "no_unpaired_log_marker": True,
+        },
+        "strict_result_fields": {
+            "thermal_result_scientific_valid": None,
+            "thermal_rx_main_interface_coverage_passed": None,
+        },
+    }
+    terminal_gate["payload_sha256"] = (
+        updater._rx_main_l5_monitor_payload_sha256(terminal_gate)
+    )
+    terminal_gate_path = successor_root / "terminal_gate.json"
+    terminal_gate_path.write_text(
+        json.dumps(terminal_gate),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TERMINAL_PAYLOAD_SHA256",
+        terminal_gate["payload_sha256"],
+    )
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TERMINAL_GATE_SHA256",
+        updater._file_sha256(terminal_gate_path),
+    )
+
+    hedge_root = root / "hedge"
+    hedge_root.mkdir()
+    params = {
+        **copy.deepcopy(updater.RX_MAIN_L5_NATIVE_CANARY_FIXED_COOLING),
+        "thermal_max_iterations": 1,
+    }
+    hedge_params_path = hedge_root / "params.json"
+    hedge_params_path.write_text(json.dumps(params, indent=2) + "\n")
+    payload = {
+        "name": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_TASK_NAME,
+        "command": (
+            "MFT_EXCLUSIVE_PLACEMENT_FAIL; "
+            "MFT_EXCLUSIVE_PLACEMENT_JSON; exit 86; "
+            f"{updater.RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256}"
+        ),
+        "cpus": updater.RX_MAIN_L5_NATIVE_CANARY_CPUS,
+        "memory_mb": updater.RX_MAIN_L5_NATIVE_CANARY_MEMORY_MB,
+        "timeout_seconds": updater.RX_MAIN_L5_NATIVE_CANARY_TIMEOUT_SECONDS,
+        "node_name": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_NODE,
+        "node_name_policy": "strict",
+        "exclusive_node": True,
+        "max_workers_per_node": 1,
+    }
+    payload_path = hedge_root / "dry_run_payload.json"
+    payload_path.write_text(json.dumps(payload, indent=2) + "\n")
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_HEDGE_PAYLOAD_SHA256",
+        updater._file_sha256(payload_path),
+    )
+    pre_submit = {
+        "schema": "mft-goal-rx-main-l5-isolated-hedge-pre-submit-v1",
+        "scheduler_post_calls": 0,
+        "source_task_id": (
+            updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID
+        ),
+        "expected_node": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_NODE,
+        "node_allocations": [],
+        "node_tasks": [],
+        "submission_policy": "exactly_one_post_no_retry_no_cancel",
+    }
+    pre_path = hedge_root / "pre_submit_receipt.json"
+    pre_path.write_text(json.dumps(pre_submit))
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_HEDGE_PRE_SUBMIT_SHA256",
+        updater._file_sha256(pre_path),
+    )
+    post_attempt = {
+        "schema": "mft-goal-rx-main-l5-isolated-hedge-post-attempt-v1",
+        "scheduler_post_calls": 1,
+        "retry_forbidden": True,
+    }
+    post_path = hedge_root / "post_attempt_receipt.json"
+    post_path.write_text(json.dumps(post_attempt))
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_HEDGE_POST_ATTEMPT_SHA256",
+        updater._file_sha256(post_path),
+    )
+    receipt = {
+        "schema": "mft-goal-rx-main-l5-isolated-hedge-submission-v1",
+        "task_id": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_TASK_ID,
+        "task_name": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_TASK_NAME,
+        "scheduler_post_calls": 1,
+        "scheduler_mutation_performed": True,
+        "retry_cancel_forbidden": True,
+        "strict_node_placement": True,
+        "requested_node_name": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_NODE,
+        "node_name_policy": "strict",
+        "exclusive_node_response": None,
+        "runtime_fail_close_marker_required": "MFT_EXCLUSIVE_PLACEMENT_JSON",
+        "geometry_sha256": (
+            updater.RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256
+        ),
+        "solver_revision": updater.RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION,
+        "library_revision": updater.RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION,
+        "core_auth_sha256": updater.RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256,
+        "cpus": updater.RX_MAIN_L5_NATIVE_CANARY_CPUS,
+        "memory_mb": updater.RX_MAIN_L5_NATIVE_CANARY_MEMORY_MB,
+        "max_workers_per_node": 1,
+    }
+    receipt_path = hedge_root / "submission_receipt.json"
+    receipt_path.write_text(json.dumps(receipt))
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_HEDGE_RECEIPT_SHA256",
+        updater._file_sha256(receipt_path),
+    )
+    hedge_monitor = {
+        "schema": updater.RX_MAIN_L5_NATIVE_CANARY_MONITOR_STATE_SCHEMA,
+        "scheduler_mutation_performed": False,
+        "updated_at_utc": OBSERVED,
+        "task": {
+            "id": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_TASK_ID,
+            "name": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_TASK_NAME,
+            "status": "queued",
+            "exit_code": None,
+            "actual_node_name": "",
+            "slurm_job_id": "",
+        },
+    }
+    hedge_monitor["payload_sha256"] = (
+        updater._rx_main_l5_monitor_payload_sha256(hedge_monitor)
+    )
+    hedge_process = {
+        "schema": updater.RX_MAIN_L5_NATIVE_CANARY_MONITOR_PROCESS_SCHEMA,
+        "task_id": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_TASK_ID,
+        "allowed_http_method": "GET",
+        "scheduler_mutation_performed": False,
+        "post_cancel_retry_forbidden": True,
+    }
+    hedge_process["payload_sha256"] = (
+        updater._rx_main_l5_monitor_payload_sha256(hedge_process)
+    )
+    (hedge_root / "monitor_state.json").write_text(
+        json.dumps(hedge_monitor)
+    )
+    (hedge_root / "monitor_process.json").write_text(
+        json.dumps(hedge_process)
+    )
+    shared_started_at = "2026-07-27 02:19:33"
+    placement_state = {
+        "schema": updater.RX_MAIN_L5_NATIVE_CANARY_PLACEMENT_STATE_SCHEMA,
+        "scheduler_mutation_performed": False,
+        "updated_at_utc": OBSERVED,
+        "allocation": None,
+        "predecessor": {
+            "id": updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID,
+            "status": "failed",
+            "exit_code": 1,
+            "actual_node_name": "n110",
+            "allocation_id": (
+                updater.RX_MAIN_L5_NATIVE_CANARY_SHARED_ALLOCATION_ID
+            ),
+            "slurm_job_id": updater.RX_MAIN_L5_NATIVE_CANARY_SHARED_JOB_ID,
+            "started_at": shared_started_at,
+        },
+        "simultaneous": {
+            "id": updater.RX_MAIN_L5_NATIVE_CANARY_SIMULTANEOUS_TASK_ID,
+            "status": "failed",
+            "actual_node_name": "n110",
+            "allocation_id": (
+                updater.RX_MAIN_L5_NATIVE_CANARY_SHARED_ALLOCATION_ID
+            ),
+            "slurm_job_id": updater.RX_MAIN_L5_NATIVE_CANARY_SHARED_JOB_ID,
+            "started_at": shared_started_at,
+        },
+        "task": {
+            "id": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_TASK_ID,
+            "name": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_TASK_NAME,
+            "status": "queued",
+            "requested_node_name": (
+                updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_NODE
+            ),
+            "node_name_policy": "strict",
+            "strict_node_placement": True,
+            "actual_node_name": "",
+            "allocation_id": 0,
+            "slurm_job_id": "",
+            "placement_contract_satisfied": False,
+        },
+    }
+    placement_state["payload_sha256"] = updater.hashlib.sha256(
+        json.dumps(
+            placement_state,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    placement_process = {
+        "schema": updater.RX_MAIN_L5_NATIVE_CANARY_PLACEMENT_PROCESS_SCHEMA,
+        "allowed_http_method": "GET",
+        "scheduler_mutation_performed": False,
+        "task_id": updater.RX_MAIN_L5_NATIVE_CANARY_HEDGE_TASK_ID,
+        "predecessor_id": (
+            updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID
+        ),
+        "simultaneous_id": (
+            updater.RX_MAIN_L5_NATIVE_CANARY_SIMULTANEOUS_TASK_ID
+        ),
+    }
+    placement_process["payload_sha256"] = updater.hashlib.sha256(
+        json.dumps(
+            placement_process,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    (hedge_root / "placement_lineage_state.json").write_text(
+        json.dumps(placement_state)
+    )
+    (hedge_root / "placement_lineage_monitor_process.json").write_text(
+        json.dumps(placement_process)
+    )
+    return successor_root, hedge_root
+
+
+def test_rx_main_l5_operational_chain_card_is_stage_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    successor_root, hedge_root = (
+        _write_rx_main_l5_operational_chain_evidence(
+            tmp_path,
+            monkeypatch,
+        )
+    )
+
+    card = updater._rx_main_l5_operational_chain_card(
+        OBSERVED,
+        root=tmp_path,
+        successor_root=successor_root,
+        hedge_root=hedge_root,
+    )
+
+    assert len(card["title"]) <= 160
+    assert "97140 AUTH FAIL PRE-SOLVER" in card["title"]
+    assert "97141 n110 MATRIX-OK/SESSION-FAIL PRE-THERMAL" in card["title"]
+    assert "97142 STRICT n107 EXCL-GATE QUEUED" in card["title"]
+    assert card["state"] == "in_progress"
+    assert card["progress_pct"] == 30
+    assert any(
+        "Matrix Setup1 solved 3s" in item
+        and "result-extraction collapse" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "task97121 started same second" in item
+        and "allocation14648/job840585" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "operational pre-thermal failure" in item
+        and "candidate design invalidated=false" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "task97142 receipt authenticated=true" in item
+        and "strict n107" in item
+        and "exclusive_node=true" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "task97142 GET monitor authenticated=true" in item
+        and "state=queued" in item
+        and "placement lineage authenticated=true" in item
+        for item in card["evidence"]
+    )
+
+
 def test_rx_main_l5_native_canary_card_uses_receipt_without_live_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
