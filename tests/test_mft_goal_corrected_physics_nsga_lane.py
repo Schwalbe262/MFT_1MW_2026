@@ -112,7 +112,10 @@ class _FakeProblem:
             20.0
         )["sha256"]
         self.spec = {
-            "size_limits_mm": {"W": 1200.0, "L": 1000.0, "H": 750.0}
+            "size_limits_mm": {"W": 1200.0, "L": 1000.0, "H": 750.0},
+            "Llt_target_uH": 20.0,
+            "Llt_tol_uH": 1.0,
+            "q_sigma": 1.0,
         }
         self.temperature_limits_C = {}
         self.temperature_contract = {}
@@ -120,13 +123,15 @@ class _FakeProblem:
         self.sobol_dimension_names = (
             "cw1",
             "gap1",
+            "u_N2_side",
             "gap2",
             "core_plate_t",
             "wcp_t",
         )
         self.cw1_coordinate_index = 0
-        self.xl = np.zeros(5, dtype=float)
-        self.xu = np.ones(5, dtype=float)
+        self.n_var = len(self.sobol_dimension_names)
+        self.xl = np.zeros(self.n_var, dtype=float)
+        self.xu = np.ones(self.n_var, dtype=float)
         self.constraint_names = (
             "Llt_robust_band",
             preflight.RESONANCE_MINIMUM_CONSTRAINT,
@@ -153,8 +158,45 @@ class _FakeProblem:
         del name
         return value / 100.0
 
+    def repair_unit_coordinates(self, values: Any) -> Any:
+        return np.asarray(values, dtype=float)
+
+    def decode_batch(self, values: Any) -> tuple[Any, Any, Any]:
+        coordinates = np.asarray(values, dtype=float)
+        main = preflight._turn_split_main_values(
+            coordinates,
+            fixed_primary_turns=6,
+            coordinate_index=2,
+        )
+        rows = [
+            {
+                "cw1": 5.0,
+                "gap1": 1.6,
+                "gap2": 1.9,
+                "cw2": 0.8,
+                "core_plate_t": 20.0,
+                "wcp_t": 20.0,
+                "N1_main": 6,
+                "N1_side": 0,
+                "N2_main": int(split),
+                "N2_side": 60 - int(split),
+            }
+            for split in main
+        ]
+        frame = pd.DataFrame(rows)
+        shrink = np.zeros(len(frame), dtype=float)
+        valid = np.ones(len(frame), dtype=bool)
+        self._last_decode = (frame, shrink, valid)
+        return frame, shrink, valid
+
     def _predict(self, target: str, frame: Any) -> tuple[Any, Any]:
         self.underlying_predict_calls.append(target)
+        if target == "Llt_phys":
+            main = frame["N2_main"].to_numpy(dtype=float)
+            return (
+                20.0 + np.abs(main - 30.0),
+                np.full(len(frame), 0.25, dtype=float),
+            )
         return (
             np.full(len(frame), 9.9e9, dtype=float),
             np.zeros(len(frame), dtype=float),
@@ -168,19 +210,7 @@ class _FakeProblem:
         **kwargs: Any,
     ) -> None:
         del args, kwargs
-        row = {
-            "cw1": 5.0,
-            "gap1": 1.6,
-            "gap2": 1.9,
-            "cw2": 0.8,
-            "core_plate_t": 20.0,
-            "wcp_t": 20.0,
-            "N1_main": 6,
-            "N1_side": 0,
-            "N2_main": 37,
-            "N2_side": 23,
-        }
-        frame = pd.DataFrame([row for _ in range(len(values))])
+        frame, _shrink, valid = self.decode_batch(values)
         # Exercise the exact legacy predictor requests.  The corrected wrapper
         # must intercept both capacitance requests without calling this
         # problem's authenticated raw-capacitance surrogate.
@@ -194,7 +224,7 @@ class _FakeProblem:
         out["F"] = np.ones((len(values), 2), dtype=float)
         out["G"] = g
         out["frame"] = frame
-        out["decoder_valid"] = np.ones(len(values), dtype=bool)
+        out["decoder_valid"] = valid
 
 
 def test_installed_evaluator_excludes_raw_predictor_and_replaces_G(
@@ -215,20 +245,49 @@ def test_installed_evaluator_excludes_raw_predictor_and_replaces_G(
     problem = _FakeProblem()
     evidence = lane._install_search_profile(problem, profile)
     out: dict[str, Any] = {}
-    problem._evaluate(np.zeros((1, 5)), out)
+    original = np.zeros((1, problem.n_var))
+    original[0, 2] = preflight._turn_split_unit_coordinate(
+        37, fixed_primary_turns=6
+    )
+    problem._evaluate(original, out)
 
-    assert problem.underlying_predict_calls == ["Llt_phys"]
+    assert problem.underlying_predict_calls == ["Llt_phys", "Llt_phys"]
     assert preflight.RESONANCE_MINIMUM_CONSTRAINT not in problem.constraint_names
     assert lane.PHYSICS_CONSTRAINT_NAME in problem.constraint_names
     physics_index = problem.constraint_index[lane.PHYSICS_CONSTRAINT_NAME]
     assert out["G"][0, physics_index] == pytest.approx(15_000.0 - expected_f)
     assert out["physics_delta_Crx_q90_ucb_F"][0] == 4.8e-10
     assert out["physics_delta_extrapolation_distance"][0] == 1.25
+    assert int(out["frame"].iloc[0]["N2_main"]) == 30
+    assert (
+        out["frame"].iloc[0]["split_repair_original_N2_main"] == 37
+    )
+    assert (
+        out["frame"].iloc[0]["split_repair_selected_N2_main"] == 30
+    )
+    assert (
+        out["frame"].iloc[0]["split_repair_selected_robust_Llt_G"]
+        < out["frame"].iloc[0]["split_repair_original_robust_Llt_G"]
+    )
+    assert (
+        out["frame"].iloc[0]["split_repair_neighbor_lower_N2_main"]
+        == 29
+    )
+    assert (
+        out["frame"].iloc[0]["split_repair_neighbor_upper_N2_main"]
+        == 31
+    )
     assert out["raw_two_net_capacitance_predictor_authority_used"] is False
     assert out["single_0p759701_transfer_ratio_used"] is False
     assert evidence["raw_C_rx_rx_F_UCB_gate_installed"] is False
     assert evidence["single_0p759701_transfer_ratio_installed"] is False
     assert evidence["legacy_half_magnetizing_resonance_G_installed"] is False
+    assert (
+        evidence["turn_split_local_repair_installation"][
+            "enumerated_split_count_per_geometry"
+        ]
+        == 49
+    )
     assert problem.hard_constraint_contract[
         "raw_two_net_capacitance_G_present"
     ] is False

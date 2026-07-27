@@ -250,6 +250,7 @@ def _physics_delta_execution_contract(
     if not isinstance(search_profile, Mapping):
         return None
     gate = search_profile.get("physics_delta_rx_resonance_gate")
+    split_repair = search_profile.get("turn_split_local_repair")
     if gate is None:
         return None
     if (
@@ -282,6 +283,20 @@ def _physics_delta_execution_contract(
             "artifacts/code/tools/"
             "mft_goal_corrected_physics_nsga_lane.py"
         )
+        or not isinstance(split_repair, Mapping)
+        or split_repair.get("fixed_total_secondary_turns") != 60
+        or split_repair.get("N2_main_minimum") != 12
+        or split_repair.get("N2_main_maximum") != 60
+        or split_repair.get("N2_main_integer_values")
+        != list(range(12, 61))
+        or split_repair.get("selection") != "minimum_robust_Llt_G"
+        or split_repair.get("original_split_early_hard_rejection_allowed")
+        is not False
+        or split_repair.get("selected_split_Llt_G_remains_hard") is not True
+        or split_repair.get(
+            "turn_voltage_physics_C_schedule_recomputed_for_selected_split"
+        )
+        is not True
     ):
         raise RuntimeError(
             "diagnostic corrected physics-delta transport contract mismatch"
@@ -319,6 +334,7 @@ def _physics_delta_execution_contract(
             "maximum": scout.SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM,
         },
         "worker_entrypoint": search_profile["worker_entrypoint"],
+        "turn_split_local_repair": copy.deepcopy(dict(split_repair)),
     }
 
 

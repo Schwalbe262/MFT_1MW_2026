@@ -106,6 +106,9 @@ WORKER_ENTRYPOINT = (
     "artifacts/code/tools/mft_goal_corrected_physics_nsga_lane.py"
 )
 PHYSICS_CONSTRAINT_NAME = "physics_delta_fRx_q90_lcb_minimum"
+SPLIT_MIN_N2_MAIN = 12
+SPLIT_MAX_N2_MAIN = 60
+SPLIT_VALUES = tuple(range(SPLIT_MIN_N2_MAIN, SPLIT_MAX_N2_MAIN + 1))
 L_PRIMARY_H = 0.002
 L_SECONDARY_H = 0.2
 RESONANCE_MIN_HZ = 15_000.0
@@ -287,6 +290,36 @@ def _physics_gate(model: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _turn_split_repair_contract() -> dict[str, Any]:
+    return {
+        "schema_version": "mft-goal-corrected-N2-split-local-repair-v1",
+        "fixed_total_secondary_turns": 60,
+        "N2_main_minimum": SPLIT_MIN_N2_MAIN,
+        "N2_main_maximum": SPLIT_MAX_N2_MAIN,
+        "N2_main_integer_values": list(SPLIT_VALUES),
+        "enumerated_split_count_per_geometry": len(SPLIT_VALUES),
+        "decoder_coordinate_name": "u_N2_side",
+        "decoder_coordinate_index": 2,
+        "decoder_mapping": (
+            "N2_side=round(60*clip(u_N2_side,0,1)*0.8);"
+            "N2_main=60-N2_side"
+        ),
+        "selection": "minimum_robust_Llt_G",
+        "robust_Llt_G_formula": (
+            "abs(mu_Llt_phys-Llt_target_uH)+"
+            "q_sigma*q90_conformal_half_width-Llt_tol_uH"
+        ),
+        "original_split_early_hard_rejection_allowed": False,
+        "selected_split_Llt_G_remains_hard": True,
+        "core_B_temperature_size_physics_C_evaluated_after_split_repair": True,
+        "turn_voltage_physics_C_schedule_recomputed_for_selected_split": True,
+        "terminal_selected_split_sealed": True,
+        "terminal_immediate_neighbor_splits_sealed": True,
+        "terminal_before_after_Llt_G_sealed": True,
+        "coordinate_genome_is_geometry_donor_not_Llt_rejection_authority": True,
+    }
+
+
 def _build_search_profile(
     runner: Any,
     *,
@@ -370,6 +403,7 @@ def _build_search_profile(
             ),
         },
         "physics_delta_rx_resonance_gate": _physics_gate(model),
+        "turn_split_local_repair": _turn_split_repair_contract(),
         "scheduler_priority": SCHEDULER_PRIORITY,
         "worker_entrypoint": WORKER_ENTRYPOINT,
         "scheduler_task_name_prefix": TASK_NAME_PREFIX,
@@ -420,6 +454,7 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         "secondary_interturn_gap_search_mm",
         "secondary_conductor_thickness_search_mm",
         "physics_delta_rx_resonance_gate",
+        "turn_split_local_repair",
         "scheduler_priority",
         "worker_entrypoint",
         "scheduler_task_name_prefix",
@@ -458,6 +493,8 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         or profile.get("maximum_decoded_winding_height_difference_mm")
         != 0.1
         or gate != expected_gate
+        or profile.get("turn_split_local_repair")
+        != _turn_split_repair_contract()
         or gap
         != {
             "minimum": 0.35,
@@ -510,6 +547,250 @@ def _candidate_prediction(
     if not math.isclose(expected, observed, rel_tol=1e-13, abs_tol=1e-9):
         raise RuntimeError("physics-delta resonance formula drifted")
     return prediction
+
+
+def _install_turn_split_local_repair(
+    problem: Any,
+    *,
+    original_decode: Any,
+    original_predict: Any,
+) -> dict[str, Any]:
+    """Select the minimum robust-Llt integer split before hard evaluation.
+
+    Only the Llt model is evaluated for the 49-way local enumeration.  The
+    complete thermal/core/size evaluator and the physics capacitance network
+    are then evaluated once at the selected repaired phenotype.
+    """
+
+    coordinate_index = 2
+    names = tuple(problem.sobol_dimension_names)
+    if (
+        coordinate_index >= len(names)
+        or names[coordinate_index] != "u_N2_side"
+    ):
+        raise RuntimeError("N2 split decoder coordinate authority drifted")
+    unit_values = np.asarray(
+        [
+            preflight._turn_split_unit_coordinate(
+                split,
+                fixed_primary_turns=6,
+            )
+            for split in SPLIT_VALUES
+        ],
+        dtype=float,
+    )
+    if (
+        len(np.unique(unit_values)) != len(SPLIT_VALUES)
+        or not np.all((unit_values >= 0.0) & (unit_values <= 1.0))
+    ):
+        raise RuntimeError("N2 split enumeration is not one-to-one")
+
+    def split_repaired_decode(values: Any) -> tuple[Any, Any, Any]:
+        coordinates = np.asarray(values, dtype=float)
+        if (
+            coordinates.ndim != 2
+            or coordinates.shape[1] != int(problem.n_var)
+        ):
+            raise RuntimeError("N2 split repair coordinate shape mismatch")
+        count = len(coordinates)
+        expanded = np.repeat(coordinates, len(SPLIT_VALUES), axis=0)
+        expanded[:, coordinate_index] = np.tile(unit_values, count)
+        expanded = np.asarray(
+            problem.repair_unit_coordinates(expanded), dtype=float
+        )
+        frame, shrink, valid = original_decode(expanded)
+        shrink = np.asarray(shrink, dtype=float).reshape(-1)
+        valid = np.asarray(valid, dtype=bool).reshape(-1)
+        expected = count * len(SPLIT_VALUES)
+        if (
+            len(frame) != expected
+            or shrink.shape != (expected,)
+            or valid.shape != (expected,)
+        ):
+            raise RuntimeError("N2 split expanded decode shape mismatch")
+        scores = np.full(expected, preflight.BIG, dtype=float)
+        means = np.full(expected, np.nan, dtype=float)
+        half_widths = np.full(expected, np.nan, dtype=float)
+        indices = np.flatnonzero(valid)
+        if len(indices):
+            sub = frame.iloc[indices]
+            mean, half_width = original_predict("Llt_phys", sub)
+            mean = np.asarray(mean, dtype=float).reshape(-1)
+            half_width = np.asarray(half_width, dtype=float).reshape(-1)
+            if (
+                mean.shape != (len(indices),)
+                or half_width.shape != (len(indices),)
+                or not np.isfinite(mean).all()
+                or not np.isfinite(half_width).all()
+                or np.any(half_width < 0.0)
+            ):
+                raise RuntimeError("N2 split Llt inference is invalid")
+            target = float(problem.spec["Llt_target_uH"])
+            tolerance = float(problem.spec["Llt_tol_uH"])
+            q_sigma = float(problem.spec["q_sigma"])
+            robust = (
+                np.abs(mean - target)
+                + q_sigma * half_width
+                - tolerance
+            )
+            scores[indices] = robust
+            means[indices] = mean
+            half_widths[indices] = half_width
+
+        original_splits = np.asarray(
+            preflight._turn_split_main_values(
+                coordinates,
+                fixed_primary_turns=6,
+                coordinate_index=coordinate_index,
+            ),
+            dtype=int,
+        ).reshape(-1)
+        selected_indices: list[int] = []
+        audit_rows: list[dict[str, Any]] = []
+        split_array = np.asarray(SPLIT_VALUES, dtype=int)
+        for row_index in range(count):
+            start = row_index * len(SPLIT_VALUES)
+            stop = start + len(SPLIT_VALUES)
+            row_scores = scores[start:stop]
+            row_valid = valid[start:stop]
+            original_split = int(original_splits[row_index])
+            original_offset = int(
+                np.argmin(np.abs(split_array - original_split))
+            )
+            if np.any(row_valid):
+                ordering = np.lexsort(
+                    (
+                        split_array,
+                        np.abs(split_array - original_split),
+                        row_scores,
+                    )
+                )
+                selected_offset = int(
+                    next(index for index in ordering if row_valid[index])
+                )
+            else:
+                selected_offset = original_offset
+            selected_index = start + selected_offset
+            selected_indices.append(selected_index)
+
+            def split_record(offset: int | None) -> dict[str, Any] | None:
+                if offset is None:
+                    return None
+                absolute = start + offset
+                return {
+                    "N2_main": int(split_array[offset]),
+                    "N2_side": int(60 - split_array[offset]),
+                    "decoder_valid": bool(valid[absolute]),
+                    "robust_Llt_G": (
+                        float(scores[absolute])
+                        if math.isfinite(float(scores[absolute]))
+                        else None
+                    ),
+                    "Llt_mean_uH": (
+                        float(means[absolute])
+                        if math.isfinite(float(means[absolute]))
+                        else None
+                    ),
+                    "Llt_q90_half_width_uH": (
+                        float(half_widths[absolute])
+                        if math.isfinite(float(half_widths[absolute]))
+                        else None
+                    ),
+                }
+
+            lower = (
+                selected_offset - 1 if selected_offset > 0 else None
+            )
+            upper = (
+                selected_offset + 1
+                if selected_offset + 1 < len(SPLIT_VALUES)
+                else None
+            )
+            audit_rows.append(
+                {
+                    "original": split_record(original_offset),
+                    "selected": split_record(selected_offset),
+                    "neighbor_lower": split_record(lower),
+                    "neighbor_upper": split_record(upper),
+                    "enumerated_split_count": len(SPLIT_VALUES),
+                    "decoder_valid_split_count": int(
+                        np.count_nonzero(row_valid)
+                    ),
+                    "selection": "minimum_robust_Llt_G",
+                }
+            )
+
+        selected = np.asarray(selected_indices, dtype=int)
+        selected_frame = frame.iloc[selected].reset_index(drop=True).copy()
+        selected_shrink = shrink[selected]
+        selected_valid = valid[selected]
+        for index, audit in enumerate(audit_rows):
+            original = audit["original"] or {}
+            chosen = audit["selected"] or {}
+            lower = audit["neighbor_lower"] or {}
+            upper = audit["neighbor_upper"] or {}
+            selected_frame.loc[
+                index, "split_repair_original_N2_main"
+            ] = original.get("N2_main")
+            selected_frame.loc[
+                index, "split_repair_selected_N2_main"
+            ] = chosen.get("N2_main")
+            selected_frame.loc[
+                index, "split_repair_original_robust_Llt_G"
+            ] = original.get("robust_Llt_G")
+            selected_frame.loc[
+                index, "split_repair_selected_robust_Llt_G"
+            ] = chosen.get("robust_Llt_G")
+            selected_frame.loc[
+                index, "split_repair_neighbor_lower_N2_main"
+            ] = lower.get("N2_main")
+            selected_frame.loc[
+                index, "split_repair_neighbor_lower_robust_Llt_G"
+            ] = lower.get("robust_Llt_G")
+            selected_frame.loc[
+                index, "split_repair_neighbor_upper_N2_main"
+            ] = upper.get("N2_main")
+            selected_frame.loc[
+                index, "split_repair_neighbor_upper_robust_Llt_G"
+            ] = upper.get("robust_Llt_G")
+            selected_frame.loc[
+                index, "split_repair_enumerated_split_count"
+            ] = audit["enumerated_split_count"]
+            selected_frame.loc[
+                index, "split_repair_decoder_valid_split_count"
+            ] = audit["decoder_valid_split_count"]
+            selected_frame.loc[
+                index, "split_repair_neighbors_json"
+            ] = json.dumps(
+                {
+                    "lower": audit["neighbor_lower"],
+                    "upper": audit["neighbor_upper"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        if len(selected_frame) != count:
+            raise RuntimeError("N2 split selected phenotype count mismatch")
+        problem._last_decode = (
+            selected_frame,
+            selected_shrink,
+            selected_valid,
+        )
+        problem._last_turn_split_repair_audit = copy.deepcopy(audit_rows)
+        return selected_frame, selected_shrink, selected_valid
+
+    problem.decode_batch = split_repaired_decode
+    problem._turn_split_local_repair_installed = True
+    problem._turn_split_local_repair_contract = (
+        _turn_split_repair_contract()
+    )
+    return {
+        **_turn_split_repair_contract(),
+        "unit_coordinate_minimum": float(np.min(unit_values)),
+        "unit_coordinate_maximum": float(np.max(unit_values)),
+        "unit_coordinate_sha256": canonical_sha256(unit_values.tolist()),
+    }
 
 
 def _install_search_profile(
@@ -575,6 +856,13 @@ def _install_search_profile(
     problem.xu[gap2_index] = gap2_upper
 
     base_evaluate = problem._evaluate
+    original_decode = problem.decode_batch
+    original_predict = problem._predict
+    split_repair_installation = _install_turn_split_local_repair(
+        problem,
+        original_decode=original_decode,
+        original_predict=original_predict,
+    )
     base_names = tuple(problem.constraint_names)
     base_index = dict(problem.constraint_index)
     base_count = int(problem.n_ieq_constr)
@@ -597,8 +885,6 @@ def _install_search_profile(
     model = _validate_embedded_model(
         profile["physics_delta_rx_resonance_gate"]["model"]
     )
-    original_predict = problem._predict
-
     def profiled_evaluate(
         values: Any,
         out: dict[str, Any],
@@ -742,6 +1028,9 @@ def _install_search_profile(
                 "payload_sha256"
             ],
             "physics_delta_rx_resonance_gate": gate_contract,
+            "turn_split_local_repair": copy.deepcopy(
+                _turn_split_repair_contract()
+            ),
             "size_limits_mm": copy.deepcopy(
                 constraints_profile["size_limits_mm"]
             ),
@@ -800,6 +1089,12 @@ def _install_search_profile(
             "legacy_half_magnetizing_resonance_G_installed": False,
             "feature_extrapolation_penalty_active": True,
             "fixed20T_turn_graded_FEA_retraining_required": True,
+            "turn_split_local_repair_installation": (
+                split_repair_installation
+            ),
+            "original_split_early_hard_rejection_allowed": False,
+            "selected_split_Llt_G_remains_hard": True,
+            "physics_C_recomputed_for_selected_split": True,
             "constraint_names": list(effective_names),
             "screening_only": True,
             "production_eligible": False,
@@ -834,6 +1129,7 @@ def corrected_resonance_contract() -> dict[str, Any]:
             "half_magnetizing_resonance_used": False,
             "interwinding_capacitance_included": False,
             "feature_extrapolation_penalty_active": True,
+            "turn_split_local_repair": _turn_split_repair_contract(),
             "fixed20T_turn_graded_FEA_retraining_required": True,
             "final_turn_graded_symmetric_FEA_required": True,
             "approved_dielectric_stack_sensitivity_required": True,
@@ -1147,6 +1443,10 @@ def _rewrite_result(path: Path) -> None:
             "single_0p759701_transfer_ratio_used": False,
             "legacy_half_magnetizing_resonance_G_present": False,
             "feature_extrapolation_penalty_active": True,
+            "turn_split_local_repair": _turn_split_repair_contract(),
+            "original_split_early_hard_rejection_allowed": False,
+            "selected_split_Llt_G_remains_hard": True,
+            "terminal_selected_and_neighbor_splits_in_decoded_params": True,
             "fixed20T_turn_graded_FEA_retraining_required": True,
             "approved_dielectric_stack_sensitivity_required": True,
             "final_turn_graded_symmetric_FEA_required": True,
@@ -1262,6 +1562,10 @@ def _preflight_value(plan_path: Path) -> dict[str, Any]:
             "secondary_inductance_H": L_SECONDARY_H,
             "minimum_fRx_Hz": RESONANCE_MIN_HZ,
             "frequency_lcb_formula": gate["frequency_lcb_formula"],
+            "turn_split_local_repair": _turn_split_repair_contract(),
+            "original_split_early_hard_rejection_allowed": False,
+            "selected_split_Llt_G_remains_hard": True,
+            "terminal_selected_and_neighbor_splits_sealed": True,
             "physics_delta_model_file_sha256": MODEL_FILE_SHA256,
             "physics_delta_model_payload_sha256": model["payload_sha256"],
             "raw_two_net_C_optimizer_objective_constraint_authority": False,
