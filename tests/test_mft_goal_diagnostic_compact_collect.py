@@ -96,6 +96,71 @@ def _records(
     return records
 
 
+def _bounded_records(
+    root: Path,
+    seeds: list[int],
+) -> list[dict[str, Any]]:
+    records = _records(root, seeds)
+    bounded = []
+    for record in records:
+        task_id = int(record["task_id"])
+        table = root / f"task-{task_id}" / "terminal_physical_candidates.csv"
+        frame = pd.read_csv(table).rename(
+            columns={
+                collector.RAW_CRX_PHYSICAL_COLUMN: (
+                    collector.PROVISIONAL_CORRECTED_CRX_PHYSICAL_COLUMN
+                ),
+                collector.RAW_CRX_NORMALIZED_COLUMN: (
+                    collector.PROVISIONAL_CORRECTED_CRX_NORMALIZED_COLUMN
+                ),
+            }
+        )
+        frame.to_csv(table, index=False)
+        unsigned = {
+            key: value
+            for key, value in record.items()
+            if key != "payload_sha256"
+        }
+        unsigned["physical_constraint_columns"] = [
+            (
+                collector.PROVISIONAL_CORRECTED_CRX_PHYSICAL_COLUMN
+                if name == collector.RAW_CRX_PHYSICAL_COLUMN
+                else name
+            )
+            for name in unsigned["physical_constraint_columns"]
+        ]
+        unsigned["normalized_constraint_columns"] = [
+            (
+                collector.PROVISIONAL_CORRECTED_CRX_NORMALIZED_COLUMN
+                if name == collector.RAW_CRX_NORMALIZED_COLUMN
+                else name
+            )
+            for name in unsigned["normalized_constraint_columns"]
+        ]
+        unsigned["artifacts"]["terminal_physical_candidates.csv"] = {
+            "sha256": _sha(table),
+            "size_bytes": table.stat().st_size,
+        }
+        unsigned["raw_same_metric_C_rx_rx_F_UCB_gate_active"] = False
+        unsigned[
+            "provisional_turn_graded_C_acquisition_gate_active"
+        ] = True
+        unsigned["capacitance_screening_constraint_name"] = (
+            collector.scout
+            .PROVISIONAL_TURN_GRADED_C_ACQUISITION_CONSTRAINT_NAME
+        )
+        unsigned["authenticated_turn_graded_transfer_ratio"] = (
+            collector.scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
+        )
+        unsigned["raw_two_net_C_physical_feasibility_authority"] = False
+        unsigned["final_turn_graded_symmetric_FEA_required"] = True
+        unsigned["raw_same_metric_C_rx_rx_F_front_classification"] = (
+            "provisional_corrected_single_truth_screening_only"
+        )
+        bounded.append(collector._sealed(unsigned))
+    return bounded
+
+
 def test_read_only_scheduler_client_exposes_get_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -220,3 +285,37 @@ def test_final_integrated_nds_requires_and_pools_exact100(
     assert authority["integrated_seed_scope_complete"] is True
     assert authority["front_files_are_provisional_screening_only"] is True
     assert authority["final_design_claim_allowed"] is False
+
+
+def test_bounded_profile_manifest_accepts_dynamic_exact100_seed_authority(
+    tmp_path: Path,
+) -> None:
+    seeds = list(range(2_607_264_300, 2_607_264_400))
+    records = _bounded_records(tmp_path, seeds)
+    manifest = collector.terminal_population_manifest(
+        records=records,
+        output_root=tmp_path,
+        snapshot_class="final_integrated_exact100",
+        expected_seeds=seeds,
+    )
+    contract = manifest["capacitance_screening_contract"]
+    assert manifest["seeds"] == seeds
+    assert manifest["raw_same_metric_C_rx_rx_F_UCB_gate_active"] is False
+    assert (
+        contract["constraint_name"]
+        == collector.scout
+        .PROVISIONAL_TURN_GRADED_C_ACQUISITION_CONSTRAINT_NAME
+    )
+    assert (
+        contract["authenticated_turn_graded_transfer_ratio"]
+        == collector.scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
+    )
+    assert contract["physical_feasibility_authority"] is False
+    assert contract["final_turn_graded_symmetric_FEA_required"] is True
+
+    with pytest.raises(RuntimeError, match="exact100 seed coverage"):
+        collector.terminal_population_manifest(
+            records=records,
+            output_root=tmp_path,
+            snapshot_class="final_integrated_exact100",
+        )

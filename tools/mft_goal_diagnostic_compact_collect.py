@@ -56,6 +56,14 @@ FINAL_SUCCESS_COUNT = offload.EXACT_TASK_COUNT
 TERMINAL_POPULATION_COUNT = scout.POPULATION
 RAW_CRX_PHYSICAL_COLUMN = f"physical_G:{scout.RAW_CRX_CONSTRAINT_NAME}"
 RAW_CRX_NORMALIZED_COLUMN = f"normalized_G:{scout.RAW_CRX_CONSTRAINT_NAME}"
+PROVISIONAL_CORRECTED_CRX_PHYSICAL_COLUMN = (
+    "physical_G:"
+    f"{scout.PROVISIONAL_TURN_GRADED_C_ACQUISITION_CONSTRAINT_NAME}"
+)
+PROVISIONAL_CORRECTED_CRX_NORMALIZED_COLUMN = (
+    "normalized_G:"
+    f"{scout.PROVISIONAL_TURN_GRADED_C_ACQUISITION_CONSTRAINT_NAME}"
+)
 MAX_RESULT_BYTES = 8 * 1024 * 1024
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_TERMINAL_TABLE_BYTES = 256 * 1024 * 1024
@@ -246,9 +254,16 @@ def authenticate_context(
     plan, _deployment, tasks, authentication = offload.authenticate_plan(
         plan_path
     )
-    if (
-        plan.get("task_count") != FINAL_SUCCESS_COUNT
-        or tuple(offload._authorized_plan_seeds(plan)) != offload.EXACT_SEEDS
+    authorized_seeds = tuple(offload._authorized_plan_seeds(plan))
+    if plan.get("task_count") != FINAL_SUCCESS_COUNT or (
+        len(authorized_seeds) != FINAL_SUCCESS_COUNT
+        or authorized_seeds
+        != tuple(
+            range(
+                authorized_seeds[0],
+                authorized_seeds[0] + FINAL_SUCCESS_COUNT,
+            )
+        )
     ):
         raise RuntimeError("collector plan is not the compact exact100 authority")
     expected = {
@@ -257,7 +272,7 @@ def authenticate_context(
             offload.scheduler_payload(
                 plan=plan,
                 task=task,
-                priority=offload.SCHEDULER_PRIORITY,
+                priority=None,
             )
             for task in tasks
         )
@@ -303,11 +318,48 @@ def authenticate_context(
         "authentication": authentication,
         "receipt": receipt,
         "entries": entries,
+        "authorized_seeds": list(authorized_seeds),
         "scheduler_url": scheduler_url.rstrip("/"),
         "plan_path": str(plan_path.resolve(strict=True)),
         "receipt_path": str(receipt_path.resolve(strict=True)),
         "plan_file_sha256": _sha256_file(plan_path.resolve(strict=True)),
         "receipt_file_sha256": _sha256_file(receipt_path.resolve(strict=True)),
+    }
+
+
+def _capacitance_screening_contract(
+    entry: Mapping[str, Any],
+) -> dict[str, Any]:
+    profile = entry["task"]["activation"]["manufacturing_search_profile"]
+    mode = scout._secondary_gap_mode_from_profile(profile)
+    if mode == scout.SECONDARY_GAP_MODE_FIXED:
+        return {
+            "secondary_gap_mode": mode,
+            "constraint_name": scout.RAW_CRX_CONSTRAINT_NAME,
+            "physical_column": RAW_CRX_PHYSICAL_COLUMN,
+            "normalized_column": RAW_CRX_NORMALIZED_COLUMN,
+            "raw_two_net_hard_gate_active": True,
+            "provisional_corrected_acquisition_gate_active": False,
+            "authenticated_turn_graded_transfer_ratio": None,
+            "front_classification": "provisional_surrogate_screening_only",
+        }
+    if mode != scout.SECONDARY_GAP_MODE_BOUNDED:
+        raise RuntimeError("collector secondary-gap profile is unsupported")
+    return {
+        "secondary_gap_mode": mode,
+        "constraint_name": (
+            scout.PROVISIONAL_TURN_GRADED_C_ACQUISITION_CONSTRAINT_NAME
+        ),
+        "physical_column": PROVISIONAL_CORRECTED_CRX_PHYSICAL_COLUMN,
+        "normalized_column": PROVISIONAL_CORRECTED_CRX_NORMALIZED_COLUMN,
+        "raw_two_net_hard_gate_active": False,
+        "provisional_corrected_acquisition_gate_active": True,
+        "authenticated_turn_graded_transfer_ratio": (
+            scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
+        ),
+        "front_classification": (
+            "provisional_corrected_single_truth_screening_only"
+        ),
     }
 
 
@@ -418,6 +470,11 @@ def _validate_result(
     task = entry["task"]
     activation = task["activation"]
     profile = activation["manufacturing_search_profile"]
+    capacitance = _capacitance_screening_contract(entry)
+    bounded_secondary = (
+        capacitance["secondary_gap_mode"]
+        == scout.SECONDARY_GAP_MODE_BOUNDED
+    )
     if (
         result.get("campaign_id") != scout.CAMPAIGN_ID
         or result.get("task_payload_sha256") != task["payload_sha256"]
@@ -431,7 +488,36 @@ def _validate_result(
         != profile["payload_sha256"]
         or result.get("geometry_constraint_profile_sha256")
         != profile["geometry_constraint_profile_sha256"]
-        or result.get("raw_same_metric_C_rx_rx_F_UCB_gate_active") is not True
+        or result.get("raw_same_metric_C_rx_rx_F_UCB_gate_active")
+        is not capacitance["raw_two_net_hard_gate_active"]
+        or (
+            bounded_secondary
+            and (
+                result.get(
+                    "provisional_turn_graded_C_acquisition_gate_active"
+                )
+                is not True
+                or not np.isclose(
+                    float(
+                        result.get(
+                            "authenticated_turn_graded_transfer_ratio",
+                            0.0,
+                        )
+                    ),
+                    scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO,
+                    rtol=0.0,
+                    atol=0.0,
+                )
+                or result.get(
+                    "raw_two_net_C_physical_feasibility_authority"
+                )
+                is not False
+                or result.get(
+                    "final_turn_graded_symmetric_FEA_required"
+                )
+                is not True
+            )
+        )
         or result.get("fixed_lm2mh_resonance_contract_sha256")
         != activation["fixed_lm2mh_resonance_contract_sha256"]
         or result.get("screening_only") is not True
@@ -480,6 +566,7 @@ def _validate_terminal_table(
     )
     task = entry["task"]
     activation = task["activation"]
+    capacitance = _capacitance_screening_contract(entry)
     source = manifest.get("source_identity") or {}
     csv_record = manifest.get("csv") or {}
     if (
@@ -565,10 +652,12 @@ def _validate_terminal_table(
         not physical
         or [name.removeprefix("physical_G:") for name in physical]
         != [name.removeprefix("normalized_G:") for name in normalized]
-        or RAW_CRX_PHYSICAL_COLUMN not in physical
-        or RAW_CRX_NORMALIZED_COLUMN not in normalized
+        or capacitance["physical_column"] not in physical
+        or capacitance["normalized_column"] not in normalized
     ):
-        raise RuntimeError("terminal table raw C_rx_rx_F constraint authority missing")
+        raise RuntimeError(
+            "terminal table capacitance screening constraint authority missing"
+        )
     for column in (*OBJECTIVE_COLUMNS, *physical, *normalized):
         values = pd.to_numeric(frame[column], errors="coerce").to_numpy(
             dtype=float
@@ -580,6 +669,7 @@ def _validate_terminal_table(
         "identities": identities,
         "physical_constraint_columns": physical,
         "normalized_constraint_columns": normalized,
+        "capacitance_screening_contract": capacitance,
     }
 
 
@@ -693,6 +783,30 @@ def collect_terminal_success(
             "terminal_physical_candidates.manifest.json",
         )
     }
+    capacitance = table_evidence["capacitance_screening_contract"]
+    if capacitance["secondary_gap_mode"] == scout.SECONDARY_GAP_MODE_FIXED:
+        capacitance_fields = {
+            "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+            "raw_same_metric_C_rx_rx_F_front_classification": (
+                "provisional_surrogate_screening_only"
+            ),
+        }
+    else:
+        capacitance_fields = {
+            "raw_same_metric_C_rx_rx_F_UCB_gate_active": False,
+            "provisional_turn_graded_C_acquisition_gate_active": True,
+            "capacitance_screening_constraint_name": capacitance[
+                "constraint_name"
+            ],
+            "authenticated_turn_graded_transfer_ratio": capacitance[
+                "authenticated_turn_graded_transfer_ratio"
+            ],
+            "raw_two_net_C_physical_feasibility_authority": False,
+            "final_turn_graded_symmetric_FEA_required": True,
+            "raw_same_metric_C_rx_rx_F_front_classification": capacitance[
+                "front_classification"
+            ],
+        }
     record = _sealed(
         {
             "schema_version": COLLECTION_RECORD_SCHEMA,
@@ -719,10 +833,7 @@ def collect_terminal_success(
                 "normalized_constraint_columns"
             ],
             "artifacts": artifacts,
-            "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
-            "raw_same_metric_C_rx_rx_F_front_classification": (
-                "provisional_surrogate_screening_only"
-            ),
+            **capacitance_fields,
             **FAIL_CLOSED_FLAGS,
             "symmetric_FEA_validation_still_required": True,
             "scheduler_access_mode": "GET_status_plus_read_only_SFTP",
@@ -736,11 +847,67 @@ def collect_terminal_success(
     return record
 
 
+def _record_capacitance_contract(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    if record.get("raw_same_metric_C_rx_rx_F_UCB_gate_active") is True:
+        return {
+            "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+            "provisional_turn_graded_C_acquisition_gate_active": False,
+            "constraint_name": scout.RAW_CRX_CONSTRAINT_NAME,
+            "front_classification": "provisional_surrogate_screening_only",
+            "physical_feasibility_authority": False,
+            "final_turn_graded_symmetric_FEA_required": True,
+        }
+    if (
+        record.get("raw_same_metric_C_rx_rx_F_UCB_gate_active") is False
+        and record.get(
+            "provisional_turn_graded_C_acquisition_gate_active"
+        )
+        is True
+        and record.get("capacitance_screening_constraint_name")
+        == scout.PROVISIONAL_TURN_GRADED_C_ACQUISITION_CONSTRAINT_NAME
+        and np.isclose(
+            float(
+                record.get(
+                    "authenticated_turn_graded_transfer_ratio", 0.0
+                )
+            ),
+            scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO,
+            rtol=0.0,
+            atol=0.0,
+        )
+        and record.get(
+            "raw_two_net_C_physical_feasibility_authority"
+        )
+        is False
+        and record.get("final_turn_graded_symmetric_FEA_required")
+        is True
+    ):
+        return {
+            "raw_same_metric_C_rx_rx_F_UCB_gate_active": False,
+            "provisional_turn_graded_C_acquisition_gate_active": True,
+            "constraint_name": (
+                scout.PROVISIONAL_TURN_GRADED_C_ACQUISITION_CONSTRAINT_NAME
+            ),
+            "authenticated_turn_graded_transfer_ratio": (
+                scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
+            ),
+            "front_classification": (
+                "provisional_corrected_single_truth_screening_only"
+            ),
+            "physical_feasibility_authority": False,
+            "final_turn_graded_symmetric_FEA_required": True,
+        }
+    raise RuntimeError("diagnostic collection capacitance authority is invalid")
+
+
 def terminal_population_manifest(
     *,
     records: Iterable[Mapping[str, Any]],
     output_root: Path,
     snapshot_class: str,
+    expected_seeds: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     ordered = sorted(
         (copy.deepcopy(dict(record)) for record in records),
@@ -753,16 +920,24 @@ def terminal_population_manifest(
         "final_integrated_exact100",
     }:
         raise RuntimeError("unknown diagnostic NDS snapshot class")
+    final_seed_authority = tuple(
+        offload.EXACT_SEEDS
+        if expected_seeds is None
+        else (int(seed) for seed in expected_seeds)
+    )
+    if len(final_seed_authority) != FINAL_SUCCESS_COUNT:
+        raise RuntimeError("final integrated NDS seed authority is not exact100")
     if (
         snapshot_class == "final_integrated_exact100"
         and (
             len(ordered) != FINAL_SUCCESS_COUNT
             or [int(record["seed"]) for record in ordered]
-            != list(offload.EXACT_SEEDS)
+            != list(final_seed_authority)
         )
     ):
         raise RuntimeError("final integrated NDS requires exact100 seed coverage")
     first = ordered[0]
+    capacitance_contract = _record_capacitance_contract(first)
     for record in ordered:
         if (
             record.get("identities") != first["identities"]
@@ -775,8 +950,8 @@ def terminal_population_manifest(
                 record.get(name) != expected
                 for name, expected in FAIL_CLOSED_FLAGS.items()
             )
-            or record.get("raw_same_metric_C_rx_rx_F_UCB_gate_active")
-            is not True
+            or _record_capacitance_contract(record)
+            != capacitance_contract
         ):
             raise RuntimeError("diagnostic terminal collections mix authority")
     population_records = []
@@ -832,9 +1007,18 @@ def terminal_population_manifest(
             "geometry_deduplication_then_exact_global_non_dominated_sorting"
         ),
         "seed_local_front_union_used": False,
-        "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+        **(
+            {"capacitance_screening_contract": capacitance_contract}
+            if capacitance_contract[
+                "provisional_turn_graded_C_acquisition_gate_active"
+            ]
+            else {}
+        ),
+        "raw_same_metric_C_rx_rx_F_UCB_gate_active": capacitance_contract[
+            "raw_same_metric_C_rx_rx_F_UCB_gate_active"
+        ],
         "raw_same_metric_C_rx_rx_F_front_classification": (
-            "provisional_surrogate_screening_only"
+            capacitance_contract["front_classification"]
         ),
         **FAIL_CLOSED_FLAGS,
         "symmetric_FEA_validation_still_required": True,
@@ -851,12 +1035,14 @@ def publish_screening_nds(
     records: Iterable[Mapping[str, Any]],
     output_root: Path,
     snapshot_class: str,
+    expected_seeds: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     output_root = output_root.resolve()
     manifest = terminal_population_manifest(
         records=records,
         output_root=output_root,
         snapshot_class=snapshot_class,
+        expected_seeds=expected_seeds,
     )
     if snapshot_class == "provisional_first_threshold":
         manifest_path = output_root / "provisional_terminal_population_manifest.json"
@@ -876,6 +1062,14 @@ def publish_screening_nds(
         manifest["authenticated_seed_count"]
     ):
         raise RuntimeError("global NDS summary seed coverage mismatch")
+    capacitance_contract = manifest.get("capacitance_screening_contract") or {
+        "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+        "provisional_turn_graded_C_acquisition_gate_active": False,
+        "constraint_name": scout.RAW_CRX_CONSTRAINT_NAME,
+        "front_classification": "provisional_surrogate_screening_only",
+        "physical_feasibility_authority": False,
+        "final_turn_graded_symmetric_FEA_required": True,
+    }
     authority = _sealed(
         {
             "schema_version": SCREENING_AUTHORITY_SCHEMA,
@@ -908,9 +1102,20 @@ def publish_screening_nds(
                 "integrated_seed_scope_complete"
             ],
             "front_files_are_provisional_screening_only": True,
-            "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+            **(
+                {"capacitance_screening_contract": capacitance_contract}
+                if capacitance_contract[
+                    "provisional_turn_graded_C_acquisition_gate_active"
+                ]
+                else {}
+            ),
+            "raw_same_metric_C_rx_rx_F_UCB_gate_active": (
+                capacitance_contract[
+                    "raw_same_metric_C_rx_rx_F_UCB_gate_active"
+                ]
+            ),
             "raw_same_metric_C_rx_rx_F_front_classification": (
-                "provisional_surrogate_screening_only"
+                capacitance_contract["front_classification"]
             ),
             **FAIL_CLOSED_FLAGS,
             "symmetric_FEA_validation_still_required": True,
@@ -951,7 +1156,9 @@ def publish_screening_nds(
         "integrated_seed_scope_complete": manifest[
             "integrated_seed_scope_complete"
         ],
-        "front_classification": "provisional_surrogate_screening_only",
+        "front_classification": capacitance_contract[
+            "front_classification"
+        ],
     }
 
 
@@ -1026,6 +1233,9 @@ def collect_once(
     ordered_records = sorted(
         collections.values(), key=lambda record: int(record["seed"])
     )
+    context_capacitance = _capacitance_screening_contract(
+        context["entries"][0]
+    )
     provisional = None
     provisional_authority = (
         output_root
@@ -1048,13 +1258,16 @@ def collect_once(
                 "authenticated_seed_count"
             ],
             "integrated_seed_scope_complete": False,
-            "front_classification": "provisional_surrogate_screening_only",
+            "front_classification": context_capacitance[
+                "front_classification"
+            ],
         }
     elif len(ordered_records) >= EARLY_SUCCESS_MINIMUM:
         provisional = publish_screening_nds(
             records=ordered_records,
             output_root=output_root,
             snapshot_class="provisional_first_threshold",
+            expected_seeds=context["authorized_seeds"],
         )
 
     final = None
@@ -1063,6 +1276,7 @@ def collect_once(
             records=ordered_records,
             output_root=output_root,
             snapshot_class="final_integrated_exact100",
+            expected_seeds=context["authorized_seeds"],
         )
     statuses = Counter(str(row["scheduler_status"]) for row in observed)
     terminal_count = sum(bool(row["terminal"]) for row in observed)
@@ -1107,9 +1321,22 @@ def collect_once(
             "final_exact100_reached": (
                 len(ordered_records) == FINAL_SUCCESS_COUNT
             ),
-            "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+            **(
+                {
+                    "capacitance_screening_contract": (
+                        context_capacitance
+                    )
+                }
+                if context_capacitance[
+                    "provisional_corrected_acquisition_gate_active"
+                ]
+                else {}
+            ),
+            "raw_same_metric_C_rx_rx_F_UCB_gate_active": (
+                context_capacitance["raw_two_net_hard_gate_active"]
+            ),
             "raw_same_metric_C_rx_rx_F_front_classification": (
-                "provisional_surrogate_screening_only"
+                context_capacitance["front_classification"]
             ),
             **FAIL_CLOSED_FLAGS,
             "symmetric_FEA_validation_still_required": True,
