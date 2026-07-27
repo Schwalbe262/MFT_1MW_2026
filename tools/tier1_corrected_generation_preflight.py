@@ -160,6 +160,9 @@ GOAL_FRESH512_ACTIVATION_SCHEMA = "mft-goal-fresh512-search-activation-v1"
 GOAL_DIAGNOSTIC_COMPACT_ACTIVATION_SCHEMA = (
     "mft-goal-diagnostic-n1-6-compact-activation-v1"
 )
+GOAL_DIAGNOSTIC_COMPACT_CAMPAIGN_ID = (
+    "mft-goal-diagnostic-n1-6-compact-scout"
+)
 GOAL_B7_THERMAL_MESH_POLICY = (
     "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
 )
@@ -1972,7 +1975,7 @@ def validate_goal_compact_run_authorization(
             or authorization.get("dataset_authentication_sha256") is not None
             or activation.get("fixed_primary_turns") != 6
             or activation.get("campaign_id")
-            != "mft-goal-diagnostic-n1-6-compact-scout"
+            != GOAL_DIAGNOSTIC_COMPACT_CAMPAIGN_ID
             or activation.get("screening_only") is not True
             or activation.get("production_eligible") is not False
             or activation.get("final_design_claim_allowed") is not False

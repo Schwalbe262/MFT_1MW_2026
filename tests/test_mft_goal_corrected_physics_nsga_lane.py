@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -70,6 +71,124 @@ def test_profile_maps_latest_acceptance_and_separate_exact60(
         "temperature_contract_sha256"
     ]
     assert validated["cooling_or_TIM_contract_mutated"] is False
+
+
+def test_corrected_runtime_authorization_reaches_diagnostic_gate(
+    model: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutated_runtime_attributes = {
+        lane.goal_launch: ("GOAL_RUNTIME_TOOL_FILES",),
+        scout: (
+            "CAMPAIGN_ID",
+            "ACTIVATION_SCHEMA",
+            "BUNDLE_SCHEMA",
+            "TASK_SCHEMA",
+            "SCHEDULER_SCHEMA",
+            "RESULT_SCHEMA",
+            "SEARCH_PROFILE_SCHEMA",
+            "SEARCH_PROFILE_INSTALLATION_SCHEMA",
+            "_build_search_profile",
+            "_validate_search_profile",
+            "_secondary_gap_mode_from_profile",
+            "_install_search_profile",
+        ),
+        preflight: (
+            "GOAL_FIXED_LM_RESONANCE_SCHEMA",
+            "GOAL_DIAGNOSTIC_COMPACT_ACTIVATION_SCHEMA",
+            "GOAL_DIAGNOSTIC_COMPACT_CAMPAIGN_ID",
+            "goal_fixed_lm2mh_resonance_contract",
+            "install_goal_fixed_lm2mh_resonance",
+            "derive_fixed_lm2mh_self_resonance",
+            "_terminal_surrogate_physicality_gate",
+        ),
+    }
+    for module, names in mutated_runtime_attributes.items():
+        for name in names:
+            monkeypatch.setattr(module, name, getattr(module, name))
+    monkeypatch.setattr(lane, "_ACTIVE_MODEL", lane._ACTIVE_MODEL)
+    lane.configure_runtime(model)
+    assert (
+        preflight.GOAL_DIAGNOSTIC_COMPACT_ACTIVATION_SCHEMA
+        == lane.ACTIVATION_SCHEMA
+    )
+    assert (
+        preflight.GOAL_DIAGNOSTIC_COMPACT_CAMPAIGN_ID
+        == lane.CAMPAIGN_ID
+    )
+
+    artifacts = {"authenticated_model": {"sha256": "1" * 64}}
+    dataset_sha = "2" * 64
+    quality_sha = "3" * 64
+    hard_constraint_sha = "4" * 64
+    compact_contract_sha = "5" * 64
+    compact_bank_sha = "6" * 64
+    source_identity = {
+        "dataset_sha256": dataset_sha,
+        "evaluation_model_sha256": canonical_sha256(artifacts),
+        "quality_status_sha256": quality_sha,
+    }
+    activation = {
+        "schema_version": lane.ACTIVATION_SCHEMA,
+        "campaign_id": lane.CAMPAIGN_ID,
+        "fixed_primary_turns": 6,
+        "source_identity": source_identity,
+        "source_quality_passed": True,
+        "screening_only": True,
+        "production_eligible": False,
+        "final_design_claim_allowed": False,
+        "fresh512_activation_evidence": False,
+        "reserved_fresh512_seed_interval_used": False,
+        "fixed_lm2mh_resonance_contract_sha256": (
+            lane.corrected_resonance_contract()["sha256"]
+        ),
+        "effective_hard_constraint_contract_sha256": hard_constraint_sha,
+        "compact_search_contract_sha256": compact_contract_sha,
+        "compact_coordinate_bank_sha256": compact_bank_sha,
+        "scheduler_write_performed": False,
+        "scheduler_submission_performed": False,
+    }
+    activation["payload_sha256"] = canonical_sha256(activation)
+    authorization = preflight.seal_goal_compact_run_authorization(
+        authorization_mode=preflight.GOAL_COMPACT_AUTH_DIAGNOSTIC,
+        source_activation_schema=lane.ACTIVATION_SCHEMA,
+        source_activation_payload_sha256=activation["payload_sha256"],
+        seed=lane.SEED_START,
+        fixed_primary_turns=6,
+        dataset_sha256=dataset_sha,
+        evaluation_model_sha256=source_identity[
+            "evaluation_model_sha256"
+        ],
+        quality_status_sha256=quality_sha,
+        source_quality_passed=True,
+        effective_hard_constraint_contract_sha256=hard_constraint_sha,
+        compact_search_contract_sha256=compact_contract_sha,
+        compact_coordinate_bank_sha256=compact_bank_sha,
+    )
+    problem = SimpleNamespace(
+        fixed_primary_turns=6,
+        hard_constraint_contract_sha256=hard_constraint_sha,
+        _goal_fixed_lm2mh_resonance_installed=True,
+    )
+    authenticated = SimpleNamespace(
+        quality={"passed": True},
+        report={"artifacts": artifacts},
+        evidence={
+            "dataset": {"sha256": dataset_sha},
+            "quality_status": {"sha256": quality_sha},
+        },
+    )
+
+    observed = preflight.validate_goal_compact_run_authorization(
+        authorization,
+        source_activation=activation,
+        problem=problem,
+        seed=lane.SEED_START,
+        authenticated=authenticated,
+        compact_contract={"sha256": compact_contract_sha},
+        compact_bank={"sha256": compact_bank_sha},
+    )
+    assert observed["sha256"] == authorization["sha256"]
 
 
 def test_frequency_lcb_is_computed_from_q90_ucb(
