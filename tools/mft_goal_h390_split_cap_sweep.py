@@ -133,6 +133,8 @@ def prepare(
     full: bool = False,
     matrix_authority: bool = False,
     cap_authority: bool = False,
+    cap_authority_max_passes: int = 12,
+    cap_authority_percent_error: float = 0.25,
     equal_gaps_mm: tuple[float, ...] | None = None,
     h1_values_mm: tuple[float, ...] | None = None,
 ) -> Path:
@@ -140,6 +142,13 @@ def prepare(
         raise compact.CompactSweepError(
             "--full, --matrix-authority, and --cap-authority are "
             "mutually exclusive"
+        )
+    if (
+        cap_authority_max_passes < 12
+        or cap_authority_percent_error <= 0.0
+    ):
+        raise compact.CompactSweepError(
+            "Cap authority requires at least 12 passes and positive error"
         )
     destination = output.resolve()
     if destination.exists():
@@ -183,9 +192,10 @@ def prepare(
             {
                 "comment": (
                     "Selected compact h390 high-accuracy turn-graded Rx "
-                    "Cap authority: 12 passes and 0.25% target"
+                    f"Cap authority: {cap_authority_max_passes} passes and "
+                    f"{cap_authority_percent_error}% target"
                 ),
-                "stage": "turn_graded_rx_cap_authority_0p25pct",
+                "stage": "turn_graded_rx_cap_authority",
                 "timeout_seconds": 14400,
             }
         )
@@ -196,8 +206,10 @@ def prepare(
                 "matrix_min_converged": 1,
                 "matrix_percent_error": 1.5,
                 "cap_on": 1,
-                "cap_max_passes": 12,
-                "cap_percent_error": 0.25,
+                "cap_max_passes": int(cap_authority_max_passes),
+                "cap_percent_error": float(
+                    cap_authority_percent_error
+                ),
                 "loss_on": 0,
                 "thermal_on": 0,
                 "keep_project": 1,
@@ -409,6 +421,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--matrix-authority", action="store_true")
     parser.add_argument("--cap-authority", action="store_true")
+    parser.add_argument(
+        "--cap-authority-max-passes", type=int, default=12
+    )
+    parser.add_argument(
+        "--cap-authority-percent-error", type=float, default=0.25
+    )
     args = parser.parse_args(argv)
     splits = tuple(args.split_main or SPLITS)
     print(
@@ -418,6 +436,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             full=args.full,
             matrix_authority=args.matrix_authority,
             cap_authority=args.cap_authority,
+            cap_authority_max_passes=args.cap_authority_max_passes,
+            cap_authority_percent_error=args.cap_authority_percent_error,
             equal_gaps_mm=(
                 tuple(args.equal_gap) if args.equal_gap else None
             ),
