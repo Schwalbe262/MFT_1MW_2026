@@ -723,6 +723,7 @@ SELECTION_POLICY_CARD_ID = "codex-symmetric-primary-selection-policy"
 LOCAL_SYMMETRIC_SELECTION_CARD_ID = "codex-local-symmetric-selection"
 LEGACY_CONTINUATION_CARD_ID = "codex-standard-full-continuation"
 FINAL_DRAWING_CARD_ID = "codex-final-drawing-readiness"
+COMPACT_DESIGN_STATUS_CARD_ID = "codex-compact-design-status"
 PRIMARY_5T_RECOVERY_CARD_ID = "codex-primary-5t-constraint-recovery"
 AXIS_V6_CARD_ID = "codex-axis-v6-fixed-5t-nsga"
 TARGET_AXIS_CARD_ID = "codex-target-axis-1200x1000-nsga"
@@ -850,6 +851,13 @@ NEW_AXIS_GEOMETRY_PASS_UNIQUE = 210
 NEW_AXIS_THERMAL_FEASIBLE = 0
 NEW_AXIS_PRODUCTION_PARETO = 0
 NEW_AXIS_COMPACT_SURROGATE_MIN_WINDING_C = 302.67
+COMPACT_DESIGN_CONTRACT_COMMIT = "ccdaa7d"
+COMPACT_OLD_GENERATION_SLICE_COUNT = 1_454
+COMPACT_OLD_GENERATION_HARD_FEASIBLE_COUNT = 0
+COMPACT_FOCUS_W_MAX_MM = 1_170.0
+COMPACT_FOCUS_L_MAX_MM = 975.0
+COMPACT_REFERENCE_VOLUME_L = 830.95994977
+COMPACT_FRESH_EXACT_SEED_COUNT = 512
 TARGET_AXIS_CAMPAIGN = (
     "mft-goal-fixed-primary-5t-lm2mh-axis-w1200-l1000-"
     "old16-plus-splittemp512-global-v3"
@@ -6124,6 +6132,66 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
     }
 
 
+def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
+    return {
+        "id": COMPACT_DESIGN_STATUS_CARD_ID,
+        "title": (
+            "CODEX | COMPACT DESIGN | OLD AUDIT 1454 | HARD-FEASIBLE 0 | "
+            "ACQUISITION TRIGGER CLOSED"
+        ),
+        "detail": (
+            "The old-generation audit contains 1,454 geometries in the compact "
+            "geometric-and-volume slice, but none pass every hard constraint. "
+            "That result closes acquisition from the old generation; it is not "
+            "proof that a compact design is impossible. The sealed trigger opens "
+            "only after all 512 fresh exact seeds authenticate, the unchanged "
+            "model quality gate passes, and at least one complete hard-feasible "
+            "compact row exists."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 0,
+        "evidence": [
+            (
+                f"compact acquisition contract sealed at commit "
+                f"{COMPACT_DESIGN_CONTRACT_COMMIT} / trigger_allowed=false"
+            ),
+            (
+                f"old-generation audit slice={COMPACT_OLD_GENERATION_SLICE_COUNT} "
+                f"geometries / W<={COMPACT_FOCUS_W_MAX_MM:.0f}mm OR "
+                f"L<={COMPACT_FOCUS_L_MAX_MM:.0f}mm / "
+                f"volume<{COMPACT_REFERENCE_VOLUME_L:.8f}L"
+            ),
+            (
+                "old-generation compact hard-feasible="
+                f"{COMPACT_OLD_GENERATION_HARD_FEASIBLE_COUNT} / "
+                "proof_of_impossibility=false / old rows are audit-only"
+            ),
+            (
+                "axis policy=no_axis_swap / original W/L/H, temperature, "
+                "resonance, cooling, operating-point, and all hard constraints "
+                "retained"
+            ),
+            (
+                f"trigger condition 1/3: fresh exact"
+                f"{COMPACT_FRESH_EXACT_SEED_COUNT} authenticated=true required"
+            ),
+            (
+                "trigger condition 2/3: unchanged new-model quality gate "
+                "passed=true required"
+            ),
+            (
+                "trigger condition 3/3: compact hard-feasible row count>=1 "
+                "required"
+            ),
+            (
+                "invalid_or_near_feasible_fallback=false / constraint "
+                "relaxation=false / automatic Scheduler submission=false"
+            ),
+        ],
+    }
+
+
 def _counter(pattern: re.Pattern[str], title: str, label: str) -> int:
     values = {int(value) for value in pattern.findall(title)}
     if len(values) != 1:
@@ -6499,6 +6567,10 @@ def merge_status(
             result,
             _final_gate_card(final_gate_root, observed_at),
         )
+    _upsert_current_card(
+        result,
+        _compact_design_status_card(observed_at),
+    )
     _upsert_current_card(result, _final_drawing_card(observed_at))
 
     handoff = _single_current(result, "fea-handoff")

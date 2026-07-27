@@ -1995,6 +1995,78 @@ def test_final_drawing_card_is_unique_and_before_parallel() -> None:
     updater.validate_status_sync(merged_again)
 
 
+def test_compact_design_status_card_is_truthful_and_fail_closed() -> None:
+    card = updater._compact_design_status_card(OBSERVED)
+
+    assert card["id"] == updater.COMPACT_DESIGN_STATUS_CARD_ID
+    assert len(card["title"]) <= 160
+    assert card["state"] == "in_progress"
+    assert card["progress_pct"] == 0
+    assert len(card["evidence"]) <= 12
+    assert "OLD AUDIT 1454" in card["title"]
+    assert "HARD-FEASIBLE 0" in card["title"]
+    assert "TRIGGER CLOSED" in card["title"]
+    assert "not proof that a compact design is impossible" in card["detail"]
+    assert any(
+        "commit ccdaa7d" in item and "trigger_allowed=false" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "slice=1454 geometries" in item
+        and "W<=1170mm OR L<=975mm" in item
+        and "volume<830.95994977L" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "hard-feasible=0" in item
+        and "proof_of_impossibility=false" in item
+        and "audit-only" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "axis policy=no_axis_swap" in item
+        and "all hard constraints retained" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "fresh exact512 authenticated=true required" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "quality gate passed=true required" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "compact hard-feasible row count>=1 required" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "invalid_or_near_feasible_fallback=false" in item
+        and "constraint relaxation=false" in item
+        for item in card["evidence"]
+    )
+
+
+def test_merge_upserts_one_compact_design_card_before_parallel() -> None:
+    merged = updater.merge_status(
+        _status(),
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+    )
+    merged_again = updater.merge_status(
+        merged,
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+    )
+    ids = [item["id"] for item in merged_again["current"]]
+
+    assert ids.count(updater.COMPACT_DESIGN_STATUS_CARD_ID) == 1
+    assert ids.index(updater.COMPACT_DESIGN_STATUS_CARD_ID) < ids.index(
+        "parallel-workstreams"
+    )
+    updater.validate_status_sync(merged_again)
+
+
 def test_merge_removes_stale_automatic_continuation_card_when_disarmed() -> None:
     source = _status()
     source["current"].insert(
