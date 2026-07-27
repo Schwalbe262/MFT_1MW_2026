@@ -31,7 +31,7 @@ SOURCE_PLAN = (
     / "plan.json"
 )
 SOURCE_RECEIPT = SOURCE_PLAN.parent / "submission_receipt.json"
-DIRECT_CAP_TASKS = {1: 97766, 2: 97767, 3: 97768, 4: 97769}
+FULL_PROFILE = SOURCE_PLAN.parent / "profiles" / "full-best.json"
 
 
 class FullHedgeError(RuntimeError):
@@ -98,6 +98,7 @@ def prepare(
     *,
     source_plan_path: Path,
     source_receipt_path: Path,
+    full_profile_path: Path,
     candidate_indices: tuple[int, ...],
 ) -> Path:
     destination = output.resolve()
@@ -122,21 +123,11 @@ def prepare(
         for row in source_receipt["submissions"]
         if str(row.get("mode")) == "matrix_turngraded_rx_cap"
     }
-    if any(
-        submitted.get(index) != DIRECT_CAP_TASKS.get(index)
-        for index in candidate_indices
-    ):
-        raise FullHedgeError("direct cap task binding drifted")
+    if any(int(submitted.get(index, 0)) <= 0 for index in candidate_indices):
+        raise FullHedgeError("direct cap task binding is absent")
 
     source_root = source_plan_path.resolve(strict=True).parent
-    source_full_lanes = [
-        lane for lane in source_plan["lanes"] if lane["mode"] == FULL_MODE
-    ]
-    if len(source_full_lanes) != 1:
-        raise FullHedgeError("source full profile is ambiguous")
-    full_profile = feeder._read(
-        source_root / source_full_lanes[0]["profile"]["path"]
-    )
+    full_profile = feeder._read(full_profile_path)
     if (
         int(full_profile["param_overrides"].get("matrix_on", 0)) != 1
         or int(full_profile["param_overrides"].get("cap_on", 0)) != 1
@@ -191,7 +182,7 @@ def prepare(
                 "candidate_index": candidate_index,
                 "candidate_id": candidate_id,
                 "candidate_sha256": candidate_sha,
-                "source_task_id": int(DIRECT_CAP_TASKS[candidate_index]),
+                "source_task_id": int(submitted[candidate_index]),
                 "source_plan_payload_sha256": source_plan["payload_sha256"],
                 "source_receipt_payload_sha256": source_receipt["payload_sha256"],
                 "core_center_gap_mm": float(params["core_center_gap_mm"]),
@@ -244,8 +235,17 @@ def prepare(
                 },
                 "receipt_payload_sha256": source_receipt["payload_sha256"],
                 "direct_cap_tasks": {
-                    str(index): DIRECT_CAP_TASKS[index]
+                    str(index): submitted[index]
                     for index in candidate_indices
+                },
+                "full_profile_source": {
+                    "path": str(full_profile_path.resolve(strict=True)),
+                    "sha256": feeder._file_sha(
+                        full_profile_path.resolve(strict=True)
+                    ),
+                    "size_bytes": (
+                        full_profile_path.resolve(strict=True).stat().st_size
+                    ),
                 },
             },
             "solver_revision": source_plan["solver_revision"],
@@ -275,12 +275,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-plan", type=Path, default=SOURCE_PLAN)
     parser.add_argument("--source-receipt", type=Path, default=SOURCE_RECEIPT)
+    parser.add_argument("--full-profile", type=Path, default=FULL_PROFILE)
     parser.add_argument(
         "--candidate-index",
         type=int,
         action="append",
         required=True,
-        choices=tuple(DIRECT_CAP_TASKS),
     )
     args = parser.parse_args(argv)
     indices = tuple(dict.fromkeys(args.candidate_index))
@@ -288,6 +288,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.output,
         source_plan_path=args.source_plan,
         source_receipt_path=args.source_receipt,
+        full_profile_path=args.full_profile,
         candidate_indices=indices,
     )
     print(path)
