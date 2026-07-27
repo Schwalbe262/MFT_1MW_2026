@@ -1002,6 +1002,12 @@ def _write_synthetic_goal_seed_result(
         }
         row.update({f"physical_G:{name}": -1.0 for name in constraints})
         row.update({f"normalized_G:{name}": -0.5 for name in constraints})
+        if index == 0 and seed == 101:
+            row["physical_G:exterior_width_limit"] = -40.0
+            row["normalized_G:exterior_width_limit"] = -40.0 / 1200.0
+        if index == 0 and seed == 102:
+            row["physical_G:exterior_length_limit"] = -30.0
+            row["normalized_G:exterior_length_limit"] = -30.0 / 1000.0
         if force_all_infeasible:
             row["physical_G:Llt_robust_band"] = 0.25
             row["normalized_G:Llt_robust_band"] = 0.5
@@ -1191,6 +1197,19 @@ def test_global_pareto_recomputes_from_all_terminal_rows_and_physicality(
     assert manifest["physical_feasible_count"] == 1279
     assert manifest["global_pareto_count"] == 2
     assert manifest["global_objective_front_count"] == 1
+    assert manifest["compactness_domain_count"] == 2
+    assert manifest["compactness_hard_feasible_count"] == 2
+    assert manifest["compactness_acquisition_count"] == 2
+    assert (
+        manifest["compactness_acquisition_contract"]["trigger"]["allowed"]
+        is False
+    )
+    assert (
+        "fresh_2607263000_3511_campaign_incomplete"
+        in manifest["compactness_acquisition_contract"]["trigger"][
+            "reasons"
+        ]
+    )
     assert manifest["seed_local_pareto_merge_used"] is False
     assert manifest["authenticated_bundle"]["task_count"] == 4
     assert manifest["authenticated_bundle"]["all_four_N1_strata_covered"] is True
@@ -1225,6 +1244,17 @@ def test_global_pareto_recomputes_from_all_terminal_rows_and_physicality(
     ].iloc[0]
     assert bool(quarantined["physical_feasible"]) is False
     assert quarantined["global_non_dominated_rank"] == -1
+    compact = pd.read_csv(
+        tmp_path / "global" / "compactness_acquisition_candidates.csv"
+    )
+    assert set(compact["source_seed"]) == {101, 102}
+    assert compact["hard_feasible"].all()
+    assert (
+        manifest["artifacts"]["compactness_acquisition_candidates"][
+            "invalid_or_near_feasible_fallback_used"
+        ]
+        is False
+    )
 
 
 def test_global_pareto_retains_nonempty_audit_front_when_feasible_front_empty(
@@ -1255,6 +1285,13 @@ def test_global_pareto_retains_nonempty_audit_front_when_feasible_front_empty(
     assert manifest["physical_feasible_count"] == 0
     assert manifest["global_pareto_count"] == 0
     assert manifest["global_objective_front_count"] == 1
+    assert manifest["compactness_acquisition_count"] == 0
+    assert (
+        "no_hard_feasible_compact_candidate"
+        in manifest["compactness_acquisition_contract"]["trigger"][
+            "reasons"
+        ]
+    )
     assert pd.read_csv(
         tmp_path / "global" / "global_pareto_front.csv"
     ).empty

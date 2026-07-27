@@ -54,6 +54,9 @@ SCHEDULER_MANIFEST_SCHEMA = "mft-goal-20260726-scheduler-manifest-v1"
 RELOCATION_SCHEMA = "mft-goal-20260726-worker-relocation-v1"
 SEARCH_RESULT_SCHEMA = "mft-goal-20260726-search-seed-v1"
 GLOBAL_PARETO_SCHEMA = "mft-goal-20260726-global-pareto-v1"
+COMPACTNESS_ACQUISITION_SCHEMA = (
+    "mft-goal-compactness-acquisition-slice-v1"
+)
 CODE_MANIFEST_SCHEMA = preflight.GOAL_CODE_MANIFEST_SCHEMA
 RUNTIME_SOURCE_ROLES = (
     "generation",
@@ -86,6 +89,19 @@ BODY_QUALITY_THRESHOLDS = {
     "max_p90_ape_pct": 10.0,
     "max_interval_p90_width": 10.0,
 }
+COMPACT_REFERENCE_CANDIDATE = {
+    "source_task_id": 97048,
+    "W_mm": 1181.040,
+    "L_mm": 992.360,
+    "H_mm": 709.0,
+    "volume_L": 830.95994977,
+}
+COMPACT_FOCUS_W_MAX_MM = 1170.0
+COMPACT_FOCUS_L_MAX_MM = 975.0
+COMPACT_ACQUISITION_LIMIT = 12
+FRESH_AL_SEED_START = 2_607_263_000
+FRESH_AL_SEED_COUNT = 512
+FRESH_AL_SEED_END = FRESH_AL_SEED_START + FRESH_AL_SEED_COUNT - 1
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -1736,15 +1752,146 @@ def aggregate_results(
         ),
         normalized_constraint_columns=normalized_columns,
     )
+    exterior_from_constraints = {
+        "compact_exterior_W_mm": (
+            1200.0 + ranked["physical_G:exterior_width_limit"]
+        ),
+        "compact_exterior_L_mm": (
+            1000.0 + ranked["physical_G:exterior_length_limit"]
+        ),
+        "compact_exterior_H_mm": (
+            750.0 + ranked["physical_G:exterior_height_limit"]
+        ),
+    }
+    explicit_exterior_columns = {
+        "compact_exterior_W_mm": "exterior_W_drawing_x_mm",
+        "compact_exterior_L_mm": "exterior_L_perpendicular_y_mm",
+        "compact_exterior_H_mm": "exterior_H_mm",
+    }
+    for derived_name, values in exterior_from_constraints.items():
+        explicit_name = explicit_exterior_columns[derived_name]
+        if explicit_name in ranked and not np.allclose(
+            ranked[explicit_name].to_numpy(dtype=float),
+            values.to_numpy(dtype=float),
+            rtol=0.0,
+            atol=1e-9,
+            equal_nan=False,
+        ):
+            raise RuntimeError(
+                "compactness exterior dimension contradicts physical G: "
+                f"{explicit_name}"
+            )
+        ranked[derived_name] = values
+    compact_domain = (
+        (
+            ranked["compact_exterior_W_mm"].le(
+                COMPACT_FOCUS_W_MAX_MM
+            )
+            | ranked["compact_exterior_L_mm"].le(
+                COMPACT_FOCUS_L_MAX_MM
+            )
+        )
+        & ranked["objective_volume_L"].lt(
+            COMPACT_REFERENCE_CANDIDATE["volume_L"]
+        )
+    )
+    compact_domain_count = int(compact_domain.sum())
+    compact_pool = ranked.loc[
+        compact_domain & ranked["hard_feasible"]
+    ].copy()
+    if compact_pool.empty:
+        compact_candidates = ranked.iloc[0:0].copy()
+        compact_candidates["compact_selection_order"] = pd.Series(
+            dtype="int64"
+        )
+        compact_candidates["compact_selection_roles"] = pd.Series(
+            dtype="object"
+        )
+        compact_candidates["compact_selection_basis"] = pd.Series(
+            dtype="object"
+        )
+    else:
+        compact_ranked = rank_candidates(
+            compact_pool,
+            objective_columns=(
+                "objective_volume_L",
+                "objective_total_loss_W",
+            ),
+            physical_constraint_columns=physical_columns,
+            normalized_constraint_columns=normalized_columns,
+        )
+        compact_ranked["compact_non_dominated_rank"] = compact_ranked[
+            "feasible_rank"
+        ]
+        compact_candidates = select_standard_candidates(
+            compact_ranked,
+            objective_columns=(
+                "objective_volume_L",
+                "objective_total_loss_W",
+            ),
+            normalized_constraint_columns=normalized_columns,
+            limit=COMPACT_ACQUISITION_LIMIT,
+        ).rename(
+            columns={
+                "standard_selection_order": (
+                    "compact_selection_order"
+                ),
+                "standard_selection_roles": (
+                    "compact_selection_roles"
+                ),
+                "standard_selection_basis": (
+                    "compact_selection_basis"
+                ),
+            }
+        )
+        compact_candidates["compact_selection_basis"] = (
+            "hard_feasible_compact_front0"
+        )
+    fresh_seed_contract_passed = (
+        len(seeds) == FRESH_AL_SEED_COUNT
+        and sorted(seeds)
+        == list(range(FRESH_AL_SEED_START, FRESH_AL_SEED_END + 1))
+    )
+    search_only = any(
+        result["search_only_proposal"] for result in results
+    )
+    compact_trigger_reasons = []
+    if not fresh_seed_contract_passed:
+        compact_trigger_reasons.append(
+            "fresh_2607263000_3511_campaign_incomplete"
+        )
+    if search_only:
+        compact_trigger_reasons.append(
+            "new_model_quality_gate_not_passed"
+        )
+    if compact_candidates.empty:
+        compact_trigger_reasons.append(
+            "no_hard_feasible_compact_candidate"
+        )
+    compact_trigger = {
+        "allowed": not compact_trigger_reasons,
+        "reasons": compact_trigger_reasons,
+        "strict_clean_thermal_truth_retraining_required": True,
+        "new_model_quality_gate_pass_required": True,
+        "all_512_fresh_terminal_populations_required": True,
+        "hard_feasible_required": True,
+        "invalid_thermal_truth_allowed": False,
+        "constraint_relaxation_allowed": False,
+        "turn_graded_capacitance_final_FEA_required": True,
+        "symmetric_nonrounded_FEA_only": True,
+        "scheduler_submission_performed": False,
+    }
     output.mkdir(parents=True)
     all_path = output / "global_terminal_candidates.csv"
     pareto_path = output / "global_pareto_front.csv"
     objective_front_path = output / "global_objective_front.csv"
     standard_path = output / "standard_candidates.csv"
+    compact_path = output / "compactness_acquisition_candidates.csv"
     _atomic_csv(all_path, ranked)
     _atomic_csv(pareto_path, pareto)
     _atomic_csv(objective_front_path, objective_front)
     _atomic_csv(standard_path, standard_candidates)
+    _atomic_csv(compact_path, compact_candidates)
     manifest = _seal(
         {
             "schema_version": GLOBAL_PARETO_SCHEMA,
@@ -1766,6 +1913,34 @@ def aggregate_results(
             "global_pareto_count": int(len(pareto)),
             "global_objective_front_count": int(len(objective_front)),
             "standard_candidate_count": int(len(standard_candidates)),
+            "compactness_domain_count": compact_domain_count,
+            "compactness_hard_feasible_count": int(len(compact_pool)),
+            "compactness_acquisition_count": int(
+                len(compact_candidates)
+            ),
+            "compactness_acquisition_contract": {
+                "schema_version": COMPACTNESS_ACQUISITION_SCHEMA,
+                "reference_candidate": copy.deepcopy(
+                    COMPACT_REFERENCE_CANDIDATE
+                ),
+                "domain": {
+                    "axis_policy": "no_axis_swap",
+                    "focus_any": {
+                        "W_mm_lte": COMPACT_FOCUS_W_MAX_MM,
+                        "L_mm_lte": COMPACT_FOCUS_L_MAX_MM,
+                    },
+                    "volume_L_lt": COMPACT_REFERENCE_CANDIDATE[
+                        "volume_L"
+                    ],
+                    "H_mm_lte": 750.0,
+                },
+                "selection_limit": COMPACT_ACQUISITION_LIMIT,
+                "selection": (
+                    "hard_feasible_compact_front0_deterministic_"
+                    "anchors_and_spread"
+                ),
+                "trigger": compact_trigger,
+            },
             "sorting_authority": (
                 "all_authenticated_terminal_rows_then_physical_dedupe_"
                 "then_decoder_and_physical_G_and_surrogate_physicality_"
@@ -1830,10 +2005,18 @@ def aggregate_results(
                         "deterministic_anchors_knee_margin_and_front_spread"
                     ),
                 },
+                "compactness_acquisition_candidates": {
+                    "path": compact_path.name,
+                    "sha256": adapter.sha256_file(compact_path),
+                    "row_count": int(len(compact_candidates)),
+                    "production_authority": False,
+                    "fea_submission_allowed": compact_trigger[
+                        "allowed"
+                    ],
+                    "invalid_or_near_feasible_fallback_used": False,
+                },
             },
-            "search_only_proposal": any(
-                result["search_only_proposal"] for result in results
-            ),
+            "search_only_proposal": search_only,
             "production_eligible": False,
             "automatic_promotion_allowed": False,
         }
