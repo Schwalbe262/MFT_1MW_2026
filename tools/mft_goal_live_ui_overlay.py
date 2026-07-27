@@ -164,10 +164,15 @@ def update(
     scheduler_url: str,
     core_rescue_plan: Path,
     fea_prefix: str = FEA_PREFIX,
+    extra_fea_prefixes: Iterable[str] = (),
 ) -> dict[str, Any]:
     status = _read_json(status_file)
     nsga_rows = _get_tasks(scheduler_url, NSGA_PREFIX)
-    fea_rows = _get_tasks(scheduler_url, fea_prefix)
+    fea_rows_by_id: dict[int, dict[str, Any]] = {}
+    for prefix in (fea_prefix, *extra_fea_prefixes):
+        for row in _get_tasks(scheduler_url, prefix):
+            fea_rows_by_id[int(row["id"])] = row
+    fea_rows = list(fea_rows_by_id.values())
     nsga_counts = _counts(nsga_rows)
     fea_counts = _counts(fea_rows)
     plan = _read_json(core_rescue_plan) if core_rescue_plan.is_file() else {}
@@ -281,6 +286,7 @@ def update(
         "nsga_task_count": len(nsga_rows),
         "fea_task_count": len(fea_rows),
         "fea_task_prefix": fea_prefix,
+        "extra_fea_task_prefixes": list(extra_fea_prefixes),
         "core_rescue_plan": str(core_rescue_plan),
     }
     _atomic_json(status_file, status)
@@ -295,6 +301,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--core-rescue-plan", type=Path, required=True)
     parser.add_argument("--fea-prefix", default=FEA_PREFIX)
+    parser.add_argument("--extra-fea-prefix", action="append", default=[])
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--interval-seconds", type=float, default=15.0)
@@ -321,6 +328,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             scheduler_url=args.scheduler_url,
             core_rescue_plan=args.core_rescue_plan,
             fea_prefix=args.fea_prefix,
+            extra_fea_prefixes=args.extra_fea_prefix,
         )
         if not args.watch:
             return 0
