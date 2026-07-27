@@ -1611,7 +1611,7 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         if item["id"] == updater.FINAL_DRAWING_CARD_ID
     )
     assert drawing["title"] == (
-        "CODEX | 5T FULL ROUNDED GUI READY | DRAFT STILL SUPERSEDED | "
+        "CODEX | PREFERRED 5T FULL ROUNDED GUI READY | h_gap1=19.45mm | "
         "SYMMETRIC PASS PENDING | FINAL RELEASE OFF"
     )
     assert drawing["state"] == "in_progress"
@@ -1982,7 +1982,7 @@ def test_merge_upserts_missing_official_task_card_before_parallel() -> None:
 
 def test_final_drawing_card_is_unique_and_before_parallel() -> None:
     card = updater._final_drawing_card(OBSERVED)
-    assert "5T FULL ROUNDED GUI READY" in card["title"]
+    assert "PREFERRED 5T FULL ROUNDED GUI READY" in card["title"]
     assert card["progress_pct"] == 25
     assert "No analysis was run" in card["detail"]
     assert "symmetric nonrounded" in card["detail"]
@@ -1994,7 +1994,7 @@ def test_final_drawing_card_is_unique_and_before_parallel() -> None:
         for item in card["evidence"]
     )
     assert any(
-        "wcp_len_x 399.9->388.9mm" in item
+        "wcp_len_x 392.8->381.7mm" in item
         and "fan=1.5m/s" in item
         and "TIM and pads=2mm,k=0.2W/mK unchanged" in item
         for item in card["evidence"]

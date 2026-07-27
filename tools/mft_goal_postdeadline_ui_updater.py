@@ -1105,16 +1105,16 @@ ROUNDED_SNAPSHOT_SHA256 = (
 ROUNDED_SNAPSHOT_SIZE_BYTES = 33_204_563
 CORRECTED_5T_ROUNDED_FULL_GUI_PATH = (
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\local_bddff5t_full_curved_gui_v3\simulation"
-    r"\simulation_job_bddff5t_full_curved_model_v3_20260727"
-    r"\simulation_job_bddff5t_full_curved_model_v3_20260727.aedt"
+    r"\local_5807135t_full_curved_gui_v1\simulation"
+    r"\simulation_job_5807135t_full_curved_model_v1_20260727"
+    r"\simulation_job_5807135t_full_curved_model_v1_20260727.aedt"
 )
 CORRECTED_5T_ROUNDED_FULL_GUI_SHA256 = (
-    "65a2c36565e6f91c3f5cb5c917c213b3c5a8ead40690c91177e402384e7d7cfa"
+    "66d568dec29fc3f419816a828f3de52d14841c57ff59434c0f02ec06580b6101"
 )
-CORRECTED_5T_ROUNDED_FULL_GUI_SIZE_BYTES = 10_982_090
+CORRECTED_5T_ROUNDED_FULL_GUI_SIZE_BYTES = 10_980_217
 CORRECTED_5T_ROUNDED_FULL_GUI_GEOMETRY = (
-    "bddff419f1efb912820d51cdb725e18482d0b09fbb2958b68c4e460d488c44d6"
+    "58071313a32e81aeaa5bc3febdddb0bfd230a2bec633940a4c180ba8b838c508"
 )
 ROUNDED_SNAPSHOT_MANIFEST_SHA256 = (
     "09bb2b714843ff7bff25ec1c6ae73849f307beab8dab01d95704cfde91fdeb82"
@@ -6258,7 +6258,7 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
     return {
         "id": FINAL_DRAWING_CARD_ID,
         "title": (
-            "CODEX | 5T FULL ROUNDED GUI READY | DRAFT STILL SUPERSEDED | "
+            "CODEX | PREFERRED 5T FULL ROUNDED GUI READY | h_gap1=19.45mm | "
             "SYMMETRIC PASS PENDING | FINAL RELEASE OFF"
         ),
         "detail": (
@@ -6268,11 +6268,13 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
             "are superseded and specification-invalid despite passing 20 layout "
             "checks. A replacement 5.0 mm/1.6 mm, 6/60-turn, Full rounded "
             "model-only AEDT has now been generated and is open in the GUI for "
-            "geometry inspection. It uses the compact bddff source candidate, "
-            "R10/s4 winding corners, and the current 0.631417 mm Lm=2mH gap "
-            "estimate. No analysis was run. Publication and final release remain "
-            "disabled until the symmetric nonrounded candidate passes the tuned-"
-            "gap thermal gate."
+            "geometry inspection. The prior bddff inspection candidate is no "
+            "longer preferred because its primary-to-core axial clearance was "
+            "only 8.95 mm per side. The preferred 580713 source restores that "
+            "clearance to 19.45 mm per side, uses R10/s4 winding corners, and "
+            "retains the current 0.631417 mm Lm=2mH gap estimate. No analysis was "
+            "run. Publication and final release remain disabled until the "
+            "symmetric nonrounded candidate passes the tuned-gap thermal gate."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
@@ -6281,7 +6283,14 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
             (
                 "replacement inspection model ready=true / cw1=5.0mm / "
                 "gap1=1.6mm / cw2=0.9mm / turns=6/60 / full_model=true / "
-                "round_corner=true / R10/s4 / analysis_run=false"
+                "round_corner=true / R10/s4 / analysis_run=false / "
+                "primary_core_axial_clearance_each=19.45mm / "
+                "bbox=1181.404x999.352x750.0mm / "
+                "candidate preference changed: bddff h_gap1=8.95mm/side "
+                "superseded for drawing freeze / preferred 580713 "
+                "h_gap1=19.45mm/side / surrogate temperatures "
+                "primary=102.182C secondary=105.032C core=119.658C / "
+                "fixed-Lm fmin=15.650kHz"
             ),
             (
                 f"replacement AEDT={CORRECTED_5T_ROUNDED_FULL_GUI_SIZE_BYTES:,}B / "
@@ -6291,7 +6300,7 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
             ),
             (
                 "rounded Full bounded conversion: wcp_len_x "
-                "399.9->388.9mm to retain <=80% straight-contact readback / "
+                "392.8->381.7mm to retain <=80% straight-contact readback / "
                 "fan=1.5m/s / TIM and pads=2mm,k=0.2W/mK unchanged"
             ),
             (
