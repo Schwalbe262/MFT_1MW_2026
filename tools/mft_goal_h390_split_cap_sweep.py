@@ -35,6 +35,12 @@ SOURCE_PARAMS = Path(
     r"\h390_36_24_equal_gap_0p4046737_params.json"
 )
 SOURCE_PROFILE = SOURCE_ROOT / "profiles" / "cap-screen.json"
+FULL_PROFILE = (
+    compact.RUNTIME
+    / "compact50f_height390_full_v1"
+    / "profiles"
+    / "full-physics.json"
+)
 SOURCE_TASK_ID = 97881
 SOURCE_PARAMS_SHA256 = (
     "e122cc95e9b97612fb3d9bb0059f98601b155f2c61d4201668f0695f19c5ad07"
@@ -113,7 +119,12 @@ def _validated(raw: dict[str, Any], split_main: int) -> tuple[dict[str, Any], di
     }
 
 
-def prepare(output: Path, splits: tuple[int, ...]) -> Path:
+def prepare(
+    output: Path,
+    splits: tuple[int, ...],
+    *,
+    full: bool = False,
+) -> Path:
     destination = output.resolve()
     if destination.exists():
         raise compact.CompactSweepError(f"output exists: {destination}")
@@ -124,9 +135,12 @@ def prepare(output: Path, splits: tuple[int, ...]) -> Path:
     if feeder._file_sha(SOURCE_PARAMS) != SOURCE_PARAMS_SHA256:
         raise compact.CompactSweepError("sealed h390 correction params drifted")
     source_params = feeder._read(SOURCE_PARAMS)
-    profile = feeder._read(SOURCE_PROFILE)
+    selected_profile_path = FULL_PROFILE if full else SOURCE_PROFILE
+    profile = feeder._read(selected_profile_path)
     profile_record = feeder._profile_record(
-        profile, destination, "profiles/cap-screen.json"
+        profile,
+        destination,
+        "profiles/full-physics.json" if full else "profiles/cap-screen.json",
     )
     lanes: list[dict[str, Any]] = []
     audits: list[dict[str, Any]] = []
@@ -140,11 +154,11 @@ def prepare(output: Path, splits: tuple[int, ...]) -> Path:
                 "N2_side": int(60 - split_main),
                 "matrix_on": 1,
                 "cap_on": 1,
-                "loss_on": 0,
-                "thermal_on": 0,
+                "loss_on": int(full),
+                "thermal_on": int(full),
                 "round_corner": 0,
                 "full_model": 0,
-                "keep_project": 0,
+                "keep_project": int(full),
             }
         )
         effective, dimensions = _validated(raw, split_main)
@@ -155,7 +169,7 @@ def prepare(output: Path, splits: tuple[int, ...]) -> Path:
             effective,
         )
         name = (
-            f"mft-h390-split-cap-{lane_index:02d}-"
+            f"mft-h390-split-{'full' if full else 'cap'}-{lane_index:02d}-"
             f"{split_main:02d}x{60 - split_main:02d}-{candidate_sha[:10]}"
         )
         identity = feeder.scheduler_client.verification_submission_identity(
@@ -185,7 +199,11 @@ def prepare(output: Path, splits: tuple[int, ...]) -> Path:
                 "core_center_gap_mm": float(effective["core_center_gap_mm"]),
                 "core_equal_three_leg_air_gap": 1,
                 "expected_gapped_leg_count": 3,
-                "mode": compact.CAP_MODE,
+                "mode": (
+                    "matrix_turngraded_cap_loss_thermal"
+                    if full
+                    else compact.CAP_MODE
+                ),
                 "params": feeder._record(params_path, destination),
                 "params_sha256": feeder._sha(effective),
                 "profile": profile_record,
@@ -214,13 +232,17 @@ def prepare(output: Path, splits: tuple[int, ...]) -> Path:
             "source": {
                 "plan": compact._external_record(SOURCE_PLAN),
                 "params": compact._external_record(SOURCE_PARAMS),
-                "profile": compact._external_record(SOURCE_PROFILE),
+                "profile": compact._external_record(selected_profile_path),
                 "task_id": SOURCE_TASK_ID,
             },
             "solver_revision": compact.SOLVER_REVISION,
             "library_revision": compact.LIBRARY_REVISION,
             "selection": {
-                "strategy": "h390_direct_split_bracket_after_32_28_FEA_bias",
+                "strategy": (
+                    "h390_selected_35_25_full_symmetric_validation"
+                    if full
+                    else "h390_direct_split_bracket_after_32_28_FEA_bias"
+                ),
                 "audits": audits,
             },
             "regression_contract": {
@@ -251,9 +273,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--split-main", action="append", type=int)
+    parser.add_argument("--full", action="store_true")
     args = parser.parse_args(argv)
     splits = tuple(args.split_main or SPLITS)
-    print(prepare(args.output, splits))
+    print(prepare(args.output, splits, full=args.full))
     return 0
 
 
