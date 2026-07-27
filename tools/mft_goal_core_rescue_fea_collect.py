@@ -37,6 +37,7 @@ LM_RELATIVE_TOLERANCE = 0.01
 TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
 FULL_MODE = "matrix_turngraded_cap_loss_thermal"
 MATRIX_MODE = "matrix_only_lm_bracket"
+CAP_MODE = "matrix_turngraded_rx_cap"
 
 
 class CollectionError(RuntimeError):
@@ -252,6 +253,7 @@ def _assert_contract(
     plan = binding["plan"]
     expected_gap = float(lane["core_center_gap_mm"])
     expected_thermal = lane["mode"] == FULL_MODE
+    expected_turn_graded_rx = lane["mode"] in {FULL_MODE, CAP_MODE}
     checks = {
         "scheduler_succeeded": (
             task.get("state") == "succeeded"
@@ -361,7 +363,7 @@ def _assert_contract(
             or int(result.get("result_valid_thermal", -1)) == 1
         ),
         "turn_graded_rx_when_requested": (
-            not expected_thermal
+            not expected_turn_graded_rx
             or (
                 result.get("cap_turn_graded_active_winding") == "Rx"
                 and result.get("active_winding") == "Rx"
@@ -877,6 +879,9 @@ def collect(
         "diagnostic_excluded_tasks": diagnostics,
         "matrix_record_count": sum(
             row["mode"] == MATRIX_MODE for row in ranked
+        ),
+        "cap_screen_record_count": sum(
+            row["mode"] == CAP_MODE for row in ranked
         ),
         "full_physics_record_count": len(full_records),
         "exact_gap_full_physics_record_count": len(exact_records),
