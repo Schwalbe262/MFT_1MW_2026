@@ -40,7 +40,6 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from module.mft_goal_20260726_contract import canonical_sha256  # noqa: E402
 from tools import mft_goal_20260726_launch as goal_launch  # noqa: E402
 from tools import mft_goal_diagnostic_compact_scout as scout  # noqa: E402
-from tools import mft_goal_diagnostic_compact_slurm as offload  # noqa: E402
 from tools import mft_goal_turn_graded_physics_reranker as physics  # noqa: E402
 from tools import tier1_corrected_generation_preflight as preflight  # noqa: E402
 
@@ -88,6 +87,10 @@ DEFAULT_LOCAL_ROOT = (
 DEFAULT_REMOTE_ROOT = (
     "/gpfs/tmp_cpu2/mft_goal_20260726/corrected_physics_delta_nsga"
 )
+DEFAULT_ACCOUNTS = Path(r"Y:\runtime\slurm_scheduler\config\accounts.yaml")
+DEFAULT_SCHEDULER_SOURCE = Path(r"C:\Users\peets\NEC\slurm_scheduler")
+DEFAULT_STAGING_ACCOUNT = "harry261"
+DEFAULT_SCHEDULER_URL = "http://127.0.0.1:8002"
 DEFAULT_BUNDLE_ROOT = (
     Path(r"C:\Users\peets\slurm_scheduler_runtime")
     / "mft_goal_20260726"
@@ -105,6 +108,10 @@ DEDUPE_PREFIX = "mft-goal-20260726-physics-delta-nsga:"
 WORKER_ENTRYPOINT = (
     "artifacts/code/tools/mft_goal_corrected_physics_nsga_lane.py"
 )
+CORRECTED_RUNTIME_TOOL_FILES = (
+    "tools/mft_goal_corrected_physics_nsga_lane.py",
+    "tools/mft_goal_turn_graded_physics_reranker.py",
+)
 PHYSICS_CONSTRAINT_NAME = "physics_delta_fRx_q90_lcb_minimum"
 SPLIT_MIN_N2_MAIN = 12
 SPLIT_MAX_N2_MAIN = 60
@@ -120,7 +127,30 @@ FORBIDDEN_OPTIMIZER_INPUTS = (
 )
 
 _ACTIVE_MODEL: dict[str, Any] | None = None
-_BASE_SCHEDULER_PAYLOAD = offload.scheduler_payload
+_COORDINATOR_OFFLOAD: Any | None = None
+_BASE_SCHEDULER_PAYLOAD: Any | None = None
+
+
+def _coordinator_offload(*, configure: bool = True) -> Any:
+    """Load Scheduler coordination code only outside worker execution."""
+
+    global _BASE_SCHEDULER_PAYLOAD, _COORDINATOR_OFFLOAD
+    if _COORDINATOR_OFFLOAD is None:
+        from tools import mft_goal_diagnostic_compact_slurm as loaded
+
+        _COORDINATOR_OFFLOAD = loaded
+        _BASE_SCHEDULER_PAYLOAD = loaded.scheduler_payload
+    if configure:
+        _configure_coordinator_offload(_COORDINATOR_OFFLOAD)
+    return _COORDINATOR_OFFLOAD
+
+
+def __getattr__(name: str) -> Any:
+    """Preserve coordinator introspection without worker-time imports."""
+
+    if name == "offload":
+        return _coordinator_offload(configure=False)
+    raise AttributeError(name)
 
 
 def _now() -> str:
@@ -1594,6 +1624,8 @@ def _corrected_scheduler_payload(
     task: Mapping[str, Any],
     priority: int | None = None,
 ) -> dict[str, Any]:
+    if _BASE_SCHEDULER_PAYLOAD is None:
+        raise RuntimeError("corrected Scheduler coordinator is not loaded")
     payload = _BASE_SCHEDULER_PAYLOAD(
         plan=plan,
         task=task,
@@ -1611,9 +1643,33 @@ def _corrected_scheduler_payload(
     return payload
 
 
+def _configure_coordinator_offload(offload: Any) -> None:
+    offload.PLAN_SCHEMA = OFFLOAD_PLAN_SCHEMA
+    offload.DEPLOYMENT_SCHEMA = OFFLOAD_DEPLOYMENT_SCHEMA
+    offload.AUTHENTICATION_SCHEMA = OFFLOAD_AUTH_SCHEMA
+    offload.DRY_RUN_SCHEMA = OFFLOAD_DRY_RUN_SCHEMA
+    offload.RECEIPT_SCHEMA = OFFLOAD_RECEIPT_SCHEMA
+    offload.EXACT_SEED_START = SEED_START
+    offload.EXACT_TASK_COUNT = SEED_COUNT
+    offload.EXACT_SEEDS = tuple(range(SEED_START, SEED_END + 1))
+    offload.TASK_NAME_PREFIX = TASK_NAME_PREFIX
+    offload.DEDUPE_PREFIX = DEDUPE_PREFIX
+    offload.DEFAULT_LOCAL_ROOT = DEFAULT_LOCAL_ROOT
+    offload.DEFAULT_REMOTE_ROOT = DEFAULT_REMOTE_ROOT
+    offload.scheduler_payload = _corrected_scheduler_payload
+
+
 def configure_runtime(model: Mapping[str, Any] | None = None) -> None:
     if model is not None:
         _set_active_model(model)
+    goal_launch.GOAL_RUNTIME_TOOL_FILES = tuple(
+        dict.fromkeys(
+            (
+                *goal_launch.GOAL_RUNTIME_TOOL_FILES,
+                *CORRECTED_RUNTIME_TOOL_FILES,
+            )
+        )
+    )
     scout.CAMPAIGN_ID = CAMPAIGN_ID
     scout.ACTIVATION_SCHEMA = ACTIVATION_SCHEMA
     scout.BUNDLE_SCHEMA = BUNDLE_SCHEMA
@@ -1635,19 +1691,6 @@ def configure_runtime(model: Mapping[str, Any] | None = None) -> None:
     preflight._terminal_surrogate_physicality_gate = (
         corrected_terminal_physicality_gate
     )
-    offload.PLAN_SCHEMA = OFFLOAD_PLAN_SCHEMA
-    offload.DEPLOYMENT_SCHEMA = OFFLOAD_DEPLOYMENT_SCHEMA
-    offload.AUTHENTICATION_SCHEMA = OFFLOAD_AUTH_SCHEMA
-    offload.DRY_RUN_SCHEMA = OFFLOAD_DRY_RUN_SCHEMA
-    offload.RECEIPT_SCHEMA = OFFLOAD_RECEIPT_SCHEMA
-    offload.EXACT_SEED_START = SEED_START
-    offload.EXACT_TASK_COUNT = SEED_COUNT
-    offload.EXACT_SEEDS = tuple(range(SEED_START, SEED_END + 1))
-    offload.TASK_NAME_PREFIX = TASK_NAME_PREFIX
-    offload.DEDUPE_PREFIX = DEDUPE_PREFIX
-    offload.DEFAULT_LOCAL_ROOT = DEFAULT_LOCAL_ROOT
-    offload.DEFAULT_REMOTE_ROOT = DEFAULT_REMOTE_ROOT
-    offload.scheduler_payload = _corrected_scheduler_payload
 
 
 def _model_from_payload(path: Path) -> dict[str, Any]:
@@ -1662,6 +1705,7 @@ def _model_from_payload(path: Path) -> dict[str, Any]:
 
 
 def _configure_from_bundle(bundle_root: Path) -> dict[str, Any]:
+    _coordinator_offload()
     bundle = _read_json(bundle_root / "bundle_manifest.json")
     relatives = bundle.get("task_relative_paths") or []
     if len(relatives) != SEED_COUNT:
@@ -1748,6 +1792,7 @@ def execute_command(args: argparse.Namespace) -> Path:
 
 def plan_command(args: argparse.Namespace) -> Path:
     _configure_from_bundle(args.goal_bundle_root)
+    offload = _coordinator_offload()
     plan, _deployment = offload.build_plan(
         goal_bundle_root=args.goal_bundle_root,
         generation=args.generation,
@@ -1782,6 +1827,7 @@ class _ReadOnlyAbsentScheduler:
 
 def _preflight_value(plan_path: Path) -> dict[str, Any]:
     _configure_from_plan(plan_path)
+    offload = _coordinator_offload()
     plan, deployment, tasks, authentication = offload.authenticate_plan(
         plan_path
     )
@@ -1861,6 +1907,7 @@ def preflight_command(args: argparse.Namespace) -> Path:
 
 def dry_run_command(args: argparse.Namespace) -> Path:
     _configure_from_plan(args.plan)
+    offload = _coordinator_offload()
     plan = _read_json(args.plan)
     client = _ReadOnlyAbsentScheduler()
     base = offload.submit(
@@ -1923,6 +1970,7 @@ def dry_run_command(args: argparse.Namespace) -> Path:
 
 def stage_command(args: argparse.Namespace) -> str:
     _configure_from_plan(args.plan)
+    offload = _coordinator_offload()
     value = offload.stage(
         plan_path=args.plan,
         accounts_path=args.accounts,
@@ -1936,6 +1984,7 @@ def stage_command(args: argparse.Namespace) -> str:
 
 def submit_command(args: argparse.Namespace) -> str:
     _configure_from_plan(args.plan)
+    offload = _coordinator_offload()
     if args.apply and not args.authorization:
         raise RuntimeError(
             "--apply requires --authorization confirming parent/root approval"
@@ -2003,22 +2052,22 @@ def _parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name)
         command.add_argument("--plan", type=Path, required=True)
         command.add_argument(
-            "--accounts", type=Path, default=offload.DEFAULT_ACCOUNTS
+            "--accounts", type=Path, default=DEFAULT_ACCOUNTS
         )
         command.add_argument(
             "--scheduler-source",
             type=Path,
-            default=offload.DEFAULT_SCHEDULER_SOURCE,
+            default=DEFAULT_SCHEDULER_SOURCE,
         )
         command.add_argument(
-            "--staging-account", default=offload.DEFAULT_STAGING_ACCOUNT
+            "--staging-account", default=DEFAULT_STAGING_ACCOUNT
         )
         command.add_argument("--apply", action="store_true")
         if name == "stage":
             command.add_argument("--resume-incoming")
         else:
             command.add_argument(
-                "--scheduler-url", default=offload.DEFAULT_SCHEDULER_URL
+                "--scheduler-url", default=DEFAULT_SCHEDULER_URL
             )
             command.add_argument("--receipt-out", type=Path)
             command.add_argument("--authorization")
