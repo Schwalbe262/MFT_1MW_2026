@@ -323,6 +323,7 @@ def _turn_split_repair_contract() -> dict[str, Any]:
         "split_dependent_derived_features_recomputed": True,
         "decoder_reprojection_per_split_used": False,
         "vectorized_Llt_enumeration": True,
+        "plain_decode_geometry_audit_bypass": True,
     }
 
 
@@ -828,6 +829,16 @@ def _install_turn_split_local_repair(
         raise RuntimeError("N2 split enumeration is not one-to-one")
 
     def split_repaired_decode(values: Any) -> tuple[Any, Any, Any]:
+        if not getattr(
+            problem,
+            "_turn_split_local_repair_evaluation_active",
+            False,
+        ):
+            # Compact-bank construction and geometry audits need only the
+            # ordinary decoder.  Running a 49-way Llt ensemble there adds no
+            # optimizer evidence and made sealed prepare repeat the expensive
+            # enumeration several times.
+            return original_decode(values)
         coordinates = np.asarray(values, dtype=float)
         if (
             coordinates.ndim != 2
@@ -1169,9 +1180,11 @@ def _install_search_profile(
         problem.constraint_index = base_index
         problem.n_ieq_constr = base_count
         problem._predict = guarded_predict
+        problem._turn_split_local_repair_evaluation_active = True
         try:
             base_evaluate(values, out, *args, **kwargs)
         finally:
+            problem._turn_split_local_repair_evaluation_active = False
             problem._predict = original_predict
             problem.constraint_names = effective_names
             problem.constraint_index = effective_index

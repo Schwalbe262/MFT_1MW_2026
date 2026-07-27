@@ -299,6 +299,21 @@ def test_installed_evaluator_excludes_raw_predictor_and_replaces_G(
     ] is False
 
 
+def test_plain_decode_bypasses_expensive_split_enumeration(
+    profile: dict[str, Any],
+) -> None:
+    problem = _FakeProblem()
+    lane._install_search_profile(problem, profile)
+    coordinates = np.zeros((3, problem.n_var), dtype=float)
+    frame, shrink, valid = problem.decode_batch(coordinates)
+
+    assert len(frame) == 3
+    assert shrink.shape == (3,)
+    assert valid.tolist() == [True, True, True]
+    assert problem.underlying_decode_calls == 1
+    assert problem.underlying_predict_calls == []
+
+
 def test_raw_Crx_cannot_quarantine_terminal_candidate() -> None:
     targets = (
         set(preflight.TERMINAL_NONNEGATIVE_SURROGATE_TARGETS)
