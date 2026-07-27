@@ -599,6 +599,7 @@ def test_scheduler_payload_uses_isolated_worker_and_namespace(
             "name": lane.TASK_NAME_PREFIX + "abc-s2607264400-n1-6",
             "dedupe_key": lane.DEDUPE_PREFIX + "abc",
             "command": (
+                "set -euo pipefail\n"
                 "exec python artifacts/code/tools/"
                 "mft_goal_diagnostic_compact_scout.py execute "
                 "--payload \"$payload_path\""
@@ -616,6 +617,16 @@ def test_scheduler_payload_uses_isolated_worker_and_namespace(
     ]
     assert payload["name"].startswith(lane.TASK_NAME_PREFIX)
     assert payload["dedupe_key"].startswith(lane.DEDUPE_PREFIX)
+    lines = payload["command"].splitlines()
+    assert lines[:4] == [
+        "set -euo pipefail",
+        "export OMP_NUM_THREADS=1",
+        "export OPENBLAS_NUM_THREADS=1",
+        "export MKL_NUM_THREADS=1",
+    ]
+    assert payload["command"].count("OMP_NUM_THREADS") == 1
+    assert payload["command"].count("OPENBLAS_NUM_THREADS") == 1
+    assert payload["command"].count("MKL_NUM_THREADS") == 1
 
 
 def test_model_file_sha_is_exact() -> None:

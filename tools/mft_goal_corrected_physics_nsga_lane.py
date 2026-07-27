@@ -110,6 +110,11 @@ DEDUPE_PREFIX = "mft-goal-20260726-physics-delta-nsga:"
 WORKER_ENTRYPOINT = (
     "artifacts/code/tools/mft_goal_corrected_physics_nsga_lane.py"
 )
+NATIVE_THREAD_LIMITS = {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+}
 CORRECTED_RUNTIME_TOOL_FILES = (
     "tools/mft_goal_corrected_physics_nsga_lane.py",
     "tools/mft_goal_turn_graded_physics_reranker.py",
@@ -1670,7 +1675,19 @@ def _corrected_scheduler_payload(
     command = str(payload["command"])
     if command.count(old) != 1:
         raise RuntimeError("diagnostic worker entrypoint replacement drifted")
-    payload["command"] = command.replace(old, new)
+    command = command.replace(old, new)
+    lines = command.splitlines()
+    if not lines or lines[0] != "set -euo pipefail":
+        raise RuntimeError("diagnostic worker shell prologue drifted")
+    thread_exports = [
+        f"export {name}={value}"
+        for name, value in NATIVE_THREAD_LIMITS.items()
+    ]
+    if any(name in command for name in NATIVE_THREAD_LIMITS):
+        raise RuntimeError("diagnostic worker thread environment is duplicated")
+    payload["command"] = "\n".join(
+        [lines[0], *thread_exports, *lines[1:]]
+    )
     return payload
 
 
