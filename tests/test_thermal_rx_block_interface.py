@@ -37,6 +37,52 @@ def test_unpaired_retained_rx_interfaces_are_rejected(tmp_path):
     assert coverage["unpaired_interfaces"] == ["interf150", "interf153"]
 
 
+def test_exact_6x60_unpaired_rx_main_forensic_signature_is_rejected(
+    tmp_path,
+):
+    path = tmp_path / "ThermalSetup.nc_cas"
+    path.write_text(
+        _case_text(
+            "(rx_main_block_yp_side_1_shadow wall "
+            "rx_main_block_xn_solid rx_main_block_yp_solid)",
+            "(rx_main_block_yp_side_1 wall "
+            "rx_main_block_yp_solid rx_main_block_xn_solid)",
+            "(rx_main_block_yp_side wall rx_main_block_yp_solid)",
+            "(rx_main_block_xn_side wall rx_main_block_xn_solid)",
+            "(interf160 wall rx_main_block_xn_solid)",
+            "(interf158 wall rx_main_block_yp_solid)",
+        ),
+        encoding="utf-8",
+    )
+
+    coverage = thermal._parse_thermal_rx_block_interface_case(
+        path, ["Rx_main_block_xn", "Rx_main_block_yp"]
+    )
+
+    assert coverage == {
+        "schema": thermal.THERMAL_RX_BLOCK_INTERFACE_CONTRACT_VERSION,
+        "passed": False,
+        "expected_rx_main_object_count": 2,
+        "expected_rx_main_objects": [
+            "Rx_main_block_xn",
+            "Rx_main_block_yp",
+        ],
+        "missing_rx_main_solids": [],
+        "missing_fluid_coupling": [
+            "Rx_main_block_xn",
+            "Rx_main_block_yp",
+        ],
+        "rx_main_adjacency_component_count": 1,
+        "rx_main_adjacency_components": [[
+            "rx_main_block_xn_solid",
+            "rx_main_block_yp_solid",
+        ]],
+        "rx_main_adjacency_passed": True,
+        "unpaired_interfaces": ["interf158", "interf160"],
+        "native_wall_record_count": 6,
+    }
+
+
 def test_paired_rx_fluid_and_block_coverage_is_accepted(tmp_path):
     path = tmp_path / "current.nc_cas"
     path.write_text(
@@ -210,6 +256,7 @@ def test_exact_eighth_rx_main_topology_uses_one_shared_mesh_operation():
     assert plan["shared_operation_count"] == 1
     assert operation["name"] == "rx_main_block_mesh_level"
     assert operation["objects"] == plan["rx_main_block_objects"]
+    assert operation["level"] == 5
     assert operation["shared_region"] is True
     assert operation["separate_objects"] is False
     assert (

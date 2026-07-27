@@ -3246,6 +3246,9 @@ class ThermalStabilityTest(unittest.TestCase):
             by_name["rx_main_block_mesh_level"]["separate_objects"],
             False,
         )
+        self.assertEqual(
+            by_name["rx_main_block_mesh_level"]["level"], 5
+        )
         self.assertIs(
             by_name["rx_side_block_mesh_level"]["separate_objects"],
             False,

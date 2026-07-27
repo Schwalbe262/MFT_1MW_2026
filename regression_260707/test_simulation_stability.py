@@ -4381,7 +4381,7 @@ class ThermalMeshPolicyTests(unittest.TestCase):
                 "Tx_main_wcp_1_p": 5,
             }, "wcp_assembly_mesh_level_1_p"),
             ({"tx_0": 4, "tx_1": 4}, "tx_mesh_level"),
-            ({"rx_main_block": 4}, "rx_main_block_mesh_level"),
+            ({"rx_main_block": 5}, "rx_main_block_mesh_level"),
             ({"rx_side_block": 5}, "rx_side_block_mesh_level"),
             ({"rx_main": 5}, "rx_main_retained_pack_mesh_level"),
             ({"rx_side": 5}, "rx_side_retained_pack_mesh_level"),
@@ -4458,7 +4458,7 @@ class ThermalMeshPolicyTests(unittest.TestCase):
         _assign_thermal_mesh(SimpleNamespace(mesh=mesh), objects)
 
         self.assertEqual(mesh.calls, [
-            ({"rx_main_block": 4}, "rx_main_block_mesh_level"),
+            ({"rx_main_block": 5}, "rx_main_block_mesh_level"),
             ({"Rx_side_0_0": 5}, "rx_side_retained_pack_mesh_level"),
         ])
         for operation in mesh.meshoperations:

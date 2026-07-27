@@ -86,9 +86,9 @@ _RX_INSULATION_KEYS = (
     "Rx_side2_insulation",
 )
 THERMAL_MESH_POLICY = (
-    "b6-rx-block-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+    "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
 )
-THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v7"
+THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v8"
 THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION = "thermal-mesh-preflight-v3"
 THERMAL_RX_BLOCK_INTERFACE_CONTRACT_VERSION = (
     "thermal-rx-block-interface-coverage-v1"
@@ -1686,8 +1686,17 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5, mode="full"):
     side_block_level = int(side_block_level)
     if side_block_level not in (4, 5):
         raise ValueError("side_block_level must be 4 or 5")
+    # The retained eighth-model Rx_main blocks meet at the pack corner while
+    # their remaining exterior faces must pair with the global fluid mesh.
+    # Native B6 evidence (6/60, geometry f7f6f289...) showed that level 4
+    # preserved the two solid zones and their mutual adjacency but left the
+    # exterior zones interf158/interf160 unpaired.  The geometrically
+    # equivalent side packs at level 5 produced paired solid/fluid walls.
+    # Keep one shared pack operation for block-to-block conformity, but use
+    # Icepak's finest predefined object level for the symmetry-clipped main
+    # pack so the global-fluid counterpart is retained.
     rx_block_specs = (
-        ("Rx_main_blocks", "rx_main_block_mesh_level", 4),
+        ("Rx_main_blocks", "rx_main_block_mesh_level", 5),
         ("Rx_side_blocks", "rx_side_block_mesh_level", side_block_level),
         ("Rx_side2_blocks", "rx_side2_block_mesh_level", side_block_level),
     )
