@@ -94,12 +94,8 @@ def _receipt_inventory(receipt_path: Path) -> tuple[set[int], str]:
     if (
         receipt.get("scheduler_post_count") != 60
         or len(tasks) != 60
-        or {int(row["seed"]) for row in tasks}
-        != set(range(2607264400, 2607264460))
-        or any(
-            not str(row.get("name") or "").startswith(NSGA_PREFIX)
-            for row in tasks
-        )
+        or {int(row["seed"]) for row in tasks} != set(range(2607264400, 2607264460))
+        or any(not str(row.get("name") or "").startswith(NSGA_PREFIX) for row in tasks)
     ):
         raise RuntimeError("corrected exact60 receipt inventory mismatch")
     task_ids = {int(row["task_id"]) for row in tasks}
@@ -141,9 +137,7 @@ def _replace_section(
 def _candidate_evidence(plan: Mapping[str, Any]) -> list[str]:
     selection = plan.get("selection") or {}
     candidates = (
-        selection.get("candidates")
-        or selection.get("selected_candidates")
-        or []
+        selection.get("candidates") or selection.get("selected_candidates") or []
     )
     if not isinstance(candidates, list):
         return []
@@ -172,17 +166,48 @@ def _candidate_evidence(plan: Mapping[str, Any]) -> list[str]:
                 B=float(raw.get("B_design_square_material_analytic_T", 0.0)),
                 fkhz=float(cap.get("physics_delta_fRx_mean_Hz", 0.0)) / 1000.0,
                 llt=float(split.get("Llt_mean_uH", 0.0)),
-                tx=float(
-                    (thermal.get("T_max_Tx") or {}).get("q90_upper_C", 0.0)
-                ),
-                core=float(
-                    (thermal.get("T_max_core") or {}).get(
-                        "q90_upper_C", 0.0
-                    )
-                ),
+                tx=float((thermal.get("T_max_Tx") or {}).get("q90_upper_C", 0.0)),
+                core=float((thermal.get("T_max_core") or {}).get("q90_upper_C", 0.0)),
             )
         )
     return evidence
+
+
+def _local_gui_section(status_path: Path) -> dict[str, Any]:
+    gui = _read_json(status_path)
+    state = str(gui.get("state") or "unknown")
+    completed = state == "solved_gui_held"
+    failed = state.startswith("failed")
+    ui_state = "completed" if completed else ("attention" if failed else "in_progress")
+    model = str(gui.get("model") or "unknown")
+    cores = int(gui.get("requested_cores") or 0)
+    evidence = [
+        f"state={state}",
+        f"model={model}",
+        f"requested CPU cores={cores}",
+        f"candidate SHA256={gui.get('candidate_sha256') or 'unknown'}",
+        f"source parameters={gui.get('source_parameter_path') or 'unknown'}",
+        "cooling contract=core plate 20T / winding plate 20T / fan 1.5 m/s",
+        "solver sequence=Matrix / turn-graded Rx C / Loss / Thermal",
+        "GUI is preserved after solve for result inspection",
+    ]
+    error = gui.get("error")
+    if error:
+        evidence.append(f"error={error}")
+    return {
+        "id": "active-compact-visible-gui-fea",
+        "title": (f"Compact 최우선 후보 · visible 1/8 GUI FEA | {state}"),
+        "detail": (
+            "1057.3×875.3×750 mm 형상구제 후보를 비라운드 1/8 대칭 "
+            "모델로 직접 검증합니다. 이 로컬 GUI 해석은 빠른 진단이며, "
+            "최종 생산 적합성은 인증된 Slurm FEA와 전역 Pareto 결과로 "
+            "확정합니다."
+        ),
+        "state": ui_state,
+        "updated_at": str(gui.get("updated_at_utc") or _now()),
+        "evidence": evidence,
+        "progress_pct": 100.0 if completed else (0.0 if failed else 65.0),
+    }
 
 
 def update(
@@ -193,6 +218,7 @@ def update(
     nsga_receipt: Path | None = None,
     fea_prefix: str = FEA_PREFIX,
     extra_fea_prefixes: Iterable[str] = (),
+    local_gui_status: Path | None = None,
 ) -> dict[str, Any]:
     status = _read_json(status_file)
     receipt_ids: set[int] | None = None
@@ -201,9 +227,7 @@ def update(
         receipt_ids, receipt_sha256 = _receipt_inventory(nsga_receipt)
     nsga_rows = _get_tasks(scheduler_url, NSGA_PREFIX, project=None)
     if receipt_ids is not None:
-        nsga_rows = [
-            row for row in nsga_rows if int(row["id"]) in receipt_ids
-        ]
+        nsga_rows = [row for row in nsga_rows if int(row["id"]) in receipt_ids]
     fea_rows_by_id: dict[int, dict[str, Any]] = {}
     for prefix in (fea_prefix, *extra_fea_prefixes):
         for row in _get_tasks(scheduler_url, prefix):
@@ -216,11 +240,7 @@ def update(
     candidates = _candidate_evidence(plan)
     now = _now()
 
-    nsga_state = (
-        "completed"
-        if nsga_counts.get("completed", 0) == 60
-        else "in_progress"
-    )
+    nsga_state = "completed" if nsga_counts.get("completed", 0) == 60 else "in_progress"
     nsga_detail = (
         "보정된 60-turn 물리 커패시턴스와 Lm=2 mH 공진 계약을 사용하는 "
         "exact-60 다중 시드 NSGA-II입니다. 모든 시드의 terminal 320행을 "
@@ -247,8 +267,7 @@ def update(
 
     fea_state = (
         "completed"
-        if planned_lanes > 0
-        and fea_counts.get("completed", 0) == planned_lanes
+        if planned_lanes > 0 and fea_counts.get("completed", 0) == planned_lanes
         else "in_progress"
     )
     fea_detail = (
@@ -283,28 +302,26 @@ def update(
             "state": nsga_state,
             "updated_at": now,
             "evidence": nsga_evidence,
-            "progress_pct": round(
-                100.0 * nsga_counts.get("completed", 0) / 60.0, 1
-            ),
+            "progress_pct": round(100.0 * nsga_counts.get("completed", 0) / 60.0, 1),
         },
     )
+    if local_gui_status is not None and local_gui_status.is_file():
+        current = _replace_section(
+            current,
+            _local_gui_section(local_gui_status),
+        )
     current = _replace_section(
         current,
         {
             "id": "active-core-rescue-symmetric-fea",
-            "title": (
-                "4·5그룹 core-rescue symmetric FEA | "
-                f"{_count_text(fea_counts)}"
-            ),
+            "title": (f"4·5그룹 core-rescue symmetric FEA | {_count_text(fea_counts)}"),
             "detail": fea_detail,
             "state": fea_state,
             "updated_at": now,
             "evidence": fea_evidence,
             "progress_pct": (
                 round(
-                    100.0
-                    * fea_counts.get("completed", 0)
-                    / float(planned_lanes),
+                    100.0 * fea_counts.get("completed", 0) / float(planned_lanes),
                     1,
                 )
                 if planned_lanes
@@ -336,6 +353,9 @@ def update(
         "fea_task_prefix": fea_prefix,
         "extra_fea_task_prefixes": list(extra_fea_prefixes),
         "core_rescue_plan": str(core_rescue_plan),
+        "local_gui_status": (
+            str(local_gui_status) if local_gui_status is not None else None
+        ),
     }
     _atomic_json(status_file, status)
     return status
@@ -344,13 +364,12 @@ def update(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--status-file", type=Path, required=True)
-    parser.add_argument(
-        "--scheduler-url", default="http://127.0.0.1:8002"
-    )
+    parser.add_argument("--scheduler-url", default="http://127.0.0.1:8002")
     parser.add_argument("--core-rescue-plan", type=Path, required=True)
     parser.add_argument("--nsga-receipt", type=Path)
     parser.add_argument("--fea-prefix", default=FEA_PREFIX)
     parser.add_argument("--extra-fea-prefix", action="append", default=[])
+    parser.add_argument("--local-gui-status", type=Path)
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--interval-seconds", type=float, default=15.0)
@@ -379,6 +398,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             nsga_receipt=args.nsga_receipt,
             fea_prefix=args.fea_prefix,
             extra_fea_prefixes=args.extra_fea_prefix,
+            local_gui_status=args.local_gui_status,
         )
         if not args.watch:
             return 0
