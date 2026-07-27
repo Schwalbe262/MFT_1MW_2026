@@ -1399,6 +1399,7 @@ def prepare_selection(
     output: Path,
     per_stratum: int = 4,
     physics_delta_model_path: Path | None = None,
+    approved_dielectric_stack_path: Path | None = None,
 ) -> dict[str, Any]:
     if isinstance(per_stratum, bool) or not 3 <= int(per_stratum) <= 4:
         raise StratifiedSelectionError(
@@ -1427,6 +1428,28 @@ def prepare_selection(
             "calibration_row_count": physics_delta_model[
                 "calibration_row_count"
             ],
+        }
+    approved_dielectric_stack: dict[str, Any] | None = None
+    approved_dielectric_stack_record: dict[str, Any] | None = None
+    if approved_dielectric_stack_path is not None:
+        stack_path = approved_dielectric_stack_path.resolve(strict=True)
+        raw_stack = _read_json(stack_path)
+        try:
+            approved_dielectric_stack = (
+                physics_reranker._validated_approved_dielectric_stack(  # noqa: SLF001
+                    raw_stack
+                )
+            )
+        except physics_reranker.RerankError as exc:
+            raise StratifiedSelectionError(
+                "approved dielectric-stack artifact is invalid"
+            ) from exc
+        approved_dielectric_stack_record = {
+            **_file_record(stack_path),
+            "payload_sha256": approved_dielectric_stack["payload_sha256"],
+            "schema_version": approved_dielectric_stack["schema_version"],
+            "case_id": approved_dielectric_stack["case_id"],
+            "approval": copy.deepcopy(approved_dielectric_stack["approval"]),
         }
     collections, deduplication = discover_and_deduplicate_collections(
         collector_roots
@@ -1496,6 +1519,24 @@ def prepare_selection(
                 )
                 _write_json(base_path, base)
                 _write_json(rx_path, rx_params)
+                dielectric_stack_sensitivity = None
+                if (
+                    physics_delta_model is not None
+                    and approved_dielectric_stack is not None
+                ):
+                    try:
+                        dielectric_stack_sensitivity = (
+                            physics_reranker.dielectric_stack_sensitivity(
+                                candidate["decoded"],
+                                physics_delta_model,
+                                approved_dielectric_stack,
+                            )
+                        )
+                    except physics_reranker.RerankError as exc:
+                        raise StratifiedSelectionError(
+                            "approved dielectric-stack sensitivity failed "
+                            f"for {candidate['physical_geometry_sha256']}"
+                        ) from exc
                 candidate_records.append(
                     {
                         key: copy.deepcopy(candidate[key])
@@ -1536,6 +1577,9 @@ def prepare_selection(
                             "calibrated_log_delta_q90_resonance_LCB"
                             if physics_delta_model is not None
                             else "uncalibrated_air_network_resonance_diagnostic"
+                        ),
+                        "approved_dielectric_stack_sensitivity": (
+                            dielectric_stack_sensitivity
                         ),
                         "base_params": _file_record(
                             base_path, relative_to=destination
@@ -1693,6 +1737,29 @@ def prepare_selection(
                         if physics_delta_model is not None
                         else "not_supplied_network_only_no_final_rerank_authority"
                     ),
+                    "approved_dielectric_stack_artifact": (
+                        approved_dielectric_stack_record
+                    ),
+                    "approved_dielectric_stack_API": (
+                        "mft_goal_turn_graded_physics_reranker."
+                        "dielectric_stack_sensitivity"
+                    ),
+                    "dielectric_stack_sensitivity_status": (
+                        "authenticated_stack_and_log_delta_model_applied"
+                        if (
+                            approved_dielectric_stack is not None
+                            and physics_delta_model is not None
+                        )
+                        else (
+                            "fail_closed_missing_log_delta_model"
+                            if approved_dielectric_stack is not None
+                            else "fail_closed_missing_approved_stack_artifact"
+                        )
+                    ),
+                    "dielectric_stack_sensitivity_ready": (
+                        approved_dielectric_stack is not None
+                        and physics_delta_model is not None
+                    ),
                     "selection_influence": (
                         "post-selection_parallel_FEA_execution_priority_only"
                     ),
@@ -1740,6 +1807,9 @@ def prepare_selection(
                             "explicit_approved_dielectric_stack_artifact",
                         ],
                         "approved_dielectric_stack_artifact_required": True,
+                        "approved_dielectric_stack_artifact": (
+                            approved_dielectric_stack_record
+                        ),
                         "unapproved_example_relative_permittivity_allowed": False,
                         "implicit_bulk_relative_permittivity_allowed": False,
                         "minimum_case_count": 6,
@@ -1748,6 +1818,10 @@ def prepare_selection(
                             "resonance_claim"
                         ),
                         "automatic_material_promotion_allowed": False,
+                        "sensitivity_API_ready": (
+                            approved_dielectric_stack is not None
+                            and physics_delta_model is not None
+                        ),
                     },
                     "final_top3_paired_Tx_Rx_required": True,
                     "scheduler_submission_performed": False,
@@ -1836,6 +1910,14 @@ def _parser() -> argparse.ArgumentParser:
             "parallel FEA execution priority"
         ),
     )
+    prepare.add_argument(
+        "--approved-dielectric-stack",
+        type=Path,
+        help=(
+            "Optional sealed, project-approved secondary interturn stack; "
+            "without it dielectric sensitivity remains fail-closed"
+        ),
+    )
     return parser
 
 
@@ -1848,6 +1930,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output=args.output,
         per_stratum=args.per_stratum,
         physics_delta_model_path=args.physics_delta_model,
+        approved_dielectric_stack_path=args.approved_dielectric_stack,
     )
     print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
     return 0
