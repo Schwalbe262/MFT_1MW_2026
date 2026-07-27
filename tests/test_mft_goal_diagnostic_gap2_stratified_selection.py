@@ -1,0 +1,290 @@
+from __future__ import annotations
+
+import copy
+from pathlib import Path
+
+import pytest
+
+from module.input_parameter_260706 import (
+    create_input_parameter,
+    get_drawing_default_params,
+)
+from module.mft_goal_20260726_contract import canonical_sha256
+from tools import mft_goal_diagnostic_gap2_stratified_selection as selection
+
+
+def _diversity_candidate(
+    token: str,
+    *,
+    corrected_c: float,
+    cw2: float,
+    gap2: float,
+    spread: float,
+) -> dict:
+    features = {
+        name: spread for name in selection.DIVERSITY_FEATURES
+    }
+    features.update({"cw2": cw2, "gap2": gap2})
+    return {
+        "physical_geometry_sha256": token * 64,
+        "corrected_acquisition_C_rx_rx_F_UCB_F": corrected_c,
+        "diversity_features": features,
+        # A raw-like diagnostic must have no influence on selection.
+        "diagnostic_raw_same_metric_C_rx_rx_F": 1e99,
+    }
+
+
+def _scientific_collection(task_id: int, seed: int) -> dict:
+    identities = {
+        name: character * 64
+        for name, character in zip(selection.IDENTITY_COLUMNS, "abcde")
+    }
+    record = {
+        "payload_sha256": f"{task_id:064x}",
+        "identities": identities,
+        "objective_columns": list(selection.OBJECTIVE_COLUMNS),
+        "physical_constraint_columns": [
+            selection.CORRECTED_CAP_PHYSICAL_COLUMN
+        ],
+        "normalized_constraint_columns": [
+            selection.CORRECTED_CAP_NORMALIZED_COLUMN
+        ],
+    }
+    return {
+        "task_id": task_id,
+        "seed": seed,
+        "record": record,
+        "record_path": Path(f"task-{task_id}/collection_record.json"),
+        "record_file_sha256": "f" * 64,
+        "profile_sha256": "1" * 64,
+        "geometry_constraint_profile_sha256": "2" * 64,
+        "physical_constraint_columns": record["physical_constraint_columns"],
+        "normalized_constraint_columns": record[
+            "normalized_constraint_columns"
+        ],
+        "capacitance_authority": {
+            "schema_version": selection.CAP_AUTHORITY_SCHEMA,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("gap2", "expected"),
+    [
+        (0.35, "low"),
+        (0.899, "low"),
+        (0.90, "mid"),
+        (1.449, "mid"),
+        (1.45, "high"),
+        (2.0, "high"),
+    ],
+)
+def test_gap_strata_have_explicit_nonoverlapping_boundaries(
+    gap2: float, expected: str
+) -> None:
+    assert selection._gap_stratum(gap2) == expected
+
+
+@pytest.mark.parametrize("gap2", [0.349999, 2.000001])
+def test_gap_strata_reject_out_of_band_values(gap2: float) -> None:
+    with pytest.raises(selection.StratifiedSelectionError):
+        selection._gap_stratum(gap2)
+
+
+def test_bounded_cap_contract_is_corrected_acquisition_only() -> None:
+    record = {
+        "raw_same_metric_C_rx_rx_F_UCB_gate_active": False,
+        "provisional_turn_graded_C_acquisition_gate_active": True,
+        "capacitance_screening_constraint_name": (
+            selection.CORRECTED_CAP_CONSTRAINT
+        ),
+        "authenticated_turn_graded_transfer_ratio": (
+            selection.CORRECTED_CAP_TRANSFER_RATIO
+        ),
+        "raw_two_net_C_physical_feasibility_authority": False,
+        "final_turn_graded_symmetric_FEA_required": True,
+        "raw_same_metric_C_rx_rx_F_front_classification": (
+            "provisional_corrected_single_truth_screening_only"
+        ),
+    }
+    authority = selection._validate_bounded_cap_contract(record)
+    assert authority["ratio_use"] == "surrogate_acquisition_only"
+    assert authority["raw_two_net_block_C_used_for_ranking"] is False
+    assert authority["raw_two_net_block_C_used_for_physical_truth"] is False
+
+    for drift in (
+        {"raw_same_metric_C_rx_rx_F_UCB_gate_active": True},
+        {"raw_two_net_C_physical_feasibility_authority": True},
+        {"authenticated_turn_graded_transfer_ratio": 0.75},
+    ):
+        invalid = {**record, **drift}
+        with pytest.raises(selection.StratifiedSelectionError):
+            selection._validate_bounded_cap_contract(invalid)
+
+
+def test_corrected_c_anchor_and_diversity_ignore_raw_block_metric() -> None:
+    candidates = [
+        _diversity_candidate(
+            "a", corrected_c=1.0e-10, cw2=0.5, gap2=0.5, spread=0.0
+        ),
+        _diversity_candidate(
+            "b", corrected_c=1.1e-10, cw2=0.51, gap2=0.51, spread=0.05
+        ),
+        _diversity_candidate(
+            "c", corrected_c=1.2e-10, cw2=0.9, gap2=0.85, spread=1.0
+        ),
+    ]
+    first = selection._select_diverse(copy.deepcopy(candidates), count=2)
+    changed_raw = copy.deepcopy(candidates)
+    for index, item in enumerate(changed_raw):
+        item["diagnostic_raw_same_metric_C_rx_rx_F"] = -float(index + 1)
+    second = selection._select_diverse(changed_raw, count=2)
+
+    assert [item["physical_geometry_sha256"] for item in first] == [
+        "a" * 64,
+        "c" * 64,
+    ]
+    assert [item["physical_geometry_sha256"] for item in second] == [
+        item["physical_geometry_sha256"] for item in first
+    ]
+    assert first[0]["corrected_acquisition_rank_in_stratum"] == 1
+    assert first[0]["selection_role"] == "minimum_corrected_acquisition_C"
+
+
+def test_missing_stratum_is_fail_closed_without_partial_fea_candidates() -> None:
+    eligible = [
+        {
+            **_diversity_candidate(
+                character,
+                corrected_c=(index + 1) * 1e-10,
+                cw2=0.5,
+                gap2=0.5,
+                spread=float(index),
+            ),
+            "gap2_stratum": "low",
+        }
+        for index, character in enumerate(("a", "b"))
+    ]
+    by_stratum, missing, proposed = selection._build_stratified_proposal(
+        eligible,
+        per_stratum=2,
+    )
+    assert len(by_stratum["low"]) == 2
+    assert missing == ["mid", "high"]
+    assert proposed == []
+
+
+def test_temperature_intersection_recovers_strict_100_120_120_limits() -> None:
+    physical = {
+        f"temperature_robust_limit:{target}": -10.0
+        for target in selection.TEMPERATURE_TARGET_LIMITS_C
+    }
+    evidence = selection._temperature_evidence(physical)
+    assert all(item["strict_margin_C"] == pytest.approx(0.0) for item in evidence.values())
+
+    primary = next(iter(selection.PRIMARY_WINDING_TEMPERATURE_TARGETS))
+    physical[f"temperature_robust_limit:{primary}"] = -9.999
+    with pytest.raises(selection.StratifiedSelectionError, match="exceeds strict"):
+        selection._temperature_evidence(physical)
+
+
+def test_seed_retry_dedupe_keeps_highest_authenticated_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "collector"
+    paths = {}
+    for task_id, seed in ((11, 4300), (12, 4300), (13, 4301)):
+        path = root / f"task-{task_id}" / "collection_record.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{}", encoding="utf-8")
+        collection = _scientific_collection(task_id, seed)
+        collection["record_path"] = path.resolve()
+        paths[path.resolve()] = collection
+
+    monkeypatch.setattr(
+        selection,
+        "authenticate_collection",
+        lambda path: copy.deepcopy(paths[path.resolve()]),
+    )
+    chosen, evidence = selection.discover_and_deduplicate_collections([root])
+    assert [(item["seed"], item["task_id"]) for item in chosen] == [
+        (4300, 12),
+        (4301, 13),
+    ]
+    assert evidence["discarded_retry_tasks"] == [
+        {
+            "seed": 4300,
+            "discarded_task_id": 11,
+            "retained_task_id": 12,
+            "reason": "higher_task_id_authenticated_retry_wins",
+            "discarded_collection_record_payload_sha256": f"{11:064x}",
+            "retained_collection_record_payload_sha256": f"{12:064x}",
+        }
+    ]
+
+
+def test_seed_retry_dedupe_rejects_profile_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "collector"
+    paths = {}
+    for task_id in (21, 22):
+        path = root / f"task-{task_id}" / "collection_record.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{}", encoding="utf-8")
+        collection = _scientific_collection(task_id, 4300)
+        collection["record_path"] = path.resolve()
+        paths[path.resolve()] = collection
+    paths[(root / "task-22" / "collection_record.json").resolve()][
+        "profile_sha256"
+    ] = "9" * 64
+    monkeypatch.setattr(
+        selection,
+        "authenticate_collection",
+        lambda path: copy.deepcopy(paths[path.resolve()]),
+    )
+    with pytest.raises(selection.StratifiedSelectionError, match="mix scientific"):
+        selection.discover_and_deduplicate_collections([root])
+
+
+def test_reviewed_rx_params_are_nonrounded_symmetric_and_60_turn_compatible() -> None:
+    params = get_drawing_default_params()
+    params.update(
+        {
+            "N1_main": 6,
+            "N1_side": 0,
+            "N2_main": 35,
+            "N2_side": 25,
+            "cw1": 5.0,
+            "gap1": 1.6,
+            "cw2": 0.8,
+            "gap2": 0.5,
+            "core_plate_t": 20.0,
+            "wcp_t": 20.0,
+            "n_core_group": 6,
+            "l2": 330.0,
+            "cc_w2c_space_x": 40.0,
+            "cc_w2c_space_y": 40.0,
+            "w2c_w1c_space_x": 40.0,
+            "w2c_w1c_space_y": 40.0,
+            "w1c_w2s_space_x": 20.0,
+            "w1s_cs_space_x": 40.0,
+            "cs_w1s_space_y": 40.0,
+        }
+    )
+    decoded = create_input_parameter(params).iloc[0].to_dict()
+    base, rx, compatibility = selection._reviewed_rx_turn_graded_params(decoded)
+
+    assert set(base) == set(selection.ALL_INPUT_KEYS)
+    assert set(rx) == set(selection.ALL_INPUT_KEYS)
+    assert rx["full_model"] == 0
+    assert rx["round_corner"] == 0
+    assert rx["matrix_on"] == 1
+    assert rx["cap_turn_graded_active_winding"] == "Rx"
+    assert rx["cap_turn_graded_section_order"] == "main,side"
+    assert rx["N2_main"] + rx["N2_side"] == 60
+    assert compatibility["explicit_turn_voltage_count"] == 60
+    assert compatibility["n_explicit_turns_field_not_repurposed"] is True
+    assert compatibility["profile_canonical_sha256"] == canonical_sha256(
+        selection.REVIEWED_TURN_GRADED_PROFILE
+    )
