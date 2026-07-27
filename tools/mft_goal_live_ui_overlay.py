@@ -22,7 +22,7 @@ import urllib.request
 
 PROJECT = "MFT_1MW_2026v1"
 NSGA_PREFIX = "mft-goal-physics-delta-nsga-"
-FEA_PREFIX = "mft-core-rescue-"
+FEA_PREFIX = "mft-core-rescue"
 ACTIVE = frozenset({"queued", "attaching", "running"})
 TERMINAL = frozenset({"completed", "failed", "cancelled"})
 
