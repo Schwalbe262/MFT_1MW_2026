@@ -259,6 +259,66 @@ def test_live_53_plus_47_baseline_dry_cycle_selects_zero(
     assert client.post_count == 0
 
 
+def test_cycle_cap_reserves_retry_slots_without_changing_deficit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    authority, plan, tasks = _fixture(tmp_path)
+    monkeypatch.setattr(
+        feeder,
+        "load_authority",
+        lambda _path: (authority, plan, tasks),
+    )
+    baseline: dict[int, dict[str, Any]] = {}
+    for index, row in enumerate(authority["base_tasks"]):
+        baseline[row["task_id"]] = _scheduler_row(
+            row["task_id"],
+            name=row["name"],
+            dedupe_key=row["dedupe_key"],
+            status="running" if index < 47 else "completed",
+        )
+    for row in authority["recovery_tasks"]:
+        baseline[row["task_id"]] = _scheduler_row(
+            row["task_id"],
+            name=row["name"],
+            dedupe_key=row["dedupe_key"],
+            status="completed",
+            account=row["requested_account"],
+        )
+    client = FakeScheduler(base=baseline)
+    cycle = feeder.run_cycle(
+        authority_path=tmp_path / "unused.json",
+        receipt_out=tmp_path / "dry-capped.json",
+        apply=False,
+        max_new_submissions=48,
+        scheduler=client,
+    )
+    assert cycle["active_before"] == 47
+    assert cycle["deficit_before"] == 53
+    assert cycle["max_new_submissions"] == 48
+    assert cycle["selected_seed_count"] == 48
+    assert cycle["selected_seeds"] == list(
+        range(
+            feeder.scout.CONTINUATION_SEED_START,
+            feeder.scout.CONTINUATION_SEED_START + 48,
+        )
+    )
+    assert client.post_count == 0
+
+
+@pytest.mark.parametrize("cap", [-1, 101, True])
+def test_cycle_rejects_invalid_new_submission_cap(
+    tmp_path: Path,
+    cap,
+) -> None:
+    with pytest.raises(RuntimeError, match="cap is invalid"):
+        feeder.run_cycle(
+            authority_path=tmp_path / "unused.json",
+            receipt_out=tmp_path / "unused-receipt.json",
+            max_new_submissions=cap,
+        )
+
+
 def test_cycle_receipts_resume_at_next_monotonic_index(
     tmp_path: Path,
 ) -> None:

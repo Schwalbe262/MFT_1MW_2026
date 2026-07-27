@@ -808,8 +808,15 @@ def run_cycle(
     authority_path: Path,
     receipt_out: Path,
     apply: bool = False,
+    max_new_submissions: int = MAXIMUM_POSTS_PER_CYCLE,
     scheduler: Scheduler | None = None,
 ) -> dict[str, Any]:
+    if (
+        isinstance(max_new_submissions, bool)
+        or not isinstance(max_new_submissions, int)
+        or not 0 <= max_new_submissions <= MAXIMUM_POSTS_PER_CYCLE
+    ):
+        raise RuntimeError("feeder new-submission cap is invalid")
     authority, plan, tasks = load_authority(authority_path)
     root = Path(authority["output_root"]).resolve(strict=True)
     client = scheduler or offload.SchedulerClient(authority["scheduler_url"])
@@ -916,7 +923,7 @@ def run_cycle(
             seed
             for seed in sorted(expected)
             if seed not in finalized and seed not in inventory
-        ][:deficit]
+        ][: min(deficit, max_new_submissions)]
         actions: list[dict[str, Any]] = list(recovered_actions)
         if apply:
             for seed in candidates:
@@ -994,6 +1001,7 @@ def run_cycle(
                 ],
                 "extension_active_count": extension_active,
                 "deficit_before": deficit,
+                "max_new_submissions": max_new_submissions,
                 "selected_seed_count": len(candidates),
                 "selected_seeds": candidates,
                 "actions": actions,
@@ -1142,6 +1150,11 @@ def _parser() -> argparse.ArgumentParser:
     cycle.add_argument("--authority", type=Path, required=True)
     cycle.add_argument("--receipt-out", type=Path, required=True)
     cycle.add_argument("--apply", action="store_true")
+    cycle.add_argument(
+        "--max-new-submissions",
+        type=int,
+        default=MAXIMUM_POSTS_PER_CYCLE,
+    )
     watch_parser = commands.add_parser("watch")
     watch_parser.add_argument("--authority", type=Path, required=True)
     watch_parser.add_argument("--poll-seconds", type=float, default=30.0)
@@ -1167,6 +1180,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             authority_path=args.authority,
             receipt_out=args.receipt_out,
             apply=args.apply,
+            max_new_submissions=args.max_new_submissions,
         )
         print(json.dumps(value, sort_keys=True))
     else:
