@@ -3850,3 +3850,62 @@ def test_cli_modes_and_default_interval() -> None:
         parser.parse_args([])
     with pytest.raises(SystemExit):
         parser.parse_args(["--once", "--watch"])
+
+
+def test_active_truth_replaces_fixed_gap_contract_without_false_post_claim() -> None:
+    cards = updater._active_truth_ui_cards(
+        observed_at="2026-07-27T12:00:00+09:00",
+        exact100={
+            "submitted_count": 100,
+            "receipt_path": "legacy-exact100-receipt.json",
+        },
+    )
+    by_id = {card["id"]: card for card in cards}
+
+    contract = by_id["codex-active-contract-20260727"]
+    contract_truth = " | ".join(
+        [contract["title"], contract["detail"], *contract["evidence"]]
+    )
+    assert "1200x900x750 UPPER BOUND" in contract_truth
+    assert "gap2 variable range=0.350..2.000mm" in contract_truth
+    assert "cw2 hard range=0.300..1.000mm" in contract_truth
+    assert "lower=upper=0.350" not in contract_truth
+    assert "gap2=0.350 mm hard-fixed" not in contract_truth
+
+    legacy = by_id["codex-active-exact100-gap2p35"]
+    legacy_truth = " | ".join(
+        [legacy["title"], legacy["detail"], *legacy["evidence"]]
+    )
+    assert "COLLECT-ONLY" in legacy_truth
+    assert "cancellation requested=false" in legacy_truth
+    assert "replacement-profile eligibility=false" in legacy_truth
+
+    replacement = by_id["codex-active-variable-gap2-cw2le1"]
+    replacement_truth = " | ".join(
+        [
+            replacement["title"],
+            replacement["detail"],
+            *replacement["evidence"],
+        ]
+    )
+    assert "SEEDS 2607264300..4399" in replacement_truth
+    assert "PRIORITY 100" in replacement_truth
+    assert "Scheduler POST count=0" in replacement_truth
+    assert "sealed receipt=none" in replacement_truth
+    assert "scientific PASS=false" in replacement_truth
+
+
+def test_active_truth_shows_smaller_points_as_unvalidated_not_passes() -> None:
+    cards = updater._active_truth_ui_cards(
+        observed_at="2026-07-27T12:00:00+09:00",
+        exact100={"submitted_count": 0, "receipt_path": None},
+    )
+    contract = next(
+        card
+        for card in cards
+        if card["id"] == "codex-active-contract-20260727"
+    )
+    value = " | ".join([contract["detail"], *contract["evidence"]])
+    assert "1040x899.86x695" in value
+    assert "983x899.24x695" in value
+    assert "not feasible and not FEA-validated" in value

@@ -8885,21 +8885,23 @@ def _active_truth_ui_cards(
         {
             "id": "codex-active-contract-20260727",
             "title": (
-                "ACTIVE HARD CONTRACT | 1200×900×750 | gap2 0.350 | "
-                "plates 20T/20T"
+                "ACTIVE HARD CONTRACT | 1200x900x750 UPPER BOUND | "
+                "gap2 0.35-2.00 | cw2 0.30-1.00"
             ),
             "detail": (
-                "현재 탐색에 적용되는 권위 계약입니다. 외형 W≤1200 mm, "
-                "L≤900 mm, H≤750 mm, 2차 턴간격 gap2=0.350 mm hard-fixed, "
-                "코어 냉각판과 권선 콜드플레이트는 각각 정확히 20 mm입니다. "
-                "온도 gate는 1차≤110°C, 2차≤130°C, 코어≤130°C입니다."
+                "1200 mm is an upper bound, not a target. The replacement "
+                "profile varies gap2 over 0.35..2.00 mm and hard-bounds cw2 "
+                "to 0.30..1.00 mm. Existing fixed-gap lanes are collect-only."
             ),
             "state": "in_progress",
             "updated_at": observed_at,
-            "progress_pct": 100,
+            "progress_pct": 35,
             "evidence": [
                 "envelope_mm: W<=1200 / L<=900 / H<=750",
-                "secondary interturn gap2=0.350mm / lower=upper=0.350 / hard-fixed",
+                "secondary interturn gap2 variable range=0.350..2.000mm",
+                "secondary conductor thickness cw2 hard range=0.300..1.000mm",
+                "smaller surrogate points exist near 1040x899.86x695 and 983x899.24x695mm",
+                "smaller points are not feasible and not FEA-validated",
                 "temperature_C: primary<=110 / secondary<=130 / core<=130",
                 "core cooling plate thickness=20.0mm exactly",
                 "winding cold-plate thickness=20.0mm exactly",
@@ -8910,15 +8912,15 @@ def _active_truth_ui_cards(
         {
             "id": "codex-active-exact100-gap2p35",
             "title": (
-                f"NSGA-II | LOGICAL {logical_seeds} | ATTEMPTS "
+                f"LEGACY gap2=0.350 COLLECT-ONLY | LOGICAL {logical_seeds} | ATTEMPTS "
                 f"{submitted_attempts} | ACTIVE {active_nonterminal} | "
                 f"INFRA-FAILED {infrastructure_failed} | RETRY "
                 f"{retry_identities}"
             ),
             "detail": (
-                "100개 독립 seed 캠페인을 준비·제출하는 활성 검색 lane입니다. "
-                "실제 POST를 증명하는 sealed receipt가 완전 검증되기 전에는 "
-                "Scheduler 제출 수를 추론하지 않고 0으로 표시합니다."
+                "Existing fixed-gap exact100 and retry attempts keep their "
+                "authenticated lifecycle counts and are not cancelled. They "
+                "are collect-only and cannot pass the replacement profile."
             ),
             "state": "in_progress",
             "updated_at": observed_at,
@@ -8926,9 +8928,9 @@ def _active_truth_ui_cards(
                 55 if retry_verified else (45 if phase == "SUBMITTED" else 15)
             ),
             "evidence": [
-                "active code revision=5823d475b9a6bf40fd709f4efca3f069e06bd722",
-                "seeds=2607264100..2607264199 / population=320 / generations=300",
-                "resources each=8CPU+65536MiB / max_workers_per_node=8 / priority=10",
+                "legacy code revision=5823d475b9a6bf40fd709f4efca3f069e06bd722",
+                "legacy seeds=2607264100..2607264199 / population=320 / generations=300",
+                "legacy resources each=8CPU+65536MiB / max_workers_per_node=8 / priority=10",
                 post_evidence,
                 (
                     f"receipt identities: logical_seeds={logical_seeds} / "
@@ -8938,10 +8940,36 @@ def _active_truth_ui_cards(
                     f"active_nonterminal={active_nonterminal}"
                 ),
                 *retry_evidence,
+                "lane mode=collect-only / cancellation requested=false",
+                "replacement-profile eligibility=false / new-profile POST claim=false",
                 (
                     "Scheduler repository/service modification=false / "
                     "MFT search bundle remains separate"
                 ),
+            ],
+        },
+        {
+            "id": "codex-active-variable-gap2-cw2le1",
+            "title": (
+                "NEW PROFILE PREPARING | SEEDS 2607264300..4399 | "
+                "PRIORITY 100 | POST0"
+            ),
+            "detail": (
+                "The replacement 100-seed lane is being built for variable "
+                "gap2 and cw2=0.30..1.00 mm. No sealed POST receipt exists, "
+                "so submitted=0 and no legacy counts are imported."
+            ),
+            "state": "in_progress",
+            "updated_at": observed_at,
+            "progress_pct": 15,
+            "evidence": [
+                "profile state=preparing / planned logical seeds=100",
+                "new-profile Scheduler POST count=0 / sealed receipt=none",
+                "seeds=2607264300..2607264399 / priority=100",
+                "gap2 search range=0.350..2.000mm / decoder resolution=0.001mm",
+                "cw2 hard range=0.300..1.000mm",
+                "legacy fixed-gap attempts imported=0 / collect-only separation=true",
+                "scientific PASS=false / final promotion=false",
             ],
         },
         {
@@ -8959,7 +8987,8 @@ def _active_truth_ui_cards(
             "evidence": [
                 "raw metric=C_rx_rx_F with all Rx turns tied to one equipotential net",
                 "interturn delta-V=0 in raw two-net solve / not an interturn metric",
-                "gap2 hard-fixed for manufacturability; raw-cap improvement is not the final validity basis",
+                "replacement gap2 range=0.350..2.000mm / cw2 range=0.300..1.000mm",
+                "legacy gap2=0.350mm results remain collect-only",
                 "required next gate=turn-graded FEA on top compact candidates",
                 "final 15kHz resonance claim prohibited until graded-cap verification",
             ],
@@ -9276,19 +9305,18 @@ def merge_status(
             "submitted" if exact100_submitted == 100 else "preparing"
         )
         result["summary"] = (
-            "현재 권위 계약: W≤1200 × L≤900 × H≤750 mm, "
-            "gap2=0.350 mm hard-fixed, 1차≤110°C, 2차/코어≤130°C, "
-            "코어·권선 냉각판=20T 고정. "
-            f"NSGA-II exact100={exact100_phase}, submitted "
-            f"{exact100_submitted}/100 (sealed POST receipt 기준). "
-            "raw 2-net capacitance는 interturn metric이 아니므로 provisional이며 "
-            "상위 후보 turn-graded FEA가 필요합니다. "
-            "16-core GUI legacy diagnostic은 HDF5 기준 49.999–136.247°C로 "
-            "검증됐지만 새 최종 설계 PASS는 아닙니다."
+            "Active replacement contract: W<=1200, L<=900, H<=750 mm "
+            "(upper bounds, not size targets); gap2=0.35..2.00 mm; "
+            "cw2=0.30..1.00 mm. Smaller surrogate points near "
+            "1040x899.86x695 and 983x899.24x695 mm exist but are not "
+            "feasible or FEA-validated. The old fixed-gap exact100 lane is "
+            f"{exact100_phase} with authenticated submitted count "
+            f"{exact100_submitted}/100 and is collect-only. The replacement "
+            "seed2607264300..4399 priority100 lane is preparing with POST0."
         )
         if active_exact100_retry_state is not None:
             result["summary"] = (
-                "Active compact NSGA-II: logical seeds "
+                "Legacy fixed-gap compact NSGA-II is collect-only: logical seeds "
                 f"{active_exact100_retry_state['logical_seed_count']}, "
                 "submitted attempts "
                 f"{active_exact100_retry_state['submitted_attempt_count']}, "
@@ -9298,6 +9326,11 @@ def merge_status(
                 f"{active_exact100_retry_state['retry_identity_count']}, "
                 "active nonterminal "
                 f"{active_exact100_retry_state['active_nonterminal_seed_count']}. "
+                "It is not cancelled. The active replacement profile uses "
+                "gap2=0.35..2.00 mm, cw2=0.30..1.00 mm, seeds "
+                "2607264300..4399 at priority100, and is preparing with "
+                "Scheduler POST0. Smaller surrogate points exist below "
+                "1200 mm width but are not feasible or FEA-validated. "
                 "Equal physical air gaps on all three core legs still require "
                 "symmetric FEA; final promotion remains false."
             )
