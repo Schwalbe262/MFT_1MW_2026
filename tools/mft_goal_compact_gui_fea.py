@@ -2,8 +2,9 @@
 
 This launcher is intentionally a local, inspectable diagnostic companion to
 the authenticated Slurm solve.  It preserves the selected geometry and fixed
-cooling contract, disables the separately-running capacitance stage, and
-leaves the solved AEDT project open for inspection.
+cooling contract, disables only the legacy raw two-net capacitance stage,
+retains the corrected turn-graded Rx capacitance stage, and leaves the solved
+AEDT project open for inspection.
 """
 
 from __future__ import annotations
@@ -165,8 +166,15 @@ def run(args: argparse.Namespace) -> int:
         "output_root": str(output_root),
         "requested_cores": int(args.cores),
         "model": "symmetric_eighth_nonrounded",
-        "solver_sequence": ["matrix", "loss", "thermal"],
-        "capacitance_stage": "disabled_parallel_slurm_lane_is_authoritative",
+        "solver_sequence": [
+            "matrix",
+            "cap_turn_graded_rx",
+            "loss",
+            "thermal",
+        ],
+        "capacitance_stage": (
+            "raw_two_net_disabled_turn_graded_rx_enabled"
+        ),
         "diagnostic_only": True,
         "production_truth_eligible": False,
     }
