@@ -1528,6 +1528,7 @@ def _project_bounded_secondary_bank(
         "total_length"
     )
     projected = []
+    projection_exhausted_rows: list[int] = []
     for index, source in enumerate(coordinates):
         coordinate = np.asarray(source, dtype=float).copy()
         for _attempt in range(8):
@@ -1600,9 +1601,11 @@ def _project_bounded_secondary_bank(
                 "gap2", required
             )
         else:
-            raise RuntimeError(
-                f"bounded secondary bank projection did not converge: {index}"
-            )
+            # The finalizer below has the stronger row repair, exact-stratum
+            # donor replacement, and a complete hard-band audit.  Preserve a
+            # row that exhausts this inexpensive first pass so that finalizer
+            # can close it instead of aborting an otherwise valid seed bank.
+            projection_exhausted_rows.append(index)
         projected.append(coordinate)
     finalized, final_projection = _finalize_bounded_secondary_coordinates(
         problem,
@@ -1631,6 +1634,9 @@ def _project_bounded_secondary_bank(
         for topology in contract["turn_split_topologies_N2_main"]
     }
     result["bounded_secondary_final_projection"] = final_projection
+    result["bounded_secondary_projection_exhausted_rows"] = (
+        projection_exhausted_rows
+    )
     result.pop("sha256", None)
     result["sha256"] = canonical_sha256(result)
     initialization = contract["initialization"]
