@@ -3877,7 +3877,8 @@ def test_active_truth_replaces_fixed_gap_contract_without_false_post_claim() -> 
         [legacy["title"], legacy["detail"], *legacy["evidence"]]
     )
     assert "COLLECT-ONLY" in legacy_truth
-    assert "cancellation requested=false" in legacy_truth
+    assert "cancellation before new receipt=false" in legacy_truth
+    assert "conditional cutover planned" in legacy_truth
     assert "replacement-profile eligibility=false" in legacy_truth
 
     replacement = by_id["codex-active-variable-gap2-cw2le1"]

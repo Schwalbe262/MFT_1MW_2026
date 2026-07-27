@@ -8919,8 +8919,9 @@ def _active_truth_ui_cards(
             ),
             "detail": (
                 "Existing fixed-gap exact100 and retry attempts keep their "
-                "authenticated lifecycle counts and are not cancelled. They "
-                "are collect-only and cannot pass the replacement profile."
+                "authenticated lifecycle counts and are currently collect-only. "
+                "There is no cancellation before a sealed/read-back-verified "
+                "replacement receipt; a conditional cutover is planned after it."
             ),
             "state": "in_progress",
             "updated_at": observed_at,
@@ -8940,7 +8941,8 @@ def _active_truth_ui_cards(
                     f"active_nonterminal={active_nonterminal}"
                 ),
                 *retry_evidence,
-                "lane mode=collect-only / cancellation requested=false",
+                "lane mode=collect-only / cancellation before new receipt=false",
+                "conditional cutover planned after sealed/read-back replacement receipt",
                 "replacement-profile eligibility=false / new-profile POST claim=false",
                 (
                     "Scheduler repository/service modification=false / "
@@ -9326,7 +9328,9 @@ def merge_status(
                 f"{active_exact100_retry_state['retry_identity_count']}, "
                 "active nonterminal "
                 f"{active_exact100_retry_state['active_nonterminal_seed_count']}. "
-                "It is not cancelled. The active replacement profile uses "
+                "No cancellation occurs before the sealed/read-back replacement "
+                "receipt; conditional cutover is planned after it. The active "
+                "replacement profile uses "
                 "gap2=0.35..2.00 mm, cw2=0.30..1.00 mm, seeds "
                 "2607264300..4399 at priority100, and is preparing with "
                 "Scheduler POST0. Smaller surrogate points exist below "
