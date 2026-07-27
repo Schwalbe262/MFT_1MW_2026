@@ -63,7 +63,11 @@ ALIGNED_BANK_PROOF_SCHEMA = "mft-goal-diagnostic-aligned-bank-proof-v1"
 RAW_CRX_CONSTRAINT_NAME = (
     "diagnostic_raw_same_metric_C_rx_rx_F_q90_ucb_maximum"
 )
+PROVISIONAL_TURN_GRADED_C_ACQUISITION_CONSTRAINT_NAME = (
+    "diagnostic_turn_graded_transfer_C_rx_rx_F_acquisition_maximum"
+)
 RAW_CRX_UCB_MAXIMUM_F = 5.553658e-10
+AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO = 0.7597014146941471
 PROFILE_SEED_STARTS = {
     20: 2_607_264_100,
     30: 2_607_264_200,
@@ -76,6 +80,24 @@ FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM = 5.0
 FIXED_PRIMARY_INTERTURN_GAP_MM = 1.6
 FIXED_SECONDARY_TURNS = 60
 FIXED_SECONDARY_INTERTURN_GAP_MM = 0.35
+VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM = 0.35
+VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM = 2.0
+VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM = 0.001
+SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM = 0.3
+SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM = 1.0
+SECONDARY_GAP_MODE_FIXED = "fixed_gap2p35"
+SECONDARY_GAP_MODE_BOUNDED = "bounded_gap2_cw2"
+SECONDARY_GAP_MODES = (
+    SECONDARY_GAP_MODE_FIXED,
+    SECONDARY_GAP_MODE_BOUNDED,
+)
+SECONDARY_GAP_BAND_CONSTRAINT_NAME = (
+    "diagnostic_secondary_interturn_gap_realized_band"
+)
+SECONDARY_CONDUCTOR_BAND_CONSTRAINT_NAME = (
+    "diagnostic_secondary_conductor_thickness_band"
+)
+VARIABLE_SECONDARY_PROFILE_SCHEDULER_PRIORITY = 100
 FIXED_CORE_PLATE_THICKNESS_MM = 20.0
 FIXED_WINDING_COLD_PLATE_THICKNESS_MM = 20.0
 REQUIRED_WINDING_HEIGHT_OVERLAP_RATIO = 1.0
@@ -221,10 +243,20 @@ def _authorized_profile_seed_start(
     return requested_seed_start
 
 
-def _search_profile_id(clearance: int, seed_start: int) -> str:
+def _search_profile_id(
+    clearance: int,
+    seed_start: int,
+    secondary_gap_mode: str = SECONDARY_GAP_MODE_FIXED,
+) -> str:
+    if secondary_gap_mode == SECONDARY_GAP_MODE_FIXED:
+        secondary = "gap2p35"
+    elif secondary_gap_mode == SECONDARY_GAP_MODE_BOUNDED:
+        secondary = "gap2p35to2p00-cw2p30to1p00-priority100"
+    else:
+        raise RuntimeError("diagnostic secondary-gap mode is invalid")
     stem = (
         f"l900-temp110-130-130-hard-equal-hgap{clearance}-"
-        "gap2p35-plates20-exact100"
+        f"{secondary}-plates20-exact100"
     )
     if seed_start == PROFILE_SEED_STARTS[clearance]:
         return stem
@@ -236,6 +268,7 @@ def _build_search_profile(
     *,
     geometry_profile: Mapping[str, Any],
     authorized_seed_start: int | None = None,
+    secondary_gap_mode: str = SECONDARY_GAP_MODE_FIXED,
 ) -> dict[str, Any]:
     geometry = preflight.validate_goal_geometry_constraint_profile(
         geometry_profile
@@ -264,9 +297,54 @@ def _build_search_profile(
     ):
         raise RuntimeError("raw C_rx_rx_F calibration cohort is incomplete")
     effective_constraints = _effective_constraint_profile()
+    if secondary_gap_mode not in SECONDARY_GAP_MODES:
+        raise RuntimeError("diagnostic secondary-gap mode is invalid")
+    cap_contract = {
+        "constraint_name": RAW_CRX_CONSTRAINT_NAME,
+        "target": "C_rx_rx_F",
+        "measurement_identity": (
+            "authenticated_strict_full_raw_two_net_CapMatrix_C_rx_rx_F"
+        ),
+        "turn_graded_or_corrected_metric_used": False,
+        "statistic": "surrogate_mu_plus_q90_conformal_half_width",
+        "maximum_F": RAW_CRX_UCB_MAXIMUM_F,
+        "optimizer_hard_gate_active": True,
+        "constraint_value": "UCB_F/maximum_F-1",
+        "predictor_conformal_argument": True,
+        "model_artifact_sha256": model_sha,
+        "model_metadata_sha256": meta_sha,
+        "dataset_sha256": runner.authenticated.evidence["dataset"]["sha256"],
+        "calibration_recovery_status": recovery["status"],
+        "calibration_row_count": int(recovery["row_count"]),
+    }
+    if secondary_gap_mode == SECONDARY_GAP_MODE_BOUNDED:
+        cap_contract.update(
+            {
+                "constraint_name": (
+                    PROVISIONAL_TURN_GRADED_C_ACQUISITION_CONSTRAINT_NAME
+                ),
+                "turn_graded_or_corrected_metric_used": True,
+                "statistic": (
+                    "raw_two_net_q90_ucb_times_authenticated_"
+                    "turn_graded_transfer_ratio"
+                ),
+                "constraint_value": (
+                    "UCB_F*turn_graded_transfer_ratio/maximum_F-1"
+                ),
+                "turn_graded_transfer_ratio": (
+                    AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
+                ),
+                "gate_role": "provisional_acquisition_screening_only",
+                "physical_feasibility_authority": False,
+                "raw_two_net_physical_feasibility_claim_allowed": False,
+                "final_turn_graded_symmetric_FEA_required": True,
+            }
+        )
     value = {
         "schema_version": SEARCH_PROFILE_SCHEMA,
-        "profile_id": _search_profile_id(clearance, seed_start),
+        "profile_id": _search_profile_id(
+            clearance, seed_start, secondary_gap_mode
+        ),
         "fixed_primary_turns": FIXED_PRIMARY_TURNS,
         "fixed_secondary_turns": FIXED_SECONDARY_TURNS,
         "turns_ratio_N2_over_N1": 10.0,
@@ -275,9 +353,6 @@ def _build_search_profile(
         ),
         "fixed_primary_interturn_gap_mm": (
             FIXED_PRIMARY_INTERTURN_GAP_MM
-        ),
-        "fixed_secondary_interturn_gap_mm": (
-            FIXED_SECONDARY_INTERTURN_GAP_MM
         ),
         "fixed_core_plate_thickness_mm": FIXED_CORE_PLATE_THICKNESS_MM,
         "fixed_winding_cold_plate_thickness_mm": (
@@ -300,26 +375,7 @@ def _build_search_profile(
         "authorized_seed_end_inclusive": (
             seed_start + PROFILE_SEED_COUNT - 1
         ),
-        "raw_same_metric_capacitance_gate": {
-            "constraint_name": RAW_CRX_CONSTRAINT_NAME,
-            "target": "C_rx_rx_F",
-            "measurement_identity": (
-                "authenticated_strict_full_raw_two_net_CapMatrix_C_rx_rx_F"
-            ),
-            "turn_graded_or_corrected_metric_used": False,
-            "statistic": "surrogate_mu_plus_q90_conformal_half_width",
-            "maximum_F": RAW_CRX_UCB_MAXIMUM_F,
-            "optimizer_hard_gate_active": True,
-            "constraint_value": "UCB_F/maximum_F-1",
-            "predictor_conformal_argument": True,
-            "model_artifact_sha256": model_sha,
-            "model_metadata_sha256": meta_sha,
-            "dataset_sha256": runner.authenticated.evidence["dataset"][
-                "sha256"
-            ],
-            "calibration_recovery_status": recovery["status"],
-            "calibration_row_count": int(recovery["row_count"]),
-        },
+        "raw_same_metric_capacitance_gate": cap_contract,
         "fixed_lm2mh_resonance_contract_sha256": (
             preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
         ),
@@ -331,7 +387,51 @@ def _build_search_profile(
         "production_eligible": False,
         "final_design_claim_allowed": False,
     }
+    if secondary_gap_mode == SECONDARY_GAP_MODE_FIXED:
+        value["fixed_secondary_interturn_gap_mm"] = (
+            FIXED_SECONDARY_INTERTURN_GAP_MM
+        )
+    else:
+        value["secondary_interturn_gap_search_mm"] = {
+            "minimum": VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM,
+            "maximum": VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM,
+            "step": VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM,
+            "decoder_native_minimum": 0.3,
+            "decoder_native_maximum": 2.0,
+            "realized_band_constraint_name": (
+                SECONDARY_GAP_BAND_CONSTRAINT_NAME
+            ),
+        }
+        value["secondary_conductor_thickness_search_mm"] = {
+            "minimum": SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM,
+            "maximum": SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM,
+            "hard_constraint_name": (
+                SECONDARY_CONDUCTOR_BAND_CONSTRAINT_NAME
+            ),
+        }
+        value["scheduler_priority"] = (
+            VARIABLE_SECONDARY_PROFILE_SCHEDULER_PRIORITY
+        )
     return goal_launch._seal(value)
+
+
+def _secondary_gap_mode_from_profile(
+    profile: Mapping[str, Any],
+) -> str:
+    fixed = "fixed_secondary_interturn_gap_mm" in profile
+    bounded_keys = {
+        "secondary_interturn_gap_search_mm",
+        "secondary_conductor_thickness_search_mm",
+        "scheduler_priority",
+    }
+    bounded = bounded_keys.issubset(profile)
+    if fixed == bounded:
+        raise RuntimeError("diagnostic secondary-gap profile is ambiguous")
+    return (
+        SECONDARY_GAP_MODE_FIXED
+        if fixed
+        else SECONDARY_GAP_MODE_BOUNDED
+    )
 
 
 def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -357,6 +457,7 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
             "diagnostic manufacturing search profile mismatch"
         ) from exc
     cap = profile.get("raw_same_metric_capacitance_gate") or {}
+    secondary_gap_mode = _secondary_gap_mode_from_profile(profile)
     expected_keys = {
         "schema_version",
         "profile_id",
@@ -365,7 +466,6 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         "turns_ratio_N2_over_N1",
         "fixed_primary_conductor_thickness_mm",
         "fixed_primary_interturn_gap_mm",
-        "fixed_secondary_interturn_gap_mm",
         "fixed_core_plate_thickness_mm",
         "fixed_winding_cold_plate_thickness_mm",
         "effective_constraint_profile",
@@ -386,6 +486,55 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         "final_design_claim_allowed",
         "payload_sha256",
     }
+    if secondary_gap_mode == SECONDARY_GAP_MODE_FIXED:
+        expected_keys.add("fixed_secondary_interturn_gap_mm")
+        secondary_contract_valid = (
+            profile.get("fixed_secondary_interturn_gap_mm")
+            == FIXED_SECONDARY_INTERTURN_GAP_MM
+        )
+    else:
+        expected_keys.update(
+            {
+                "secondary_interturn_gap_search_mm",
+                "secondary_conductor_thickness_search_mm",
+                "scheduler_priority",
+            }
+        )
+        gap_search = profile.get("secondary_interturn_gap_search_mm") or {}
+        conductor_search = (
+            profile.get("secondary_conductor_thickness_search_mm") or {}
+        )
+        secondary_contract_valid = (
+            set(gap_search)
+            == {
+                "minimum",
+                "maximum",
+                "step",
+                "decoder_native_minimum",
+                "decoder_native_maximum",
+                "realized_band_constraint_name",
+            }
+            and gap_search.get("minimum")
+            == VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
+            and gap_search.get("maximum")
+            == VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+            and gap_search.get("step")
+            == VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM
+            and gap_search.get("decoder_native_minimum") == 0.3
+            and gap_search.get("decoder_native_maximum") == 2.0
+            and gap_search.get("realized_band_constraint_name")
+            == SECONDARY_GAP_BAND_CONSTRAINT_NAME
+            and set(conductor_search)
+            == {"minimum", "maximum", "hard_constraint_name"}
+            and conductor_search.get("minimum")
+            == SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM
+            and conductor_search.get("maximum")
+            == SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+            and conductor_search.get("hard_constraint_name")
+            == SECONDARY_CONDUCTOR_BAND_CONSTRAINT_NAME
+            and profile.get("scheduler_priority")
+            == VARIABLE_SECONDARY_PROFILE_SCHEDULER_PRIORITY
+        )
     cap_keys = {
         "constraint_name",
         "target",
@@ -402,6 +551,34 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         "calibration_recovery_status",
         "calibration_row_count",
     }
+    if secondary_gap_mode == SECONDARY_GAP_MODE_BOUNDED:
+        cap_keys.update(
+            {
+                "turn_graded_transfer_ratio",
+                "gate_role",
+                "physical_feasibility_authority",
+                "raw_two_net_physical_feasibility_claim_allowed",
+                "final_turn_graded_symmetric_FEA_required",
+            }
+        )
+        expected_cap_name = (
+            PROVISIONAL_TURN_GRADED_C_ACQUISITION_CONSTRAINT_NAME
+        )
+        expected_cap_statistic = (
+            "raw_two_net_q90_ucb_times_authenticated_"
+            "turn_graded_transfer_ratio"
+        )
+        expected_cap_constraint = (
+            "UCB_F*turn_graded_transfer_ratio/maximum_F-1"
+        )
+        corrected_metric_expected = True
+    else:
+        expected_cap_name = RAW_CRX_CONSTRAINT_NAME
+        expected_cap_statistic = (
+            "surrogate_mu_plus_q90_conformal_half_width"
+        )
+        expected_cap_constraint = "UCB_F/maximum_F-1"
+        corrected_metric_expected = False
     digest_fields = (
         "model_artifact_sha256",
         "model_metadata_sha256",
@@ -410,7 +587,9 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
     if (
         set(profile) != expected_keys
         or profile.get("profile_id")
-        != _search_profile_id(clearance, authorized_seed_start)
+        != _search_profile_id(
+            clearance, authorized_seed_start, secondary_gap_mode
+        )
         or profile.get("fixed_primary_turns") != FIXED_PRIMARY_TURNS
         or profile.get("fixed_secondary_turns") != FIXED_SECONDARY_TURNS
         or profile.get("turns_ratio_N2_over_N1") != 10.0
@@ -418,8 +597,7 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         != FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM
         or profile.get("fixed_primary_interturn_gap_mm")
         != FIXED_PRIMARY_INTERTURN_GAP_MM
-        or profile.get("fixed_secondary_interturn_gap_mm")
-        != FIXED_SECONDARY_INTERTURN_GAP_MM
+        or not secondary_contract_valid
         or profile.get("fixed_core_plate_thickness_mm")
         != FIXED_CORE_PLATE_THICKNESS_MM
         or profile.get("fixed_winding_cold_plate_thickness_mm")
@@ -439,13 +617,13 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         or profile.get("authorized_seed_end_inclusive")
         != authorized_seed_start + PROFILE_SEED_COUNT - 1
         or set(cap) != cap_keys
-        or cap.get("constraint_name") != RAW_CRX_CONSTRAINT_NAME
+        or cap.get("constraint_name") != expected_cap_name
         or cap.get("target") != "C_rx_rx_F"
         or cap.get("measurement_identity")
         != "authenticated_strict_full_raw_two_net_CapMatrix_C_rx_rx_F"
-        or cap.get("turn_graded_or_corrected_metric_used") is not False
-        or cap.get("statistic")
-        != "surrogate_mu_plus_q90_conformal_half_width"
+        or cap.get("turn_graded_or_corrected_metric_used")
+        is not corrected_metric_expected
+        or cap.get("statistic") != expected_cap_statistic
         or not math.isclose(
             float(cap.get("maximum_F", 0.0)),
             RAW_CRX_UCB_MAXIMUM_F,
@@ -453,7 +631,7 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
             abs_tol=0.0,
         )
         or cap.get("optimizer_hard_gate_active") is not True
-        or cap.get("constraint_value") != "UCB_F/maximum_F-1"
+        or cap.get("constraint_value") != expected_cap_constraint
         or cap.get("predictor_conformal_argument") is not True
         or any(
             not isinstance(cap.get(name), str)
@@ -465,6 +643,22 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         or isinstance(cap.get("calibration_row_count"), bool)
         or not isinstance(cap.get("calibration_row_count"), int)
         or cap["calibration_row_count"] < 1
+        or (
+            secondary_gap_mode == SECONDARY_GAP_MODE_BOUNDED
+            and (
+                cap.get("turn_graded_transfer_ratio")
+                != AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
+                or cap.get("gate_role")
+                != "provisional_acquisition_screening_only"
+                or cap.get("physical_feasibility_authority") is not False
+                or cap.get(
+                    "raw_two_net_physical_feasibility_claim_allowed"
+                )
+                is not False
+                or cap.get("final_turn_graded_symmetric_FEA_required")
+                is not True
+            )
+        )
         or profile.get("fixed_lm2mh_resonance_contract_sha256")
         != preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
         or profile.get("temperature_contract_sha256")
@@ -485,6 +679,7 @@ def _install_search_profile(
     import numpy as np
 
     profile = _validate_search_profile(search_profile)
+    secondary_gap_mode = _secondary_gap_mode_from_profile(profile)
     if getattr(problem, "_diagnostic_search_profile_installed", False):
         raise RuntimeError("diagnostic search profile was already installed")
     if problem.geometry_constraint_profile_sha256 != profile[
@@ -537,11 +732,23 @@ def _install_search_profile(
             "gap1", FIXED_PRIMARY_INTERTURN_GAP_MM
         )
     )
-    gap2_coordinate = float(
-        problem._unit_from_physical(
-            "gap2", FIXED_SECONDARY_INTERTURN_GAP_MM
+    if secondary_gap_mode == SECONDARY_GAP_MODE_FIXED:
+        gap2_coordinate_lower = gap2_coordinate_upper = float(
+            problem._unit_from_physical(
+                "gap2", FIXED_SECONDARY_INTERTURN_GAP_MM
+            )
         )
-    )
+    else:
+        gap2_coordinate_lower = float(
+            problem._unit_from_physical(
+                "gap2", VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
+            )
+        )
+        gap2_coordinate_upper = float(
+            problem._unit_from_physical(
+                "gap2", VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+            )
+        )
     core_plate_coordinate = float(
         problem._unit_from_physical(
             "core_plate_t", FIXED_CORE_PLATE_THICKNESS_MM
@@ -556,8 +763,8 @@ def _install_search_profile(
     problem.xu[cw1_index] = cw1_coordinate
     problem.xl[gap1_index] = gap1_coordinate
     problem.xu[gap1_index] = gap1_coordinate
-    problem.xl[gap2_index] = gap2_coordinate
-    problem.xu[gap2_index] = gap2_coordinate
+    problem.xl[gap2_index] = gap2_coordinate_lower
+    problem.xu[gap2_index] = gap2_coordinate_upper
     problem.xl[core_plate_index] = core_plate_coordinate
     problem.xu[core_plate_index] = core_plate_coordinate
     problem.xl[wcp_index] = wcp_coordinate
@@ -567,13 +774,26 @@ def _install_search_profile(
     base_names = tuple(problem.constraint_names)
     base_index = dict(problem.constraint_index)
     base_count = int(problem.n_ieq_constr)
-    if RAW_CRX_CONSTRAINT_NAME in base_names:
-        raise RuntimeError("raw C_rx_rx_F gate already exists")
-    effective_names = (*base_names, RAW_CRX_CONSTRAINT_NAME)
+    cap_contract = profile["raw_same_metric_capacitance_gate"]
+    cap_constraint_name = cap_contract["constraint_name"]
+    if cap_constraint_name in base_names:
+        raise RuntimeError("diagnostic C_rx_rx_F acquisition gate already exists")
+    secondary_constraint_names = (
+        ()
+        if secondary_gap_mode == SECONDARY_GAP_MODE_FIXED
+        else (
+            SECONDARY_GAP_BAND_CONSTRAINT_NAME,
+            SECONDARY_CONDUCTOR_BAND_CONSTRAINT_NAME,
+        )
+    )
+    effective_names = (
+        *base_names,
+        cap_constraint_name,
+        *secondary_constraint_names,
+    )
     effective_index = {
         name: index for index, name in enumerate(effective_names)
     }
-    cap_contract = profile["raw_same_metric_capacitance_gate"]
     cap_limit = float(cap_contract["maximum_F"])
 
     def profiled_evaluate(
@@ -602,6 +822,12 @@ def _install_search_profile(
             raise RuntimeError("diagnostic profiled evaluation shape mismatch")
         indices = np.flatnonzero(valid)
         cap_g = np.full(len(valid), preflight.BIG, dtype=float)
+        gap2_band_g = np.full(len(valid), preflight.BIG, dtype=float)
+        cw2_band_g = np.full(len(valid), preflight.BIG, dtype=float)
+        raw_diagnostic = np.full(len(valid), np.nan, dtype=float)
+        acquisition_diagnostic = np.full(
+            len(valid), np.nan, dtype=float
+        )
         if len(indices):
             sub = frame.iloc[indices]
             for local_index in range(len(sub)):
@@ -618,12 +844,6 @@ def _install_search_profile(
                     or not math.isclose(
                         float(row["gap1"]),
                         FIXED_PRIMARY_INTERTURN_GAP_MM,
-                        rel_tol=0.0,
-                        abs_tol=1e-12,
-                    )
-                    or not math.isclose(
-                        float(row["gap2"]),
-                        FIXED_SECONDARY_INTERTURN_GAP_MM,
                         rel_tol=0.0,
                         abs_tol=1e-12,
                     )
@@ -649,6 +869,43 @@ def _install_search_profile(
                     raise RuntimeError(
                         "diagnostic fixed manufacturing controls escaped"
                     )
+                gap2 = float(row["gap2"])
+                cw2 = float(row["cw2"])
+                if secondary_gap_mode == SECONDARY_GAP_MODE_FIXED:
+                    if not math.isclose(
+                        gap2,
+                        FIXED_SECONDARY_INTERTURN_GAP_MM,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    ):
+                        raise RuntimeError(
+                            "diagnostic fixed secondary gap escaped"
+                        )
+                else:
+                    gap2_band_g[indices[local_index]] = max(
+                        (
+                            VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
+                            / gap2
+                        )
+                        - 1.0,
+                        (
+                            gap2
+                            / VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+                        )
+                        - 1.0,
+                    )
+                    cw2_band_g[indices[local_index]] = max(
+                        (
+                            SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM
+                            / cw2
+                        )
+                        - 1.0,
+                        (
+                            cw2
+                            / SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+                        )
+                        - 1.0,
+                    )
             problem._prediction_cache = {}
             try:
                 mean, half_width = problem._predict("C_rx_rx_F", sub)
@@ -663,8 +920,20 @@ def _install_search_profile(
                 or np.any(ucb <= 0.0)
             ):
                 raise RuntimeError("raw C_rx_rx_F UCB inference is invalid")
-            cap_g[indices] = ucb / cap_limit - 1.0
-        out["G"] = np.column_stack((constraints, cap_g))
+            acquisition_ucb = ucb.copy()
+            if secondary_gap_mode == SECONDARY_GAP_MODE_BOUNDED:
+                acquisition_ucb *= AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
+            cap_g[indices] = acquisition_ucb / cap_limit - 1.0
+            raw_diagnostic[indices] = ucb
+            acquisition_diagnostic[indices] = acquisition_ucb
+        out["diagnostic_raw_two_net_C_rx_rx_F_q90_ucb"] = raw_diagnostic
+        out[
+            "diagnostic_provisional_turn_graded_C_rx_rx_F_q90_ucb"
+        ] = acquisition_diagnostic
+        columns = [constraints, cap_g]
+        if secondary_gap_mode == SECONDARY_GAP_MODE_BOUNDED:
+            columns.extend((gap2_band_g, cw2_band_g))
+        out["G"] = np.column_stack(columns)
 
     base_contract = copy.deepcopy(problem.hard_constraint_contract)
     if canonical_sha256(base_contract) != problem.hard_constraint_contract_sha256:
@@ -691,7 +960,12 @@ def _install_search_profile(
     effective_contract["temperature_contract_sha256"] = (
         effective_constraints["temperature_contract_sha256"]
     )
-    effective_contract["raw_same_metric_capacitance_gate"] = copy.deepcopy(
+    capacitance_contract_key = (
+        "raw_same_metric_capacitance_gate"
+        if secondary_gap_mode == SECONDARY_GAP_MODE_FIXED
+        else "provisional_turn_graded_C_acquisition_gate"
+    )
+    effective_contract[capacitance_contract_key] = copy.deepcopy(
         cap_contract
     )
     effective_contract["screening_only"] = True
@@ -706,6 +980,25 @@ def _install_search_profile(
     )
     problem._diagnostic_search_profile_installed = True
     problem._diagnostic_search_profile = profile
+    if secondary_gap_mode == SECONDARY_GAP_MODE_FIXED:
+        secondary_installation = {
+            "gap2_coordinate_index": gap2_index,
+            "gap2_coordinate": gap2_coordinate_lower,
+            "raw_C_rx_rx_F_UCB_gate_installed": True,
+        }
+    else:
+        secondary_installation = {
+            "gap2_coordinate_index": gap2_index,
+            "gap2_coordinate_lower": gap2_coordinate_lower,
+            "gap2_coordinate_upper": gap2_coordinate_upper,
+            "secondary_gap_mode": secondary_gap_mode,
+            "secondary_constraint_names": list(
+                secondary_constraint_names
+            ),
+            "raw_C_rx_rx_F_UCB_gate_installed": False,
+            "provisional_turn_graded_C_acquisition_gate_installed": True,
+            "final_turn_graded_symmetric_FEA_required": True,
+        }
     evidence = goal_launch._seal(
         {
             "schema_version": SEARCH_PROFILE_INSTALLATION_SCHEMA,
@@ -732,15 +1025,13 @@ def _install_search_profile(
             "cw1_coordinate": cw1_coordinate,
             "gap1_coordinate_index": gap1_index,
             "gap1_coordinate": gap1_coordinate,
-            "gap2_coordinate_index": gap2_index,
-            "gap2_coordinate": gap2_coordinate,
+            **secondary_installation,
             "core_plate_t_coordinate_index": core_plate_index,
             "core_plate_t_coordinate": core_plate_coordinate,
             "wcp_t_coordinate_index": wcp_index,
             "wcp_t_coordinate": wcp_coordinate,
             "fixed_primary_turns": FIXED_PRIMARY_TURNS,
             "fixed_secondary_turns": FIXED_SECONDARY_TURNS,
-            "raw_C_rx_rx_F_UCB_gate_installed": True,
             "constraint_names": list(effective_names),
             "screening_only": True,
             "production_eligible": False,
@@ -757,6 +1048,7 @@ def _aligned_bank_proof(
     import numpy as np
 
     profile = _validate_search_profile(search_profile)
+    secondary_gap_mode = _secondary_gap_mode_from_profile(profile)
     values = np.asarray(bank.get("coordinates"), dtype=float)
     repaired = np.asarray(problem.repair_unit_coordinates(values), dtype=float)
     if values.ndim != 2 or not np.array_equal(values, repaired):
@@ -772,6 +1064,8 @@ def _aligned_bank_proof(
     overlaps: list[float] = []
     height_differences: list[float] = []
     h_gap1: list[float] = []
+    secondary_gaps: list[float] = []
+    secondary_conductor_thicknesses: list[float] = []
     exterior_dimensions: list[tuple[float, float, float]] = []
     for index in range(len(frame)):
         row = frame.iloc[index]
@@ -781,8 +1075,26 @@ def _aligned_bank_proof(
         overlaps.append(overlap)
         height_differences.append(abs(nwh1 - nwh2))
         h_gap1.append(float(row["h_gap1"]))
+        secondary_gaps.append(float(row["gap2"]))
+        secondary_conductor_thicknesses.append(float(row["cw2"]))
         _volume, dimensions = problem._goal_bounding_box_lit(row)
         exterior_dimensions.append(tuple(map(float, dimensions)))
+        if secondary_gap_mode == SECONDARY_GAP_MODE_FIXED:
+            secondary_controls_valid = math.isclose(
+                secondary_gaps[-1],
+                FIXED_SECONDARY_INTERTURN_GAP_MM,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        else:
+            secondary_controls_valid = (
+                VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
+                <= secondary_gaps[-1]
+                <= VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+                and SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM
+                <= secondary_conductor_thicknesses[-1]
+                <= SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+            )
         if (
             height_differences[-1]
             > MAXIMUM_DECODED_WINDING_HEIGHT_DIFFERENCE_MM
@@ -811,12 +1123,7 @@ def _aligned_bank_proof(
                 rel_tol=0.0,
                 abs_tol=1e-12,
             )
-            or not math.isclose(
-                float(row["gap2"]),
-                FIXED_SECONDARY_INTERTURN_GAP_MM,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
+            or not secondary_controls_valid
             or int(row["N1_main"]) + int(row["N1_side"])
             != FIXED_PRIMARY_TURNS
             or int(row["N2_main"]) + int(row["N2_side"])
@@ -833,14 +1140,14 @@ def _aligned_bank_proof(
                 f"row={index},h_gap1={h_gap1[-1]},overlap={overlap},"
                 f"height_difference={height_differences[-1]},"
                 f"cw1={float(row['cw1'])},gap1={float(row['gap1'])},"
-                f"gap2={float(row['gap2'])},"
+                f"gap2={secondary_gaps[-1]},"
+                f"cw2={secondary_conductor_thicknesses[-1]},"
                 f"core_plate_t={float(row['core_plate_t'])},"
                 f"wcp_t={float(row['wcp_t'])},"
                 f"N1={int(row['N1_main']) + int(row['N1_side'])},"
                 f"N2={int(row['N2_main']) + int(row['N2_side'])}"
             )
-    return goal_launch._seal(
-        {
+    proof = {
             "schema_version": ALIGNED_BANK_PROOF_SCHEMA,
             "search_profile_payload_sha256": profile["payload_sha256"],
             "geometry_constraint_profile_sha256": profile[
@@ -863,10 +1170,6 @@ def _aligned_bank_proof(
             "all_rows_repair_fixed_points": True,
             "all_rows_decoder_valid": True,
             "all_rows_manufacturing_controls_attested": True,
-            "fixed_secondary_interturn_gap_mm": (
-                FIXED_SECONDARY_INTERTURN_GAP_MM
-            ),
-            "all_rows_gap2_exactly_fixed": True,
             "maximum_exterior_W_mm": max(
                 dimensions[0] for dimensions in exterior_dimensions
             ),
@@ -880,7 +1183,42 @@ def _aligned_bank_proof(
             "all_rows_L900_envelope_verified": True,
             "exact_equal_initialization_and_repair_verified": True,
         }
-    )
+    if secondary_gap_mode == SECONDARY_GAP_MODE_FIXED:
+        # Keep the original fixed-gap proof byte-compatible so already staged
+        # bundles still recompute to their sealed authority.
+        proof["fixed_secondary_interturn_gap_mm"] = (
+            FIXED_SECONDARY_INTERTURN_GAP_MM
+        )
+        proof["all_rows_gap2_exactly_fixed"] = True
+    else:
+        proof.update(
+            {
+                "secondary_gap_mode": SECONDARY_GAP_MODE_BOUNDED,
+                "allowed_secondary_interturn_gap_mm": {
+                    "minimum": VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM,
+                    "maximum": VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM,
+                },
+                "minimum_realized_secondary_interturn_gap_mm": min(
+                    secondary_gaps
+                ),
+                "maximum_realized_secondary_interturn_gap_mm": max(
+                    secondary_gaps
+                ),
+                "all_rows_gap2_within_allowed_band": True,
+                "allowed_secondary_conductor_thickness_mm": {
+                    "minimum": SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM,
+                    "maximum": SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM,
+                },
+                "minimum_realized_secondary_conductor_thickness_mm": min(
+                    secondary_conductor_thicknesses
+                ),
+                "maximum_realized_secondary_conductor_thickness_mm": max(
+                    secondary_conductor_thicknesses
+                ),
+                "all_rows_cw2_within_allowed_band": True,
+            }
+        )
+    return goal_launch._seal(proof)
 
 
 def _seed_interval(seed_start: int, seed_count: int) -> list[int]:
@@ -1242,6 +1580,7 @@ def prepare(args: argparse.Namespace) -> Path:
         runner,
         geometry_profile=geometry_profile,
         authorized_seed_start=seed_start,
+        secondary_gap_mode=args.secondary_gap_mode,
     )
     expected_seeds = list(
         range(
@@ -1813,7 +2152,23 @@ def execute(args: argparse.Namespace) -> Path:
             ),
             "raw_same_metric_C_rx_rx_F_UCB_gate_active": (
                 search_profile is not None
+                and _secondary_gap_mode_from_profile(search_profile)
+                == SECONDARY_GAP_MODE_FIXED
             ),
+            "provisional_turn_graded_C_acquisition_gate_active": (
+                search_profile is not None
+                and _secondary_gap_mode_from_profile(search_profile)
+                == SECONDARY_GAP_MODE_BOUNDED
+            ),
+            "authenticated_turn_graded_transfer_ratio": (
+                None
+                if search_profile is None
+                or _secondary_gap_mode_from_profile(search_profile)
+                == SECONDARY_GAP_MODE_FIXED
+                else AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
+            ),
+            "raw_two_net_C_physical_feasibility_authority": False,
+            "final_turn_graded_symmetric_FEA_required": True,
             "resonance_contract_schema": (
                 preflight.GOAL_FIXED_LM_RESONANCE_SCHEMA
             ),
@@ -1890,6 +2245,11 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         choices=(20.0, 30.0, 40.0),
         default=20.0,
+    )
+    prepare_parser.add_argument(
+        "--secondary-gap-mode",
+        choices=SECONDARY_GAP_MODES,
+        default=SECONDARY_GAP_MODE_FIXED,
     )
     prepare_parser.add_argument("--output", type=Path, required=True)
     prepare_parser.set_defaults(handler=prepare)

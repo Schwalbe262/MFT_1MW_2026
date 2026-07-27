@@ -268,6 +268,17 @@ def _exact_task_inventory(
     activation_sha = activation["payload_sha256"]
     contract_sha = activation["compact_search_contract_sha256"]
     bank_sha = activation["compact_coordinate_bank_sha256"]
+    search_profile = activation.get("manufacturing_search_profile")
+    secondary_gap_mode = (
+        scout.SECONDARY_GAP_MODE_FIXED
+        if search_profile is None
+        else scout._secondary_gap_mode_from_profile(search_profile)
+    )
+    scheduler_priority = (
+        SCHEDULER_PRIORITY
+        if secondary_gap_mode == scout.SECONDARY_GAP_MODE_FIXED
+        else scout.VARIABLE_SECONDARY_PROFILE_SCHEDULER_PRIORITY
+    )
     model_sha = source_identity["evaluation_model_sha256"]
     dataset_sha = source_identity["dataset_sha256"]
     quality_sha = source_identity["quality_status_sha256"]
@@ -327,6 +338,8 @@ def _exact_task_inventory(
         "geometry_constraint_profile_sha256": activation.get(
             "geometry_constraint_profile_sha256"
         ),
+        "secondary_gap_mode": secondary_gap_mode,
+        "scheduler_priority": scheduler_priority,
     }
     return ordered, common
 
@@ -779,7 +792,42 @@ def build_plan(
                     "fixed_winding_cold_plate_thickness_mm": (
                         scout.FIXED_WINDING_COLD_PLATE_THICKNESS_MM
                     ),
-                    "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+                    **(
+                        {
+                            "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+                        }
+                        if common["secondary_gap_mode"]
+                        == scout.SECONDARY_GAP_MODE_FIXED
+                        else {
+                            "raw_same_metric_C_rx_rx_F_UCB_gate_active": False,
+                            "provisional_turn_graded_C_acquisition_gate_active": (
+                                True
+                            ),
+                            "authenticated_turn_graded_transfer_ratio": (
+                                scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
+                            ),
+                            "secondary_interturn_gap_search_mm": {
+                                "minimum": (
+                                    scout.VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
+                                ),
+                                "maximum": (
+                                    scout.VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+                                ),
+                                "step": (
+                                    scout.VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM
+                                ),
+                            },
+                            "secondary_conductor_thickness_search_mm": {
+                                "minimum": (
+                                    scout.SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM
+                                ),
+                                "maximum": (
+                                    scout.SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+                                ),
+                            },
+                            "final_turn_graded_symmetric_FEA_required": True,
+                        }
+                    ),
                 }
             ),
         },
@@ -828,7 +876,8 @@ def build_plan(
         "task_paths": [str(path) for path in task_paths],
         "relocation_sources": relocation_sources,
         "scheduler_claim_root": str(plan_dir / "scheduler-claims"),
-        "scheduler_priority": SCHEDULER_PRIORITY,
+        "secondary_gap_mode": common["secondary_gap_mode"],
+        "scheduler_priority": common["scheduler_priority"],
         "screening_only": True,
         "production_eligible": False,
         "final_design_claim_allowed": False,
@@ -891,7 +940,45 @@ def _validate_deployment_inventory(
                 "fixed_winding_cold_plate_thickness_mm": (
                     scout.FIXED_WINDING_COLD_PLATE_THICKNESS_MM
                 ),
-                "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+                **(
+                    {
+                        "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+                    }
+                    if plan.get(
+                        "secondary_gap_mode",
+                        scout.SECONDARY_GAP_MODE_FIXED,
+                    )
+                    == scout.SECONDARY_GAP_MODE_FIXED
+                    else {
+                        "raw_same_metric_C_rx_rx_F_UCB_gate_active": False,
+                        "provisional_turn_graded_C_acquisition_gate_active": (
+                            True
+                        ),
+                        "authenticated_turn_graded_transfer_ratio": (
+                            scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
+                        ),
+                        "secondary_interturn_gap_search_mm": {
+                            "minimum": (
+                                scout.VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
+                            ),
+                            "maximum": (
+                                scout.VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+                            ),
+                            "step": (
+                                scout.VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM
+                            ),
+                        },
+                        "secondary_conductor_thickness_search_mm": {
+                            "minimum": (
+                                scout.SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM
+                            ),
+                            "maximum": (
+                                scout.SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+                            ),
+                        },
+                        "final_turn_graded_symmetric_FEA_required": True,
+                    }
+                ),
             }
         )
     expected_resources = {
@@ -912,7 +999,21 @@ def _validate_deployment_inventory(
     if (
         deployment.get("execution_contract") != expected_execution
         or plan.get("recommended_resources") != expected_resources
-        or plan.get("scheduler_priority") != SCHEDULER_PRIORITY
+        or plan.get(
+            "secondary_gap_mode",
+            scout.SECONDARY_GAP_MODE_FIXED,
+        )
+        not in scout.SECONDARY_GAP_MODES
+        or plan.get("scheduler_priority")
+        != (
+            SCHEDULER_PRIORITY
+            if plan.get(
+                "secondary_gap_mode",
+                scout.SECONDARY_GAP_MODE_FIXED,
+            )
+            == scout.SECONDARY_GAP_MODE_FIXED
+            else scout.VARIABLE_SECONDARY_PROFILE_SCHEDULER_PRIORITY
+        )
         or not local_plan_dir.is_absolute()
         or claim_root != local_plan_dir / "scheduler-claims"
         or not isinstance(bundle_id, str)
@@ -1135,6 +1236,14 @@ def authenticate_plan(
         != plan.get("manufacturing_search_profile_payload_sha256")
         or common.get("geometry_constraint_profile_sha256")
         != plan.get("geometry_constraint_profile_sha256")
+        or common.get(
+            "secondary_gap_mode", scout.SECONDARY_GAP_MODE_FIXED
+        )
+        != plan.get(
+            "secondary_gap_mode", scout.SECONDARY_GAP_MODE_FIXED
+        )
+        or common.get("scheduler_priority", SCHEDULER_PRIORITY)
+        != plan.get("scheduler_priority", SCHEDULER_PRIORITY)
     ):
         raise RuntimeError("diagnostic plan/bundle source binding mismatch")
     claim_authority = _load_claim_root(plan=plan, tasks=tasks)
@@ -1160,6 +1269,13 @@ def authenticate_plan(
             ),
             "geometry_constraint_profile_sha256": plan.get(
                 "geometry_constraint_profile_sha256"
+            ),
+            "secondary_gap_mode": plan.get(
+                "secondary_gap_mode",
+                scout.SECONDARY_GAP_MODE_FIXED,
+            ),
+            "scheduler_priority": plan.get(
+                "scheduler_priority", SCHEDULER_PRIORITY
             ),
             "fixed_primary_turns": FIXED_PRIMARY_TURNS,
             "compact_search_contract_sha256": common[
@@ -1205,13 +1321,23 @@ def scheduler_payload(
     *,
     plan: Mapping[str, Any],
     task: Mapping[str, Any],
-    priority: int = 10,
+    priority: int | None = None,
 ) -> dict[str, Any]:
+    expected_priority = int(
+        plan.get("scheduler_priority", SCHEDULER_PRIORITY)
+    )
+    effective_priority = (
+        expected_priority if priority is None else priority
+    )
     if (
-        isinstance(priority, bool)
-        or not isinstance(priority, int)
-        or priority != SCHEDULER_PRIORITY
-        or plan.get("scheduler_priority") != SCHEDULER_PRIORITY
+        isinstance(effective_priority, bool)
+        or not isinstance(effective_priority, int)
+        or effective_priority != expected_priority
+        or expected_priority
+        not in {
+            SCHEDULER_PRIORITY,
+            scout.VARIABLE_SECONDARY_PROFILE_SCHEDULER_PRIORITY,
+        }
     ):
         raise RuntimeError("diagnostic Scheduler priority authority mismatch")
     seed = int(task["seed"])
@@ -1258,7 +1384,7 @@ def scheduler_payload(
         "scheduling_profile": "standard",
         "aedt_backend": "standalone",
         "gpus": 0,
-        "priority": int(priority),
+        "priority": int(effective_priority),
         "timeout_seconds": TIMEOUT_SECONDS,
         "max_workers_per_node": MAX_WORKERS_PER_NODE,
     }
@@ -1329,7 +1455,9 @@ def _claim_root_authority(
         payload = scheduler_payload(
             plan=plan,
             task=task,
-            priority=SCHEDULER_PRIORITY,
+            priority=int(
+                plan.get("scheduler_priority", SCHEDULER_PRIORITY)
+            ),
         )
         inventory.append(
             {
@@ -1938,7 +2066,7 @@ def submit(
     accounts_path: Path = DEFAULT_ACCOUNTS,
     scheduler_source: Path = DEFAULT_SCHEDULER_SOURCE,
     staging_account: str = DEFAULT_STAGING_ACCOUNT,
-    priority: int = SCHEDULER_PRIORITY,
+    priority: int | None = None,
     apply: bool = False,
     receipt_out: Path | None = None,
     client: SchedulerClient | Any | None = None,
@@ -2324,7 +2452,7 @@ def _parser() -> argparse.ArgumentParser:
         "--scheduler-source", type=Path, default=DEFAULT_SCHEDULER_SOURCE
     )
     auth.add_argument("--staging-account", default=DEFAULT_STAGING_ACCOUNT)
-    auth.add_argument("--priority", type=int, default=10)
+    auth.add_argument("--priority", type=int)
     submit_parser = commands.add_parser("submit")
     submit_parser.add_argument("--plan", type=Path, required=True)
     submit_parser.add_argument(
@@ -2337,7 +2465,7 @@ def _parser() -> argparse.ArgumentParser:
     submit_parser.add_argument(
         "--staging-account", default=DEFAULT_STAGING_ACCOUNT
     )
-    submit_parser.add_argument("--priority", type=int, default=10)
+    submit_parser.add_argument("--priority", type=int)
     submit_parser.add_argument("--receipt-out", type=Path)
     submit_parser.add_argument("--apply", action="store_true")
     return parser

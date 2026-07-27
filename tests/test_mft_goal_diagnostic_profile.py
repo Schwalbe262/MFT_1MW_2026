@@ -75,6 +75,32 @@ def _profile(clearance: int = 20) -> dict:
     return launch._seal(value)
 
 
+def _bounded_profile() -> dict:
+    class Authenticated:
+        report = {
+            "artifacts": {
+                "C_rx_rx_F/models.pkl": "1" * 64,
+                "C_rx_rx_F/meta.json": "2" * 64,
+            },
+            "capacitance_recovery": {
+                "status": scout.adapter.RECOVERY_STATUS,
+                "eligible_row_count": 6151,
+                "row_count": 6151,
+            },
+        }
+        evidence = {"dataset": {"sha256": "3" * 64}}
+
+    class Runner:
+        authenticated = Authenticated()
+
+    return scout._build_search_profile(
+        Runner(),
+        geometry_profile=scout._geometry_profile(20),
+        authorized_seed_start=2_607_264_300,
+        secondary_gap_mode=scout.SECONDARY_GAP_MODE_BOUNDED,
+    )
+
+
 def test_geometry_profile_sha_and_seed_authority_are_exact() -> None:
     for clearance in (20, 30, 40):
         profile = _profile(clearance)
@@ -109,6 +135,32 @@ def test_search_profile_rejects_secondary_gap_drift() -> None:
     unsigned["fixed_secondary_interturn_gap_mm"] = 0.351
     with pytest.raises(RuntimeError, match="search profile mismatch"):
         scout._validate_search_profile(launch._seal(unsigned))
+
+
+def test_bounded_secondary_profile_is_disjoint_and_strict() -> None:
+    profile = _bounded_profile()
+    assert scout._validate_search_profile(profile) == profile
+    assert profile["authorized_seed_start"] == 2_607_264_300
+    assert profile["authorized_seed_end_inclusive"] == 2_607_264_399
+    assert profile["scheduler_priority"] == 100
+    assert profile["secondary_interturn_gap_search_mm"] == {
+        "minimum": 0.35,
+        "maximum": 2.0,
+        "step": 0.001,
+        "decoder_native_minimum": 0.3,
+        "decoder_native_maximum": 2.0,
+        "realized_band_constraint_name": (
+            scout.SECONDARY_GAP_BAND_CONSTRAINT_NAME
+        ),
+    }
+    assert profile["secondary_conductor_thickness_search_mm"] == {
+        "minimum": 0.3,
+        "maximum": 1.0,
+        "hard_constraint_name": (
+            scout.SECONDARY_CONDUCTOR_BAND_CONSTRAINT_NAME
+        ),
+    }
+    assert "fixed_secondary_interturn_gap_mm" not in profile
 
 
 def test_search_profile_accepts_only_aligned_hgap20_continuations() -> None:
@@ -231,8 +283,9 @@ def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None
             out["decoder_valid"] = np.ones(count, dtype=bool)
             out["frame"] = pd.DataFrame(
                 {
-                    "cw1": np.full(count, 5.0),
-                    "gap1": np.full(count, 1.6),
+                        "cw1": np.full(count, 5.0),
+                        "cw2": np.full(count, 0.8),
+                        "gap1": np.full(count, 1.6),
                     "gap2": np.full(count, 0.35),
                     "core_plate_t": np.full(count, 20.0),
                     "wcp_t": np.full(count, 20.0),
@@ -254,3 +307,100 @@ def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None
     assert np.all(problem.xl == problem.xu)
     assert evidence["gap2_coordinate_index"] == 1
     assert evidence["gap2_coordinate"] == 0.35
+
+
+def test_bounded_aligned_bank_proof_attests_realized_secondary_bands() -> None:
+    profile = _bounded_profile()
+
+    class Problem:
+        @staticmethod
+        def repair_unit_coordinates(values):
+            return np.asarray(values, dtype=float)
+
+        @staticmethod
+        def decode_batch(values):
+            count = len(values)
+            return (
+                pd.DataFrame(
+                    {
+                        "nwh1": np.full(count, 600.0),
+                        "nwh2": np.full(count, 600.0),
+                        "h_gap1": np.full(count, 20.0),
+                        "cw1": np.full(count, 5.0),
+                        "cw2": np.linspace(0.3, 1.0, count),
+                        "gap1": np.full(count, 1.6),
+                        "gap2": np.linspace(0.35, 2.0, count),
+                        "core_plate_t": np.full(count, 20.0),
+                        "wcp_t": np.full(count, 20.0),
+                        "N1_main": np.full(count, 6),
+                        "N1_side": np.zeros(count),
+                        "N2_main": np.full(count, 37),
+                        "N2_side": np.full(count, 23),
+                    }
+                ),
+                np.ones(count),
+                np.ones(count, dtype=bool),
+            )
+
+        @staticmethod
+        def _goal_bounding_box_lit(_row):
+            return 1.0, (1100.0, 890.0, 700.0)
+
+    coordinates = np.zeros((2, 5))
+    proof = scout._aligned_bank_proof(
+        Problem(),
+        {"coordinates": coordinates.tolist(), "sha256": "4" * 64},
+        profile,
+    )
+    assert proof["secondary_gap_mode"] == scout.SECONDARY_GAP_MODE_BOUNDED
+    assert proof["minimum_realized_secondary_interturn_gap_mm"] == 0.35
+    assert proof["maximum_realized_secondary_interturn_gap_mm"] == 2.0
+    assert proof["minimum_realized_secondary_conductor_thickness_mm"] == 0.3
+    assert proof["maximum_realized_secondary_conductor_thickness_mm"] == 1.0
+    assert proof["all_rows_gap2_within_allowed_band"] is True
+    assert proof["all_rows_cw2_within_allowed_band"] is True
+
+
+def test_bounded_aligned_bank_proof_rejects_cw2_escape() -> None:
+    profile = _bounded_profile()
+
+    class Problem:
+        @staticmethod
+        def repair_unit_coordinates(values):
+            return np.asarray(values, dtype=float)
+
+        @staticmethod
+        def decode_batch(values):
+            count = len(values)
+            return (
+                pd.DataFrame(
+                    {
+                        "nwh1": np.full(count, 600.0),
+                        "nwh2": np.full(count, 600.0),
+                        "h_gap1": np.full(count, 20.0),
+                        "cw1": np.full(count, 5.0),
+                        "cw2": np.full(count, 1.001),
+                        "gap1": np.full(count, 1.6),
+                        "gap2": np.full(count, 0.35),
+                        "core_plate_t": np.full(count, 20.0),
+                        "wcp_t": np.full(count, 20.0),
+                        "N1_main": np.full(count, 6),
+                        "N1_side": np.zeros(count),
+                        "N2_main": np.full(count, 37),
+                        "N2_side": np.full(count, 23),
+                    }
+                ),
+                np.ones(count),
+                np.ones(count, dtype=bool),
+            )
+
+        @staticmethod
+        def _goal_bounding_box_lit(_row):
+            return 1.0, (1100.0, 890.0, 700.0)
+
+    with pytest.raises(RuntimeError, match="bank profile proof failed"):
+        scout._aligned_bank_proof(
+            Problem(),
+            {"coordinates": [[0.0] * 5], "sha256": "4" * 64},
+            profile,
+        )
