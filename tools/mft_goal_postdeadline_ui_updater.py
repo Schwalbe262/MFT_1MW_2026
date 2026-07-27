@@ -854,7 +854,9 @@ NEW_AXIS_PRODUCTION_PARETO = 0
 NEW_AXIS_COMPACT_SURROGATE_MIN_WINDING_C = 302.67
 COMPACT_DESIGN_CONTRACT_COMMIT = "ccdaa7d"
 COMPACT_SEARCH_READINESS_COMMIT = "bc63ec5"
-COMPACT_SEARCH_RELATED_TEST_COUNT = 71
+COMPACT_SEARCH_AUTH_COMMIT = "fcbefeb"
+COMPACT_SEARCH_HARDENING_COMMIT = "1faee3c"
+COMPACT_SEARCH_RELATED_TEST_COUNT = 78
 COMPACT_SEARCH_AUDIT_FIX_COUNT = 4
 COMPACT_OLD_GENERATION_SLICE_COUNT = 1_454
 COMPACT_OLD_GENERATION_HARD_FEASIBLE_COUNT = 0
@@ -6327,20 +6329,22 @@ def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
     return {
         "id": COMPACT_DESIGN_STATUS_CARD_ID,
         "title": (
-            "CODEX | COMPACT SEARCH | FIXED-LM PATH TEST71 PASS | "
-            "AUDIT FIX4 PENDING | FRESH512/SCOUT POST0"
+            "CODEX | COMPACT SEARCH | FIXED-LM/AUTH TEST78 PASS | "
+            "AUDIT FIX4 PASS | FRESH512/SCOUT POST0"
         ),
         "detail": (
             "The fixed-primary-Lm=2mH resonance path and exact compact "
             "initialization/mutation are implemented and independently tested. "
-            "An independent audit then found two execution-scope defects: the "
-            "internal Runner needs an authenticated compact activation token, "
-            "the fixed-Lm wrapper must not alter legacy/nonreserved runs, N1=5 "
-            "must not claim an absent compact-C bridge, and downstream evidence "
-            "must give the fixed-Lm authority precedence over compatibility "
-            "half-Lm aliases. "
-            "Both final fresh512 and the diagnostic scout remain submission-"
-            "blocked until those defects and their negative bypass tests pass. "
+            "All four independent audit findings are now fixed: the internal "
+            "Runner requires a per-seed authenticated compact activation token, "
+            "the fixed-Lm wrapper leaves legacy/nonreserved runs unchanged, "
+            "N1=5 no longer claims an absent compact-C bridge, and downstream "
+            "evidence gives the fixed-Lm authority precedence over compatibility "
+            "half-Lm aliases. Malformed string quality states are also rejected "
+            "instead of being coerced to true. The 78-test regression and Ruff "
+            "checks pass, and the independent re-audit found no new blocker. "
+            "Scheduler POST remains zero while the clean diagnostic source is "
+            "prepared and authenticated. "
             "N1=6/7/8 replay exact A/B/C plus the independent height boundary; "
             "N1=5 replays A/B/height while its decoder-unreachable C band remains "
             "assigned to N1=6..8 without a near-band fallback. Final fresh512 "
@@ -6351,19 +6355,20 @@ def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 45,
+        "progress_pct": 55,
         "evidence": [
             (
-                f"compact fixed-Lm readiness commit "
-                f"{COMPACT_SEARCH_READINESS_COMMIT} / related tests "
-                f"{COMPACT_SEARCH_RELATED_TEST_COUNT} passed"
+                f"compact fixed-Lm readiness={COMPACT_SEARCH_READINESS_COMMIT} / "
+                f"authenticated scope={COMPACT_SEARCH_AUTH_COMMIT} / strict-bool "
+                f"hardening={COMPACT_SEARCH_HARDENING_COMMIT} / related tests "
+                f"{COMPACT_SEARCH_RELATED_TEST_COUNT} passed / Ruff passed"
             ),
             (
                 f"independent code audit blockers="
-                f"{COMPACT_SEARCH_AUDIT_FIX_COUNT} / direct Runner activation "
-                "binding missing + legacy/nonreserved fixed-Lm scope leak + "
-                "N1=5 compact-C audit overclaim + half-Lm alias precedence / "
-                "fix pending / Scheduler POST0"
+                f"{COMPACT_SEARCH_AUDIT_FIX_COUNT} fixed / per-seed Runner "
+                "authority + legacy/nonreserved isolation + N1=5 active-strata "
+                "truth + fixed-Lm precedence / re-audit blockers=0 / "
+                "Scheduler POST0"
             ),
             (
                 "resonance=Ltx(0.002H+Llt_phys), "
@@ -6386,7 +6391,7 @@ def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
             (
                 "final fresh512 activation requires strict B7/v8 dataset + "
                 "retrained PASS quality generation / current real activation "
-                "closed / diagnostic scout also blocked pending code-audit fix"
+                "closed / diagnostic scout code-ready and source-auth pending"
             ),
             (
                 f"compact acquisition contract sealed at commit "

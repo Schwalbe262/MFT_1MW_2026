@@ -2001,26 +2001,31 @@ def test_compact_design_status_card_is_truthful_and_fail_closed() -> None:
     assert card["id"] == updater.COMPACT_DESIGN_STATUS_CARD_ID
     assert len(card["title"]) <= 160
     assert card["state"] == "in_progress"
-    assert card["progress_pct"] == 45
+    assert card["progress_pct"] == 55
     assert len(card["evidence"]) <= 12
-    assert "FIXED-LM PATH TEST71 PASS" in card["title"]
-    assert "AUDIT FIX4 PENDING" in card["title"]
+    assert "FIXED-LM/AUTH TEST78 PASS" in card["title"]
+    assert "AUDIT FIX4 PASS" in card["title"]
     assert "FRESH512/SCOUT POST0" in card["title"]
     assert "not proof that a compact design is impossible" in card["detail"]
-    assert "authenticated compact activation token" in card["detail"]
-    assert "fixed-Lm wrapper must not alter legacy/nonreserved runs" in card[
+    assert "per-seed authenticated compact activation token" in card["detail"]
+    assert "fixed-Lm wrapper leaves legacy/nonreserved runs unchanged" in card[
         "detail"
     ]
+    assert "independent re-audit found no new blocker" in card["detail"]
     assert any(
-        "commit bc63ec5" in item and "tests 71 passed" in item
+        "readiness=bc63ec5" in item
+        and "authenticated scope=fcbefeb" in item
+        and "hardening=1faee3c" in item
+        and "tests 78 passed" in item
         for item in card["evidence"]
     )
     assert any(
-        "code audit blockers=4" in item
-        and "Runner activation binding missing" in item
-        and "scope leak" in item
-        and "compact-C audit overclaim" in item
-        and "half-Lm alias precedence" in item
+        "code audit blockers=4 fixed" in item
+        and "per-seed Runner authority" in item
+        and "legacy/nonreserved isolation" in item
+        and "N1=5 active-strata truth" in item
+        and "fixed-Lm precedence" in item
+        and "re-audit blockers=0" in item
         and "Scheduler POST0" in item
         for item in card["evidence"]
     )
@@ -2049,7 +2054,7 @@ def test_compact_design_status_card_is_truthful_and_fail_closed() -> None:
     assert any(
         "strict B7/v8 dataset" in item
         and "current real activation closed" in item
-        and "scout also blocked" in item
+        and "diagnostic scout code-ready and source-auth pending" in item
         for item in card["evidence"]
     )
     assert any(
