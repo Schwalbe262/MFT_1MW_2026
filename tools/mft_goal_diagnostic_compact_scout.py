@@ -24,11 +24,13 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from module.mft_goal_20260726_contract import (  # noqa: E402
+    CORE_TEMPERATURE_TARGETS,
     GOAL_CONTRACT_SCHEMA,
     GOAL_STAGE_SPEC,
     GOAL_STAGE_SPEC_SHA256,
-    GOAL_TEMPERATURE_CONTRACT_SHA256,
     GOAL_TEMPERATURE_TARGETS,
+    PRIMARY_WINDING_TEMPERATURE_TARGETS,
+    SECONDARY_WINDING_TEMPERATURE_TARGETS,
     canonical_sha256,
 )
 from tools import mft_goal_20260726_launch as goal_launch  # noqa: E402
@@ -48,9 +50,12 @@ POPULATION = goal_launch.POPULATION
 GENERATIONS = goal_launch.GENERATIONS
 INFERENCE_THREADS = goal_launch.INFERENCE_THREADS
 DEFAULT_SEED_START = 2_607_264_000
-DEFAULT_SEED_COUNT = 32
+DEFAULT_SEED_COUNT = 100
 MAXIMUM_SEED_COUNT = 128
 SEARCH_PROFILE_SCHEMA = "mft-goal-diagnostic-manufacturing-search-profile-v1"
+EFFECTIVE_CONSTRAINT_PROFILE_SCHEMA = (
+    "mft-goal-diagnostic-l900-split-temperature-profile-v1"
+)
 SEARCH_PROFILE_INSTALLATION_SCHEMA = (
     "mft-goal-diagnostic-manufacturing-search-installation-v1"
 )
@@ -64,7 +69,7 @@ PROFILE_SEED_STARTS = {
     30: 2_607_264_200,
     40: 2_607_264_300,
 }
-PROFILE_SEED_COUNT = 32
+PROFILE_SEED_COUNT = 100
 FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM = 5.0
 FIXED_PRIMARY_INTERTURN_GAP_MM = 1.6
 FIXED_SECONDARY_TURNS = 60
@@ -72,6 +77,88 @@ FIXED_CORE_PLATE_THICKNESS_MM = 20.0
 FIXED_WINDING_COLD_PLATE_THICKNESS_MM = 20.0
 REQUIRED_WINDING_HEIGHT_OVERLAP_RATIO = 1.0
 MAXIMUM_DECODED_WINDING_HEIGHT_DIFFERENCE_MM = 0.1
+EFFECTIVE_SIZE_LIMITS_MM = {"W": 1200.0, "L": 900.0, "H": 750.0}
+EFFECTIVE_TEMPERATURE_FAMILY_LIMITS_C = {
+    "primary_winding": 110.0,
+    "secondary_winding": 130.0,
+    "core": 130.0,
+}
+EFFECTIVE_TEMPERATURE_TARGET_LIMITS_C = {
+    **{
+        target: EFFECTIVE_TEMPERATURE_FAMILY_LIMITS_C["primary_winding"]
+        for target in PRIMARY_WINDING_TEMPERATURE_TARGETS
+    },
+    **{
+        target: EFFECTIVE_TEMPERATURE_FAMILY_LIMITS_C[
+            "secondary_winding"
+        ]
+        for target in SECONDARY_WINDING_TEMPERATURE_TARGETS
+    },
+    **{
+        target: EFFECTIVE_TEMPERATURE_FAMILY_LIMITS_C["core"]
+        for target in CORE_TEMPERATURE_TARGETS
+    },
+}
+
+
+def _effective_constraint_profile() -> dict[str, Any]:
+    temperature_contract = {
+        "schema_version": (
+            "mft-goal-diagnostic-split-temperature-contract-v1"
+        ),
+        "semantic_version": (
+            "split-primary110-secondary130-core130-q90-half-width-v1"
+        ),
+        "families": {
+            "primary_winding": {
+                "robust_upper_bound_C": 110.0,
+                "targets": list(PRIMARY_WINDING_TEMPERATURE_TARGETS),
+            },
+            "secondary_winding": {
+                "robust_upper_bound_C": 130.0,
+                "targets": list(SECONDARY_WINDING_TEMPERATURE_TARGETS),
+            },
+            "core": {
+                "robust_upper_bound_C": 130.0,
+                "targets": list(CORE_TEMPERATURE_TARGETS),
+            },
+        },
+        "target_limits_C": dict(EFFECTIVE_TEMPERATURE_TARGET_LIMITS_C),
+        "formula": "surrogate_mu_plus_q90_conformal_half_width_le_target_limit",
+        "side_winding_activation": "finite_N2_side_gt_0",
+        "legacy_scalar_temperature_limit_allowed": False,
+    }
+    value = {
+        "schema_version": EFFECTIVE_CONSTRAINT_PROFILE_SCHEMA,
+        "base_goal_stage_spec_sha256": GOAL_STAGE_SPEC_SHA256,
+        "size_limits_mm": dict(EFFECTIVE_SIZE_LIMITS_MM),
+        "temperature_family_limits_C": dict(
+            EFFECTIVE_TEMPERATURE_FAMILY_LIMITS_C
+        ),
+        "temperature_target_limits_C": dict(
+            EFFECTIVE_TEMPERATURE_TARGET_LIMITS_C
+        ),
+        "temperature_contract": temperature_contract,
+        "temperature_contract_sha256": canonical_sha256(
+            temperature_contract
+        ),
+        "cooling_or_TIM_contract_mutated": False,
+        "screening_only": True,
+        "production_eligible": False,
+    }
+    return goal_launch._seal(value)
+
+
+def _validate_effective_constraint_profile(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    profile = goal_launch._validate_seal(
+        dict(value), schema=EFFECTIVE_CONSTRAINT_PROFILE_SCHEMA
+    )
+    expected = _effective_constraint_profile()
+    if profile != expected:
+        raise RuntimeError("diagnostic L900 effective constraint profile mismatch")
+    return profile
 
 
 def _profile_clearance_mm(value: Any) -> int:
@@ -127,10 +214,12 @@ def _build_search_profile(
         or recovery.get("eligible_row_count") != recovery.get("row_count")
     ):
         raise RuntimeError("raw C_rx_rx_F calibration cohort is incomplete")
+    effective_constraints = _effective_constraint_profile()
     value = {
         "schema_version": SEARCH_PROFILE_SCHEMA,
         "profile_id": (
-            f"hard-equal-hgap{clearance}-plates20-exact32"
+            f"l900-temp110-130-130-hard-equal-hgap{clearance}-"
+            "plates20-exact100"
         ),
         "fixed_primary_turns": FIXED_PRIMARY_TURNS,
         "fixed_secondary_turns": FIXED_SECONDARY_TURNS,
@@ -144,6 +233,10 @@ def _build_search_profile(
         "fixed_core_plate_thickness_mm": FIXED_CORE_PLATE_THICKNESS_MM,
         "fixed_winding_cold_plate_thickness_mm": (
             FIXED_WINDING_COLD_PLATE_THICKNESS_MM
+        ),
+        "effective_constraint_profile": effective_constraints,
+        "effective_constraint_profile_payload_sha256": (
+            effective_constraints["payload_sha256"]
         ),
         "geometry_constraint_profile": copy.deepcopy(geometry),
         "geometry_constraint_profile_sha256": geometry["sha256"],
@@ -181,7 +274,9 @@ def _build_search_profile(
         "fixed_lm2mh_resonance_contract_sha256": (
             preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
         ),
-        "temperature_contract_sha256": GOAL_TEMPERATURE_CONTRACT_SHA256,
+        "temperature_contract_sha256": effective_constraints[
+            "temperature_contract_sha256"
+        ],
         "cooling_or_TIM_contract_mutated": False,
         "screening_only": True,
         "production_eligible": False,
@@ -197,6 +292,9 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
     geometry = preflight.validate_goal_geometry_constraint_profile(
         profile.get("geometry_constraint_profile") or {}
     )
+    effective_constraints = _validate_effective_constraint_profile(
+        profile.get("effective_constraint_profile") or {}
+    )
     clearance = _profile_clearance_mm(
         geometry["primary_axial_clearance"]["minimum_mm"]
     )
@@ -211,6 +309,8 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         "fixed_primary_interturn_gap_mm",
         "fixed_core_plate_thickness_mm",
         "fixed_winding_cold_plate_thickness_mm",
+        "effective_constraint_profile",
+        "effective_constraint_profile_payload_sha256",
         "geometry_constraint_profile",
         "geometry_constraint_profile_sha256",
         "winding_height_exact_equality_initialization_and_repair_required",
@@ -251,7 +351,10 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
     if (
         set(profile) != expected_keys
         or profile.get("profile_id")
-        != f"hard-equal-hgap{clearance}-plates20-exact32"
+        != (
+            f"l900-temp110-130-130-hard-equal-hgap{clearance}-"
+            "plates20-exact100"
+        )
         or profile.get("fixed_primary_turns") != FIXED_PRIMARY_TURNS
         or profile.get("fixed_secondary_turns") != FIXED_SECONDARY_TURNS
         or profile.get("turns_ratio_N2_over_N1") != 10.0
@@ -263,6 +366,8 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         != FIXED_CORE_PLATE_THICKNESS_MM
         or profile.get("fixed_winding_cold_plate_thickness_mm")
         != FIXED_WINDING_COLD_PLATE_THICKNESS_MM
+        or profile.get("effective_constraint_profile_payload_sha256")
+        != effective_constraints["payload_sha256"]
         or profile.get("geometry_constraint_profile_sha256")
         != geometry["sha256"]
         or profile.get(
@@ -306,7 +411,7 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         or profile.get("fixed_lm2mh_resonance_contract_sha256")
         != preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
         or profile.get("temperature_contract_sha256")
-        != GOAL_TEMPERATURE_CONTRACT_SHA256
+        != effective_constraints["temperature_contract_sha256"]
         or profile.get("cooling_or_TIM_contract_mutated") is not False
         or profile.get("screening_only") is not True
         or profile.get("production_eligible") is not False
@@ -329,6 +434,33 @@ def _install_search_profile(
         "geometry_constraint_profile_sha256"
     ]:
         raise RuntimeError("diagnostic geometry profile was not installed")
+    effective_constraints = _validate_effective_constraint_profile(
+        profile["effective_constraint_profile"]
+    )
+    if hasattr(problem, "spec"):
+        base_size_limits = dict(problem.spec.get("size_limits_mm") or {})
+        if base_size_limits != dict(GOAL_STAGE_SPEC["size_limits_mm"]):
+            raise RuntimeError("diagnostic base size contract drifted")
+        effective_spec = copy.deepcopy(problem.spec)
+        effective_spec["size_limits_mm"] = copy.deepcopy(
+            effective_constraints["size_limits_mm"]
+        )
+        effective_spec["temperature_family_limits_C"] = copy.deepcopy(
+            effective_constraints["temperature_family_limits_C"]
+        )
+        effective_spec["temperature_target_limits_C"] = copy.deepcopy(
+            effective_constraints["temperature_target_limits_C"]
+        )
+        problem.spec = effective_spec
+        problem.temperature_limits_C = copy.deepcopy(
+            effective_constraints["temperature_target_limits_C"]
+        )
+        problem.temperature_contract = copy.deepcopy(
+            effective_constraints["temperature_contract"]
+        )
+        problem.temperature_contract_sha256 = effective_constraints[
+            "temperature_contract_sha256"
+        ]
     coordinate_names = tuple(problem.sobol_dimension_names)
     required_coordinates = {"gap1", "core_plate_t", "wcp_t"}
     if not required_coordinates.issubset(coordinate_names):
@@ -473,6 +605,21 @@ def _install_search_profile(
     effective_contract["diagnostic_manufacturing_search_profile_sha256"] = (
         profile["payload_sha256"]
     )
+    effective_contract["diagnostic_effective_constraint_profile"] = (
+        copy.deepcopy(effective_constraints)
+    )
+    effective_contract[
+        "diagnostic_effective_constraint_profile_payload_sha256"
+    ] = effective_constraints["payload_sha256"]
+    effective_contract["size_limits_mm"] = copy.deepcopy(
+        effective_constraints["size_limits_mm"]
+    )
+    effective_contract["temperature_contract"] = copy.deepcopy(
+        effective_constraints["temperature_contract"]
+    )
+    effective_contract["temperature_contract_sha256"] = (
+        effective_constraints["temperature_contract_sha256"]
+    )
     effective_contract["raw_same_metric_capacitance_gate"] = copy.deepcopy(
         cap_contract
     )
@@ -495,6 +642,15 @@ def _install_search_profile(
             "geometry_constraint_profile_sha256": profile[
                 "geometry_constraint_profile_sha256"
             ],
+            "effective_constraint_profile_payload_sha256": (
+                effective_constraints["payload_sha256"]
+            ),
+            "effective_size_limits_mm": copy.deepcopy(
+                effective_constraints["size_limits_mm"]
+            ),
+            "effective_temperature_family_limits_C": copy.deepcopy(
+                effective_constraints["temperature_family_limits_C"]
+            ),
             "base_hard_constraint_contract_sha256": canonical_sha256(
                 base_contract
             ),
@@ -543,6 +699,7 @@ def _aligned_bank_proof(
     overlaps: list[float] = []
     height_differences: list[float] = []
     h_gap1: list[float] = []
+    exterior_dimensions: list[tuple[float, float, float]] = []
     for index in range(len(frame)):
         row = frame.iloc[index]
         nwh1 = float(row["nwh1"])
@@ -551,6 +708,8 @@ def _aligned_bank_proof(
         overlaps.append(overlap)
         height_differences.append(abs(nwh1 - nwh2))
         h_gap1.append(float(row["h_gap1"]))
+        _volume, dimensions = problem._goal_bounding_box_lit(row)
+        exterior_dimensions.append(tuple(map(float, dimensions)))
         if (
             height_differences[-1]
             > MAXIMUM_DECODED_WINDING_HEIGHT_DIFFERENCE_MM
@@ -583,6 +742,12 @@ def _aligned_bank_proof(
             != FIXED_PRIMARY_TURNS
             or int(row["N2_main"]) + int(row["N2_side"])
             != FIXED_SECONDARY_TURNS
+            or exterior_dimensions[-1][0]
+            > EFFECTIVE_SIZE_LIMITS_MM["W"] + 1e-9
+            or exterior_dimensions[-1][1]
+            > EFFECTIVE_SIZE_LIMITS_MM["L"] + 1e-9
+            or exterior_dimensions[-1][2]
+            > EFFECTIVE_SIZE_LIMITS_MM["H"] + 1e-9
         ):
             raise RuntimeError(
                 "aligned compact bank profile proof failed: "
@@ -618,6 +783,17 @@ def _aligned_bank_proof(
             "all_rows_repair_fixed_points": True,
             "all_rows_decoder_valid": True,
             "all_rows_manufacturing_controls_attested": True,
+            "maximum_exterior_W_mm": max(
+                dimensions[0] for dimensions in exterior_dimensions
+            ),
+            "maximum_exterior_L_mm": max(
+                dimensions[1] for dimensions in exterior_dimensions
+            ),
+            "maximum_exterior_H_mm": max(
+                dimensions[2] for dimensions in exterior_dimensions
+            ),
+            "effective_size_limits_mm": dict(EFFECTIVE_SIZE_LIMITS_MM),
+            "all_rows_L900_envelope_verified": True,
             "exact_equal_initialization_and_repair_verified": True,
         }
     )
@@ -693,6 +869,12 @@ def _validate_activation(value: Mapping[str, Any]) -> dict[str, Any]:
             != search_profile["authorized_seed_count"]
             or activation.get("authorized_seed_end_inclusive")
             != search_profile["authorized_seed_end_inclusive"]
+            or compact_contract.get(
+                "diagnostic_effective_constraint_profile_sha256"
+            )
+            != search_profile[
+                "effective_constraint_profile_payload_sha256"
+            ]
         ):
             raise RuntimeError(
                 "diagnostic manufacturing activation binding mismatch"
@@ -984,7 +1166,7 @@ def prepare(args: argparse.Namespace) -> Path:
     )
     if seeds != expected_seeds:
         raise RuntimeError(
-            "diagnostic search profile requires its exact32 seed interval"
+            "diagnostic search profile requires its exact100 seed interval"
         )
     search_profile_installation = _install_search_profile(
         runner.problem,
@@ -993,8 +1175,11 @@ def prepare(args: argparse.Namespace) -> Path:
     _base, fixed_lm_installation = (
         preflight.install_goal_fixed_lm2mh_resonance(runner.problem)
     )
-    compact_contract = preflight.goal_compact_search_contract(
-        FIXED_PRIMARY_TURNS
+    compact_contract = preflight.goal_diagnostic_l900_compact_search_contract(
+        FIXED_PRIMARY_TURNS,
+        effective_constraint_profile_sha256=search_profile[
+            "effective_constraint_profile_payload_sha256"
+        ],
     )
     compact_bank = preflight.build_goal_compact_coordinate_bank(
         runner.problem,
@@ -1096,7 +1281,7 @@ def prepare(args: argparse.Namespace) -> Path:
                     "stage_spec": copy.deepcopy(GOAL_STAGE_SPEC),
                     "stage_spec_sha256": GOAL_STAGE_SPEC_SHA256,
                     "temperature_contract_sha256": (
-                        GOAL_TEMPERATURE_CONTRACT_SHA256
+                        search_profile["temperature_contract_sha256"]
                     ),
                     "hard_constraint_contract_sha256": activation[
                         "effective_hard_constraint_contract_sha256"
@@ -1268,7 +1453,7 @@ def _validate_task(value: Mapping[str, Any]) -> dict[str, Any]:
         or task.get("stage_spec") != GOAL_STAGE_SPEC
         or task.get("stage_spec_sha256") != GOAL_STAGE_SPEC_SHA256
         or task.get("temperature_contract_sha256")
-        != GOAL_TEMPERATURE_CONTRACT_SHA256
+        != search_profile["temperature_contract_sha256"]
         or task.get("hard_constraint_contract_sha256")
         != activation["effective_hard_constraint_contract_sha256"]
         or task.get("source_identity") != activation["source_identity"]
@@ -1506,7 +1691,7 @@ def execute(args: argparse.Namespace) -> Path:
             ],
             "evaluation_spec_sha256": GOAL_STAGE_SPEC_SHA256,
             "temperature_contract_sha256": (
-                GOAL_TEMPERATURE_CONTRACT_SHA256
+                search_profile["temperature_contract_sha256"]
             ),
             "hard_constraint_contract_sha256": task[
                 "hard_constraint_contract_sha256"

@@ -145,6 +145,9 @@ SEARCH_RESULT_SCHEMA = "mft-tier1-current7-search-seed-v1"
 WARM_ROLE_PARTITION_SCHEMA = "mft-tier1-authenticated-warm-role-partition-v1"
 GOAL_FIXED_LM_RESONANCE_SCHEMA = "mft-goal-fixed-lm2mh-resonance-v1"
 GOAL_COMPACT_SEARCH_SCHEMA = "mft-goal-authorized-compact-search-v2"
+GOAL_DIAGNOSTIC_L900_COMPACT_SEARCH_SCHEMA = (
+    "mft-goal-diagnostic-l900-compact-search-v1"
+)
 GOAL_COMPACT_BANK_SCHEMA = "mft-goal-authorized-compact-coordinate-bank-v2"
 GOAL_COMPACT_RUN_AUTHORIZATION_SCHEMA = (
     "mft-goal-compact-run-authorization-v1"
@@ -175,6 +178,28 @@ GOAL_COMPACT_STRATA = {
     "compact_C": {
         "W_mm": [1160.0, 1170.0],
         "L_mm": [960.0, 975.0],
+    },
+    "height_boundary": {
+        "H_mm": [740.0, 750.0],
+    },
+}
+GOAL_DIAGNOSTIC_L900_SIZE_LIMITS_MM = {
+    "W": 1200.0,
+    "L": 900.0,
+    "H": 750.0,
+}
+GOAL_DIAGNOSTIC_L900_COMPACT_STRATA = {
+    "compact_A": {
+        "W_mm": [1160.0, 1170.0],
+        "L_mm": [875.0, 900.0],
+    },
+    "compact_B": {
+        "W_mm": [1170.0, 1200.0],
+        "L_mm": [850.0, 875.0],
+    },
+    "compact_C": {
+        "W_mm": [1160.0, 1170.0],
+        "L_mm": [850.0, 875.0],
     },
     "height_boundary": {
         "H_mm": [740.0, 750.0],
@@ -1543,6 +1568,41 @@ def goal_compact_search_contract(fixed_primary_turns: int) -> dict[str, Any]:
     return value
 
 
+def goal_diagnostic_l900_compact_search_contract(
+    fixed_primary_turns: int,
+    *,
+    effective_constraint_profile_sha256: str,
+) -> dict[str, Any]:
+    """Seal the isolated L<=900 mm compact bridge for diagnostic screening."""
+
+    profile_sha = str(effective_constraint_profile_sha256)
+    if (
+        len(profile_sha) != 64
+        or any(character not in "0123456789abcdef" for character in profile_sha)
+    ):
+        raise ValueError("L900 effective constraint profile SHA-256 is invalid")
+    value = goal_compact_search_contract(fixed_primary_turns)
+    value.pop("sha256")
+    value.update(
+        {
+            "schema_version": GOAL_DIAGNOSTIC_L900_COMPACT_SEARCH_SCHEMA,
+            "strata": copy.deepcopy(GOAL_DIAGNOSTIC_L900_COMPACT_STRATA),
+            "hard_size_limits_mm": copy.deepcopy(
+                GOAL_DIAGNOSTIC_L900_SIZE_LIMITS_MM
+            ),
+            "diagnostic_effective_constraint_profile_sha256": profile_sha,
+            "screening_only": True,
+            "production_eligible": False,
+            "legacy_campaign_behavior_changed": False,
+        }
+    )
+    value["coverage_requirement_by_authorization_role"][
+        GOAL_COMPACT_AUTH_DIAGNOSTIC
+    ] = "exact_L900_active_strata_for_N1_6_screening_only"
+    value["sha256"] = canonical_sha256(value)
+    return value
+
+
 def validate_goal_compact_search_contract(
     value: Mapping[str, Any],
     *,
@@ -1554,7 +1614,19 @@ def validate_goal_compact_search_contract(
         raise RuntimeError("compact search contract must be a mapping")
     contract = copy.deepcopy(dict(value))
     unsigned = {key: item for key, item in contract.items() if key != "sha256"}
-    expected = goal_compact_search_contract(int(fixed_primary_turns))
+    diagnostic_profile_sha = contract.get(
+        "diagnostic_effective_constraint_profile_sha256"
+    )
+    expected = (
+        goal_compact_search_contract(int(fixed_primary_turns))
+        if diagnostic_profile_sha is None
+        else goal_diagnostic_l900_compact_search_contract(
+            int(fixed_primary_turns),
+            effective_constraint_profile_sha256=str(
+                diagnostic_profile_sha
+            ),
+        )
+    )
     if (
         contract.get("sha256") != canonical_sha256(unsigned)
         or contract != expected
@@ -1995,6 +2067,7 @@ def _goal_compact_coordinate_replay(
     coordinates: Any,
     *,
     strata: Mapping[str, Mapping[str, Any]],
+    hard_size_limits_mm: Mapping[str, Any] | None = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
     """Repair, decode, and independently replay exterior membership."""
 
@@ -2011,6 +2084,9 @@ def _goal_compact_coordinate_replay(
     if not np.array_equal(repaired, values):
         raise RuntimeError("compact coordinate bank is not a repair fixed point")
     frame, _shrink, valid = problem.decode_batch(repaired)
+    limits = dict(hard_size_limits_mm or GOAL_SIZE_LIMITS_MM)
+    if set(limits) != {"W", "L", "H"}:
+        raise RuntimeError("compact hard size limit schema mismatch")
     records: list[dict[str, Any]] = []
     for index in range(len(repaired)):
         if not bool(valid[index]):
@@ -2022,9 +2098,9 @@ def _goal_compact_coordinate_replay(
             for value in dimensions
         )
         if (
-            width > float(GOAL_SIZE_LIMITS_MM["W"])
-            or length > float(GOAL_SIZE_LIMITS_MM["L"])
-            or height > float(GOAL_SIZE_LIMITS_MM["H"])
+            width > float(limits["W"])
+            or length > float(limits["L"])
+            or height > float(limits["H"])
         ):
             raise RuntimeError("compact coordinate bank escaped hard size limits")
         memberships = _compact_stratum_memberships(
@@ -2093,6 +2169,7 @@ def validate_goal_compact_coordinate_bank(
         problem,
         coordinates,
         strata=contract["strata"],
+        hard_size_limits_mm=contract["hard_size_limits_mm"],
     )
     membership_counts = {
         name: sum(name in record["memberships"] for record in records)
@@ -2171,14 +2248,19 @@ def build_goal_compact_coordinate_bank(
             f"compact joint coordinates are unavailable: {sorted(missing_joint)}"
         )
     topology_cycle = tuple(contract["turn_split_topologies_N2_main"])
-    targets = {
-        "compact_A": (1165.0, 987.5, None),
-        "compact_B": (1185.0, 967.5, None),
-        # Bias toward the lower-W interior.  N1=5 has a decoder discontinuity
-        # close to W=1170, so the band midpoint is a poor bridge target.
-        "compact_C": (1162.0, 967.5, None),
-        "height_boundary": (None, None, 745.0),
-    }
+    targets = {}
+    for stratum_name, bounds_by_axis in contract["strata"].items():
+        targets[stratum_name] = tuple(
+            (
+                None
+                if f"{axis}_mm" not in bounds_by_axis
+                else sum(map(float, bounds_by_axis[f"{axis}_mm"])) / 2.0
+            )
+            for axis in ("W", "L", "H")
+        )
+    if contract["schema_version"] == GOAL_COMPACT_SEARCH_SCHEMA:
+        # Preserve the proven lower-W interior target for the legacy C bridge.
+        targets["compact_C"] = (1162.0, 967.5, None)
     required = {
         name: (
             int(contract["initialization"]["minimum_exact_rows_height_boundary"])
@@ -2216,7 +2298,12 @@ def build_goal_compact_coordinate_bank(
             if stratum == "height_boundary":
                 set_physical(coordinate, "total_height", rng.uniform(740.0, 750.0))
                 set_physical(
-                    coordinate, "total_length", rng.uniform(800.0, 1000.0)
+                    coordinate,
+                    "total_length",
+                    rng.uniform(
+                        700.0,
+                        float(contract["hard_size_limits_mm"]["W"]),
+                    ),
                 )
                 set_physical(coordinate, "w1", rng.uniform(350.0, 550.0))
                 for name in (
@@ -2264,9 +2351,9 @@ def build_goal_compact_coordinate_bank(
                     strata=contract["strata"],
                 )
                 hard_dimensions = (
-                    width <= float(GOAL_SIZE_LIMITS_MM["W"])
-                    and length <= float(GOAL_SIZE_LIMITS_MM["L"])
-                    and height <= float(GOAL_SIZE_LIMITS_MM["H"])
+                    width <= float(contract["hard_size_limits_mm"]["W"])
+                    and length <= float(contract["hard_size_limits_mm"]["L"])
+                    and height <= float(contract["hard_size_limits_mm"]["H"])
                 )
                 if stratum in memberships and hard_dimensions:
                     identity = canonical_sha256(coordinate.tolist())
@@ -2285,7 +2372,7 @@ def build_goal_compact_coordinate_bank(
                         "total_height",
                         current + (float(target[2]) - height),
                     )
-                    if width > float(GOAL_SIZE_LIMITS_MM["W"]):
+                    if width > float(contract["hard_size_limits_mm"]["W"]):
                         current_length = problem._physical_from_unit(
                             "total_length",
                             coordinate[coordinate_index["total_length"]],
@@ -2294,9 +2381,12 @@ def build_goal_compact_coordinate_bank(
                             coordinate,
                             "total_length",
                             current_length
-                            - (width - float(GOAL_SIZE_LIMITS_MM["W"])),
+                            - (
+                                width
+                                - float(contract["hard_size_limits_mm"]["W"])
+                            ),
                         )
-                    if length > float(GOAL_SIZE_LIMITS_MM["L"]):
+                    if length > float(contract["hard_size_limits_mm"]["L"]):
                         current_w1 = problem._physical_from_unit(
                             "w1", coordinate[coordinate_index["w1"]]
                         )
@@ -2304,7 +2394,10 @@ def build_goal_compact_coordinate_bank(
                             coordinate,
                             "w1",
                             current_w1
-                            - (length - float(GOAL_SIZE_LIMITS_MM["L"])),
+                            - (
+                                length
+                                - float(contract["hard_size_limits_mm"]["L"])
+                            ),
                         )
                 else:
                     current_length = problem._physical_from_unit(
@@ -2338,6 +2431,7 @@ def build_goal_compact_coordinate_bank(
         problem,
         coordinates,
         strata=contract["strata"],
+        hard_size_limits_mm=contract["hard_size_limits_mm"],
     )
     membership_counts = {
         name: sum(name in record["memberships"] for record in records)

@@ -53,8 +53,8 @@ DRY_RUN_SCHEMA = "mft-goal-diagnostic-compact-submission-dry-run-v1"
 CLAIM_ROOT_SCHEMA = "mft-goal-diagnostic-compact-claim-root-v1"
 PENDING_CLAIM_SCHEMA = "mft-goal-diagnostic-compact-pending-claim-v1"
 FINALIZED_CLAIM_SCHEMA = "mft-goal-diagnostic-compact-finalized-claim-v1"
-EXACT_SEED_START = 2_607_264_000
-EXACT_TASK_COUNT = 32
+EXACT_SEED_START = scout.PROFILE_SEED_STARTS[20]
+EXACT_TASK_COUNT = scout.PROFILE_SEED_COUNT
 EXACT_SEEDS = tuple(range(EXACT_SEED_START, EXACT_SEED_START + EXACT_TASK_COUNT))
 FIXED_PRIMARY_TURNS = 6
 TASK_NAME_PREFIX = "mft-goal-diag-compact-"
@@ -75,7 +75,10 @@ TIMEOUT_SECONDS = 14_400
 MAX_WORKERS_PER_NODE = 8
 SCHEDULER_PRIORITY = 10
 
-if scout.DEFAULT_SEED_START != EXACT_SEED_START:  # pragma: no cover
+if (
+    EXACT_TASK_COUNT != 100
+    or scout.DEFAULT_SEED_COUNT != EXACT_TASK_COUNT
+):  # pragma: no cover
     raise RuntimeError("diagnostic compact scout seed authority drifted")
 
 
@@ -206,7 +209,7 @@ def _authorized_activation_seeds(
         count != EXACT_TASK_COUNT
         or seeds[-1] != normalized["authorized_seed_end_inclusive"]
     ):
-        raise RuntimeError("diagnostic profile seed authority is not exact32")
+        raise RuntimeError("diagnostic profile seed authority is not exact100")
     return seeds
 
 
@@ -230,7 +233,7 @@ def _authorized_plan_seeds(plan: Mapping[str, Any]) -> tuple[int, ...]:
         or plan.get("seed_start") != seeds[0]
         or plan.get("seed_end_inclusive") != seeds[-1]
     ):
-        raise RuntimeError("diagnostic plan seed authority is not contiguous exact32")
+        raise RuntimeError("diagnostic plan seed authority is not contiguous exact100")
     return seeds
 
 
@@ -257,7 +260,7 @@ def _exact_task_inventory(
             for task in tasks
         )
     ):
-        raise RuntimeError("diagnostic offload requires exact32 N1=6 seed inventory")
+        raise RuntimeError("diagnostic offload requires exact100 N1=6 seed inventory")
     source_identity = first["source_identity"]
     source = first["source"]
     code_manifest_sha = first["code_manifest_payload_sha256"]
@@ -1341,7 +1344,7 @@ def _claim_root_authority(
         len(inventory) != EXACT_TASK_COUNT
         or [item["seed"] for item in inventory] != list(authorized_seeds)
     ):
-        raise RuntimeError("diagnostic claim inventory is not exact32")
+        raise RuntimeError("diagnostic claim inventory is not exact100")
     return _seal(
         {
             "schema_version": CLAIM_ROOT_SCHEMA,
@@ -1433,7 +1436,7 @@ def _claim_directory(
 ) -> Path:
     seed = int(payload["payload_json"]["seed"])
     if seed not in _authorized_plan_seeds(plan):
-        raise RuntimeError("diagnostic claim seed is outside exact32")
+        raise RuntimeError("diagnostic claim seed is outside exact100")
     claims = _plain_directory(
         Path(plan["scheduler_claim_root"]) / "claims",
         "diagnostic claims directory",
@@ -1772,7 +1775,7 @@ def _validate_receipt(
         "existing_count",
         "absent_count",
         "campaign_authorized_post_count",
-        "first_clean_run_exact32_scheduler_posts",
+        "first_clean_run_exact100_scheduler_posts",
         "scheduler_url",
         "scheduler_endpoint",
         "scheduler_post_count",
@@ -1837,7 +1840,7 @@ def _validate_receipt(
         != EXACT_TASK_COUNT
         or receipt.get("scheduler_post_count")
         != receipt.get("submitted_count")
-        or receipt.get("first_clean_run_exact32_scheduler_posts")
+        or receipt.get("first_clean_run_exact100_scheduler_posts")
         is not (
             receipt.get("submitted_count") == EXACT_TASK_COUNT
             and receipt.get("existing_count") == 0
@@ -2198,7 +2201,7 @@ def submit(
         "campaign_authorized_post_count": sum(
             row["scheduler_post_authority_count"] for row in rows
         ),
-        "first_clean_run_exact32_scheduler_posts": (
+        "first_clean_run_exact100_scheduler_posts": (
             submitted_count == EXACT_TASK_COUNT and existing_count == 0
         ),
         "scheduler_url": scheduler_url.rstrip("/"),

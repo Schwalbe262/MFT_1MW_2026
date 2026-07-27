@@ -343,7 +343,7 @@ def test_dry_run_and_apply_omission_never_post(
     assert list((Path(plan["scheduler_claim_root"]) / "claims").iterdir()) == []
 
 
-def test_apply_posts_exact32_get_verifies_and_replays_immutably(
+def test_apply_posts_exact100_get_verifies_and_replays_immutably(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -361,7 +361,7 @@ def test_apply_posts_exact32_get_verifies_and_replays_immutably(
     )
     assert scheduler.post_count == offload.EXACT_TASK_COUNT
     assert scheduler.get_count >= offload.EXACT_TASK_COUNT + 1
-    assert receipt["first_clean_run_exact32_scheduler_posts"] is True
+    assert receipt["first_clean_run_exact100_scheduler_posts"] is True
     assert receipt["campaign_authorized_post_count"] == offload.EXACT_TASK_COUNT
     assert receipt["automatic_promotion_allowed"] is False
     assert receipt["authentication_sha256"] == authentication["sha256"]

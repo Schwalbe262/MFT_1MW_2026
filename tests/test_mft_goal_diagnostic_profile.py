@@ -12,9 +12,13 @@ from tools import mft_goal_diagnostic_compact_slurm as offload
 def _profile(clearance: int = 20) -> dict:
     geometry = scout._geometry_profile(clearance)
     start = scout.PROFILE_SEED_STARTS[clearance]
+    effective = scout._effective_constraint_profile()
     value = {
         "schema_version": scout.SEARCH_PROFILE_SCHEMA,
-        "profile_id": f"hard-equal-hgap{clearance}-plates20-exact32",
+        "profile_id": (
+            f"l900-temp110-130-130-hard-equal-hgap{clearance}-"
+            "plates20-exact100"
+        ),
         "fixed_primary_turns": 6,
         "fixed_secondary_turns": 60,
         "turns_ratio_N2_over_N1": 10.0,
@@ -22,6 +26,10 @@ def _profile(clearance: int = 20) -> dict:
         "fixed_primary_interturn_gap_mm": 1.6,
         "fixed_core_plate_thickness_mm": 20.0,
         "fixed_winding_cold_plate_thickness_mm": 20.0,
+        "effective_constraint_profile": effective,
+        "effective_constraint_profile_payload_sha256": effective[
+            "payload_sha256"
+        ],
         "geometry_constraint_profile": geometry,
         "geometry_constraint_profile_sha256": geometry["sha256"],
         "winding_height_exact_equality_initialization_and_repair_required": (
@@ -29,8 +37,8 @@ def _profile(clearance: int = 20) -> dict:
         ),
         "maximum_decoded_winding_height_difference_mm": 0.1,
         "authorized_seed_start": start,
-        "authorized_seed_count": 32,
-        "authorized_seed_end_inclusive": start + 31,
+        "authorized_seed_count": 100,
+        "authorized_seed_end_inclusive": start + 99,
         "raw_same_metric_capacitance_gate": {
             "constraint_name": scout.RAW_CRX_CONSTRAINT_NAME,
             "target": "C_rx_rx_F",
@@ -52,9 +60,9 @@ def _profile(clearance: int = 20) -> dict:
         "fixed_lm2mh_resonance_contract_sha256": (
             scout.preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
         ),
-        "temperature_contract_sha256": (
-            scout.GOAL_TEMPERATURE_CONTRACT_SHA256
-        ),
+        "temperature_contract_sha256": effective[
+            "temperature_contract_sha256"
+        ],
         "cooling_or_TIM_contract_mutated": False,
         "screening_only": True,
         "production_eligible": False,
@@ -82,9 +90,35 @@ def test_geometry_profile_sha_and_seed_authority_are_exact() -> None:
         assert seeds == tuple(
             range(
                 scout.PROFILE_SEED_STARTS[clearance],
-                scout.PROFILE_SEED_STARTS[clearance] + 32,
+                scout.PROFILE_SEED_STARTS[clearance] + 100,
             )
         )
+
+
+def test_l900_compact_contract_is_bound_to_effective_profile() -> None:
+    effective = scout._effective_constraint_profile()
+    contract = (
+        scout.preflight.goal_diagnostic_l900_compact_search_contract(
+            6,
+            effective_constraint_profile_sha256=effective["payload_sha256"],
+        )
+    )
+    assert contract["hard_size_limits_mm"] == {
+        "W": 1200.0,
+        "L": 900.0,
+        "H": 750.0,
+    }
+    assert max(
+        bounds["L_mm"][1]
+        for name, bounds in contract["strata"].items()
+        if name != "height_boundary"
+    ) == 900.0
+    assert (
+        scout.preflight.validate_goal_compact_search_contract(
+            contract, fixed_primary_turns=6
+        )
+        == contract
+    )
 
 
 def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None:
@@ -110,6 +144,17 @@ def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None
         hard_constraint_contract_sha256 = canonical_sha256(
             hard_constraint_contract
         )
+        spec = {
+            "size_limits_mm": dict(
+                scout.GOAL_STAGE_SPEC["size_limits_mm"]
+            ),
+            "temperature_family_limits_C": dict(
+                scout.GOAL_STAGE_SPEC["temperature_family_limits_C"]
+            ),
+            "temperature_target_limits_C": dict(
+                scout.GOAL_STAGE_SPEC["temperature_target_limits_C"]
+            ),
+        }
         _prediction_cache = None
 
         @staticmethod
