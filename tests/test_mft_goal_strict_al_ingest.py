@@ -84,6 +84,14 @@ def _strict_row(*, task_id: int, n1: int, **updates) -> dict:
         "git_hash": SOLVER_REVISION,
         "pyaedt_library_git_hash": LIBRARY_REVISION,
         "physics_data_revision": PHYSICS_DATA_REVISION,
+        "thermal_rx_block_interface_contract_version": (
+            "thermal-rx-block-interface-coverage-v1"
+        ),
+        "thermal_rx_main_interface_coverage_passed": True,
+        "thermal_rx_main_unpaired_interfaces": [],
+        "thermal_temperature_limiter_triggered": False,
+        "thermal_temperature_limiter_max_K": 400.0,
+        "thermal_result_scientific_valid": True,
     })
     params.update(updates)
     return _valid_native_result(**params)
@@ -297,6 +305,17 @@ def test_eight_rows_from_only_three_source_tasks_are_not_ready(
         (
             {"physics_data_revision": "foreign-physics"},
             "differs from the base cohort",
+        ),
+        (
+            {"thermal_result_scientific_valid": False},
+            "thermal scientific truth contract",
+        ),
+        (
+            {
+                "thermal_rx_main_interface_coverage_passed": False,
+                "thermal_rx_main_unpaired_interfaces": ["153"],
+            },
+            "thermal scientific truth contract",
         ),
     ],
 )

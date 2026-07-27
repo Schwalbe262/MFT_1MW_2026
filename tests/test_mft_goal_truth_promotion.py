@@ -191,6 +191,18 @@ def _standard_collections(
             submission_path, plan=plan
         )
         result = helpers._result(plan_path, submission)
+        result.update(
+            {
+                "thermal_rx_block_interface_contract_version": (
+                    "thermal-rx-block-interface-coverage-v1"
+                ),
+                "thermal_rx_main_interface_coverage_passed": True,
+                "thermal_rx_main_unpaired_interfaces": [],
+                "thermal_temperature_limiter_triggered": False,
+                "thermal_temperature_limiter_max_K": 400.0,
+                "thermal_result_scientific_valid": True,
+            }
+        )
         entries.append(
             {
                 "turns": primary_turns,
@@ -686,6 +698,33 @@ def test_promotion_rejects_failed_actual_hard_constraint(
                 built["entries"][0]["collection_path"]
             ],
             output=tmp_path / "forbidden-promotion",
+            predictor=built["helpers"]._Predictor(),
+        )
+
+
+def test_promotion_rejects_non_scientific_thermal_result(
+    tmp_path, monkeypatch
+):
+    def invalidate(result):
+        result["thermal_rx_main_interface_coverage_passed"] = False
+        result["thermal_rx_main_unpaired_interfaces"] = ["153"]
+        result["thermal_result_scientific_valid"] = False
+
+    built = _standard_collections(
+        tmp_path,
+        monkeypatch,
+        turns=(6,),
+        result_mutator=invalidate,
+    )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="thermal scientific truth contract",
+    ):
+        promotion.create_truth_promotion(
+            standard_collection_paths=[
+                built["entries"][0]["collection_path"]
+            ],
+            output=tmp_path / "forbidden-scientific-promotion",
             predictor=built["helpers"]._Predictor(),
         )
 

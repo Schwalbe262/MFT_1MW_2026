@@ -39,6 +39,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from module.input_parameter_260706 import ALL_INPUT_KEYS  # noqa: E402
+from module import thermal_truth_contract as thermal_truth  # noqa: E402
 from regression_260707.optimization import geometry_metrics  # noqa: E402
 from regression_260707.verify import scheduler_client  # noqa: E402
 from tools import tier1_corrected_generation_preflight as preflight  # noqa: E402
@@ -139,25 +140,14 @@ CORE_TEMPERATURES = (
     "Tprobe_core_top_yoke_max",
 )
 THERMAL_RX_INTERFACE_CONTRACT_FIELDS = (
-    "thermal_rx_block_interface_contract_version",
-    "thermal_rx_main_interface_coverage_passed",
-    "thermal_rx_main_unpaired_interfaces",
-    "thermal_temperature_limiter_triggered",
-    "thermal_temperature_limiter_max_K",
-    "thermal_result_scientific_valid",
+    thermal_truth.THERMAL_RX_INTERFACE_CONTRACT_FIELDS
 )
-THERMAL_RX_INTERFACE_CONTRACT_VERSIONS = frozenset(
-    {"thermal-rx-block-interface-coverage-v1"}
+THERMAL_RX_INTERFACE_CONTRACT_VERSIONS = (
+    thermal_truth.THERMAL_RX_INTERFACE_CONTRACT_VERSIONS
 )
-THERMAL_INVALID_LOG_MARKERS = (
-    "temperature limited to 5.000000e+03",
-    "set unpaired interface zone",
-)
-# Fluent's emergency temperature limiter is 5000 K.  Keep a small margin so
-# formatting/rounding cannot turn a limiter-clamped result into acquisition
-# truth.
-THERMAL_LIMITER_FAIL_CLOSE_K = 4_990.0
-THERMAL_LIMITER_FAIL_CLOSE_C = THERMAL_LIMITER_FAIL_CLOSE_K - 273.15
+THERMAL_INVALID_LOG_MARKERS = thermal_truth.THERMAL_INVALID_LOG_MARKERS
+THERMAL_LIMITER_FAIL_CLOSE_K = thermal_truth.THERMAL_LIMITER_FAIL_CLOSE_K
+THERMAL_LIMITER_FAIL_CLOSE_C = thermal_truth.THERMAL_LIMITER_FAIL_CLOSE_C
 N1_6_COOLER_ANCHOR_PREFIXES = (
     "7fae822212dfea8a",
     "45e20fbd810f9d24",
@@ -2418,109 +2408,11 @@ def _thermal_scientific_truth_contract(
     task_log_text: str,
 ) -> dict[str, Any]:
     """Fail-close legacy or interface-isolated thermal acquisition results."""
-
-    reasons: list[str] = []
-    missing = [
-        name
-        for name in THERMAL_RX_INTERFACE_CONTRACT_FIELDS
-        if name not in result
-    ]
-    reasons.extend(
-        f"scientific_contract_field_missing:{name}" for name in missing
+    return thermal_truth.thermal_scientific_truth_contract(
+        result,
+        observed_temperatures_C=observed_temperatures_C,
+        task_log_text=task_log_text,
     )
-
-    version = result.get("thermal_rx_block_interface_contract_version")
-    if version is not None and version not in (
-        THERMAL_RX_INTERFACE_CONTRACT_VERSIONS
-    ):
-        reasons.append(
-            "scientific_contract_invalid:"
-            "thermal_rx_block_interface_contract_version"
-        )
-
-    coverage = result.get("thermal_rx_main_interface_coverage_passed")
-    if coverage is not None and coverage is not True:
-        reasons.append(
-            "scientific_contract_invalid:"
-            "thermal_rx_main_interface_coverage_passed"
-        )
-
-    unpaired = result.get("thermal_rx_main_unpaired_interfaces")
-    if unpaired is not None:
-        if not isinstance(unpaired, list):
-            reasons.append(
-                "scientific_contract_invalid:"
-                "thermal_rx_main_unpaired_interfaces_type"
-            )
-        elif unpaired:
-            reasons.append(
-                "scientific_invalid:"
-                "thermal_rx_main_unpaired_interfaces_present"
-            )
-
-    limiter_triggered = result.get("thermal_temperature_limiter_triggered")
-    if limiter_triggered is not None and limiter_triggered is not False:
-        reasons.append(
-            "scientific_invalid:thermal_temperature_limiter_triggered"
-        )
-
-    limiter_max_K = _optional_finite(
-        result.get("thermal_temperature_limiter_max_K")
-    )
-    if (
-        "thermal_temperature_limiter_max_K" in result
-        and limiter_max_K is None
-    ):
-        reasons.append(
-            "scientific_contract_invalid:thermal_temperature_limiter_max_K"
-        )
-    elif (
-        limiter_max_K is not None
-        and limiter_max_K >= THERMAL_LIMITER_FAIL_CLOSE_K
-    ):
-        reasons.append(
-            "scientific_invalid:thermal_temperature_limiter_near_5000K"
-        )
-
-    result_scientific_valid = result.get(
-        "thermal_result_scientific_valid"
-    )
-    if (
-        result_scientific_valid is not None
-        and result_scientific_valid is not True
-    ):
-        reasons.append(
-            "scientific_invalid:thermal_result_scientific_valid_false"
-        )
-
-    if any(
-        value >= THERMAL_LIMITER_FAIL_CLOSE_C
-        for value in observed_temperatures_C.values()
-    ):
-        reasons.append(
-            "scientific_invalid:observed_temperature_near_5000K_limiter"
-        )
-
-    normalized_log = task_log_text.lower()
-    for marker in THERMAL_INVALID_LOG_MARKERS:
-        if marker in normalized_log:
-            reasons.append(
-                "scientific_invalid:task_log_marker:"
-                + marker.replace(" ", "_")
-            )
-
-    return {
-        "valid": not reasons,
-        "reasons": sorted(set(reasons)),
-        "contract_fields": {
-            name: copy.deepcopy(result.get(name))
-            for name in THERMAL_RX_INTERFACE_CONTRACT_FIELDS
-        },
-        "accepted_contract_versions": sorted(
-            THERMAL_RX_INTERFACE_CONTRACT_VERSIONS
-        ),
-        "log_markers_scanned": list(THERMAL_INVALID_LOG_MARKERS),
-    }
 
 
 def _measured_result(

@@ -43,9 +43,11 @@ from module.mft_goal_20260726_contract import (  # noqa: E402
     GOAL_G0_MODEL_TARGETS,
     GOAL_N1_MAX_TURNS,
     GOAL_N1_MIN_TURNS,
+    GOAL_TEMPERATURE_TARGETS,
     attest_fixed_identity,
     canonical_sha256,
 )
+from module import thermal_truth_contract as thermal_truth  # noqa: E402
 from regression_260707.quality_contract import (  # noqa: E402
     annotate_validity,
     validate_record,
@@ -625,6 +627,23 @@ def _validate_truth_row(
         raise StrictALIngestError(
             "authenticated result is not the retained eighth-symmetry "
             "Standard mode"
+        )
+    observed_temperatures = {}
+    for target in GOAL_TEMPERATURE_TARGETS:
+        try:
+            value = float(result.get(target))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            observed_temperatures[target] = value
+    scientific = thermal_truth.thermal_scientific_truth_contract(
+        result,
+        observed_temperatures_C=observed_temperatures,
+    )
+    if scientific["valid"] is not True:
+        raise StrictALIngestError(
+            "authenticated result fails thermal scientific truth contract: "
+            + ";".join(scientific["reasons"])
         )
     try:
         fixed_evidence = attest_fixed_identity(

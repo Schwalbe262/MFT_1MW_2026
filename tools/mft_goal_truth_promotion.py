@@ -35,6 +35,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from module.input_parameter_260706 import ALL_INPUT_KEYS  # noqa: E402
+from module import thermal_truth_contract as thermal_truth  # noqa: E402
 from module.mft_goal_20260726_contract import (  # noqa: E402
     GOAL_CONTRACT_SCHEMA,
     GOAL_SIZE_LIMITS_MM,
@@ -222,6 +223,18 @@ def _actual_standard_observation(
             "Standard actual physical goal recomputation failed"
         )
     active, temperatures, temperature_passed = _temperature_evidence(result)
+    scientific = thermal_truth.thermal_scientific_truth_contract(
+        result,
+        observed_temperatures_C={
+            name: production._finite(item.get("actual_C"), name)
+            for name, item in temperatures.items()
+        },
+    )
+    if scientific["valid"] is not True:
+        raise HandoffContractError(
+            "Standard result fails thermal scientific truth contract: "
+            + ";".join(scientific["reasons"])
+        )
     if (
         active != collection.get("active_temperature_targets")
         or temperatures
