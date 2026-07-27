@@ -152,6 +152,7 @@ class _FakeProblem:
             self.hard_constraint_contract
         )
         self.underlying_predict_calls: list[str] = []
+        self.underlying_decode_calls = 0
         self._evaluate = self._base_evaluate
 
     def _unit_from_physical(self, name: str, value: float) -> float:
@@ -162,6 +163,7 @@ class _FakeProblem:
         return np.asarray(values, dtype=float)
 
     def decode_batch(self, values: Any) -> tuple[Any, Any, Any]:
+        self.underlying_decode_calls += 1
         coordinates = np.asarray(values, dtype=float)
         main = preflight._turn_split_main_values(
             coordinates,
@@ -252,6 +254,7 @@ def test_installed_evaluator_excludes_raw_predictor_and_replaces_G(
     problem._evaluate(original, out)
 
     assert problem.underlying_predict_calls == ["Llt_phys", "Llt_phys"]
+    assert problem.underlying_decode_calls == 1
     assert preflight.RESONANCE_MINIMUM_CONSTRAINT not in problem.constraint_names
     assert lane.PHYSICS_CONSTRAINT_NAME in problem.constraint_names
     physics_index = problem.constraint_index[lane.PHYSICS_CONSTRAINT_NAME]

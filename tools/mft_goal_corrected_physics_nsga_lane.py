@@ -292,7 +292,7 @@ def _physics_gate(model: Mapping[str, Any]) -> dict[str, Any]:
 
 def _turn_split_repair_contract() -> dict[str, Any]:
     return {
-        "schema_version": "mft-goal-corrected-N2-split-local-repair-v1",
+        "schema_version": "mft-goal-corrected-N2-split-local-repair-v2",
         "fixed_total_secondary_turns": 60,
         "N2_main_minimum": SPLIT_MIN_N2_MAIN,
         "N2_main_maximum": SPLIT_MAX_N2_MAIN,
@@ -317,6 +317,12 @@ def _turn_split_repair_contract() -> dict[str, Any]:
         "terminal_immediate_neighbor_splits_sealed": True,
         "terminal_before_after_Llt_G_sealed": True,
         "coordinate_genome_is_geometry_donor_not_Llt_rejection_authority": True,
+        "enumeration_geometry_policy": (
+            "hold_decoded_geometry_conductor_sections_and_gaps_fixed"
+        ),
+        "split_dependent_derived_features_recomputed": True,
+        "decoder_reprojection_per_split_used": False,
+        "vectorized_Llt_enumeration": True,
     }
 
 
@@ -549,6 +555,242 @@ def _candidate_prediction(
     return prediction
 
 
+def _expanded_fixed_geometry_split_frame(
+    frame: Any,
+    *,
+    decoder_valid: Any,
+) -> tuple[Any, np.ndarray]:
+    """Enumerate the integer secondary split without moving the geometry.
+
+    The base decoder's coordinate projection depends on ``u_N2_side``.  Calling
+    that projection 49 times therefore changes l1/l2/spacing in addition to the
+    requested turn split.  A local repair must instead hold the decoded
+    geometry, conductor section and insulation gaps fixed and update only the
+    exact split-dependent derived quantities used by Llt inference.
+    """
+
+    count = len(frame)
+    repeats = len(SPLIT_VALUES)
+    expanded = frame.iloc[
+        np.repeat(np.arange(count, dtype=int), repeats)
+    ].reset_index(drop=True).copy()
+    split_main = np.tile(
+        np.asarray(SPLIT_VALUES, dtype=int),
+        count,
+    )
+    split_side = 60 - split_main
+    expanded["N2_main"] = split_main
+    expanded["N2_side"] = split_side
+    if "N2" in expanded.columns:
+        expanded["N2"] = 60
+
+    # The unit-test problem intentionally exposes only the turn columns.  The
+    # production decoder exposes this complete derived-geometry set.
+    required = {
+        "l2",
+        "cw2",
+        "gap2",
+        "nwh2",
+        "h1",
+        "sl2_main_x",
+        "sl2_main_y",
+        "sl2_side_x",
+        "sl2_side_y",
+        "cc_w2c_space_x",
+        "w2c_w1c_space_x",
+        "nwl1_main",
+        "w1s_cs_space_x",
+        "w1c_w2s_space_x",
+    }
+    production_geometry = required.issubset(expanded.columns)
+    if not production_geometry:
+        return expanded, np.ones(len(expanded), dtype=bool)
+
+    def values(name: str) -> np.ndarray:
+        return np.asarray(expanded[name], dtype=float)
+
+    cw2 = values("cw2")
+    gap2 = values("gap2")
+    nwh2 = values("nwh2")
+    nwl2_main = (
+        split_main * cw2
+        + np.maximum(split_main - 1, 0) * gap2
+    )
+    nwl2_side = np.where(
+        split_side > 0,
+        split_side * cw2
+        + np.maximum(split_side - 1, 0) * gap2,
+        0.0,
+    )
+    expanded["nwl2_main"] = nwl2_main
+    expanded["nwl2_side"] = nwl2_side
+    expanded["wff2_main"] = np.divide(
+        split_main * cw2,
+        nwl2_main,
+        out=np.zeros_like(cw2),
+        where=nwl2_main > 0.0,
+    )
+    expanded["wff2_side"] = np.divide(
+        split_side * cw2,
+        nwl2_side,
+        out=np.zeros_like(cw2),
+        where=nwl2_side > 0.0,
+    )
+
+    sl2_main_x = values("sl2_main_x")
+    sl2_main_y = values("sl2_main_y")
+    sl1_main_x = (
+        sl2_main_x
+        + 2.0 * nwl2_main
+        + 2.0 * values("w2c_w1c_space_x")
+    )
+    if "w2c_w1c_space_y" in expanded.columns:
+        sl1_main_y = (
+            sl2_main_y
+            + 2.0 * nwl2_main
+            + 2.0 * values("w2c_w1c_space_y")
+        )
+        expanded["sl1_main_y"] = sl1_main_y
+    expanded["sl1_main_x"] = sl1_main_x
+
+    center_stack = (
+        values("cc_w2c_space_x")
+        + nwl2_main
+        + values("w2c_w1c_space_x")
+        + values("nwl1_main")
+    )
+    side_stack = values("w1s_cs_space_x") + nwl2_side
+    actual_clearance = values("l2") - center_stack - side_stack
+    expanded["w1c_w2s_gap_x_actual"] = actual_clearance
+
+    round_corner = (
+        values("round_corner") != 0.0
+        if "round_corner" in expanded.columns
+        else np.zeros(len(expanded), dtype=bool)
+    )
+    corner_radius = (
+        values("corner_radius")
+        if "corner_radius" in expanded.columns
+        else np.zeros(len(expanded), dtype=float)
+    )
+    wcp_len_ref_x = sl1_main_x - np.where(
+        round_corner,
+        2.0 * corner_radius,
+        0.0,
+    )
+    expanded["wcp_len_ref_x"] = wcp_len_ref_x
+    if {"wcp_len_pct", "wcp_len_x"}.issubset(expanded.columns):
+        # validation_check reports the realized percentage after the
+        # authoritative 0.1-mm length quantization.  Rounding it back to one
+        # decimal recovers the sampled percentage used by the decoder.
+        requested_pct = np.round(values("wcp_len_pct"), 1)
+        wcp_len_x = np.round(
+            wcp_len_ref_x * requested_pct / 100.0,
+            1,
+        )
+        expanded["wcp_len_x"] = wcp_len_x
+        expanded["wcp_len_pct"] = np.divide(
+            100.0 * wcp_len_x,
+            wcp_len_ref_x,
+            out=np.full_like(wcp_len_x, np.nan),
+            where=wcp_len_ref_x > 0.0,
+        )
+
+    def copper_group(
+        turns: np.ndarray,
+        inner_x: np.ndarray,
+        inner_y: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        turns_float = np.asarray(turns, dtype=float)
+        total_length = 4.0 * (
+            turns_float * ((inner_x + inner_y) / 2.0 + cw2)
+            + (cw2 + gap2) * turns_float * (turns_float - 1.0)
+        )
+        mlt = np.divide(
+            total_length,
+            turns_float,
+            out=np.zeros_like(total_length),
+            where=turns_float > 0.0,
+        )
+        mass = total_length * cw2 * nwh2 * 1e-9 * 8940.0
+        return mlt, mass
+
+    mlt_main, mass_main = copper_group(
+        split_main,
+        sl2_main_x,
+        sl2_main_y,
+    )
+    mlt_side, mass_side_single = copper_group(
+        split_side,
+        values("sl2_side_x"),
+        values("sl2_side_y"),
+    )
+    expanded["MLT_Rx_main_mm"] = mlt_main
+    expanded["MLT_Rx_side_mm"] = mlt_side
+    expanded["cu_mass_Rx_main_kg"] = mass_main
+    expanded["cu_mass_Rx_side_kg"] = 2.0 * mass_side_single
+    if "cu_mass_Tx_kg" in expanded.columns:
+        expanded["cu_mass_total_kg"] = (
+            values("cu_mass_Tx_kg")
+            + mass_main
+            + 2.0 * mass_side_single
+        )
+    expanded["window_fill_x"] = np.divide(
+        center_stack + side_stack,
+        values("l2"),
+        out=np.full(len(expanded), np.inf, dtype=float),
+        where=values("l2") > 0.0,
+    )
+
+    finite_names = tuple(
+        name
+        for name in (
+            "l2",
+            "h1",
+            "cw1",
+            "gap1",
+            "cw2",
+            "gap2",
+            "nwh1",
+            "nwh2",
+            "core_depth_each",
+            "nwl2_main",
+            "nwl2_side",
+            "w1c_w2s_gap_x_actual",
+            "wcp_len_ref_x",
+        )
+        if name in expanded.columns
+    )
+    valid = np.ones(len(expanded), dtype=bool)
+    if finite_names:
+        valid &= np.isfinite(
+            expanded.loc[:, finite_names].to_numpy(dtype=float)
+        ).all(axis=1)
+    valid &= cw2 > 0.0
+    valid &= gap2 > 0.0
+    valid &= values("l2") > 0.0
+    valid &= values("h1") > 0.0
+    valid &= nwh2 <= values("h1")
+    if "nwh1" in expanded.columns:
+        valid &= values("nwh1") <= values("h1")
+    if "cw1" in expanded.columns:
+        valid &= values("cw1") > 0.0
+    if "gap1" in expanded.columns:
+        valid &= values("gap1") > 0.0
+    if "core_depth_each" in expanded.columns:
+        valid &= values("core_depth_each") > 0.0
+    valid &= actual_clearance >= values("w1c_w2s_space_x")
+    valid &= wcp_len_ref_x > 0.0
+
+    # A decoder exception produces an empty/NaN base row and is already
+    # rejected by the finite checks.  A merely split-specific invalid base row
+    # is deliberately not copied to all 49 alternatives.
+    base_valid = np.asarray(decoder_valid, dtype=bool).reshape(-1)
+    if base_valid.shape != (count,):
+        raise RuntimeError("N2 split base decoder-valid shape mismatch")
+    return expanded, valid
+
+
 def _install_turn_split_local_repair(
     problem: Any,
     *,
@@ -593,18 +835,17 @@ def _install_turn_split_local_repair(
         ):
             raise RuntimeError("N2 split repair coordinate shape mismatch")
         count = len(coordinates)
-        expanded = np.repeat(coordinates, len(SPLIT_VALUES), axis=0)
-        expanded[:, coordinate_index] = np.tile(unit_values, count)
-        expanded = np.asarray(
-            problem.repair_unit_coordinates(expanded), dtype=float
+        base_frame, base_shrink, base_valid = original_decode(coordinates)
+        base_shrink = np.asarray(base_shrink, dtype=float).reshape(-1)
+        base_valid = np.asarray(base_valid, dtype=bool).reshape(-1)
+        frame, valid = _expanded_fixed_geometry_split_frame(
+            base_frame,
+            decoder_valid=base_valid,
         )
-        frame, shrink, valid = original_decode(expanded)
-        shrink = np.asarray(shrink, dtype=float).reshape(-1)
-        valid = np.asarray(valid, dtype=bool).reshape(-1)
         expected = count * len(SPLIT_VALUES)
         if (
             len(frame) != expected
-            or shrink.shape != (expected,)
+            or base_shrink.shape != (count,)
             or valid.shape != (expected,)
         ):
             raise RuntimeError("N2 split expanded decode shape mismatch")
@@ -722,7 +963,7 @@ def _install_turn_split_local_repair(
 
         selected = np.asarray(selected_indices, dtype=int)
         selected_frame = frame.iloc[selected].reset_index(drop=True).copy()
-        selected_shrink = shrink[selected]
+        selected_shrink = base_shrink.copy()
         selected_valid = valid[selected]
         for index, audit in enumerate(audit_rows):
             original = audit["original"] or {}
