@@ -73,6 +73,18 @@ POSTDEADLINE_COLLECTION_SCHEMA = (
 POSTDEADLINE_AUTHENTICATED_COLLECTION_SCHEMA = (
     "mft-goal-postdeadline-standard-authenticated-collection-v1"
 )
+CORRECTED_REPLACEMENT_COLLECTION_SCHEMA = (
+    "mft-goal-corrected-replacement-strict-collection-v1"
+)
+CORRECTED_REPLACEMENT_AUTHENTICATED_COLLECTION_SCHEMA = (
+    "mft-goal-corrected-replacement-strict-authenticated-collection-v1"
+)
+CORRECTED_REPLACEMENT_MANIFEST_SCHEMA = (
+    "mft-goal-corrected-replacement-strict-manifest-v1"
+)
+CORRECTED_REPLACEMENT_AUTHENTICATED_MANIFEST_SCHEMA = (
+    "mft-goal-corrected-replacement-strict-authenticated-manifest-v1"
+)
 GOAL_PROFILE_PATH = (
     REGRESSION_ROOT / "verify" / "profiles" / "goal_standard.json"
 )
@@ -464,6 +476,126 @@ def _authenticate_postdeadline_collection(path: Path) -> AuthenticatedTruth:
     )
 
 
+def _corrected_replacement_adapter() -> Any:
+    try:
+        adapter = importlib.import_module(
+            "tools.mft_goal_corrected_replacement_strict_collect"
+        )
+    except ImportError as exc:
+        raise StrictALIngestError(
+            "corrected replacement collection adapter is unavailable"
+        ) from exc
+    expected = {
+        "COLLECTION_SCHEMA": CORRECTED_REPLACEMENT_COLLECTION_SCHEMA,
+        "AUTHENTICATED_COLLECTION_SCHEMA": (
+            CORRECTED_REPLACEMENT_AUTHENTICATED_COLLECTION_SCHEMA
+        ),
+        "MANIFEST_SCHEMA": CORRECTED_REPLACEMENT_MANIFEST_SCHEMA,
+        "AUTHENTICATED_MANIFEST_SCHEMA": (
+            CORRECTED_REPLACEMENT_AUTHENTICATED_MANIFEST_SCHEMA
+        ),
+    }
+    if any(
+        getattr(adapter, name, None) != value
+        for name, value in expected.items()
+    ):
+        raise StrictALIngestError(
+            "corrected replacement adapter schema drifted"
+        )
+    return adapter
+
+
+def _authenticate_corrected_replacement_collection(
+    path: Path,
+) -> AuthenticatedTruth:
+    raw = _read_json(path)
+    if (
+        raw.get("schema_version")
+        != CORRECTED_REPLACEMENT_COLLECTION_SCHEMA
+    ):
+        raise StrictALIngestError(
+            "corrected replacement collection schema mismatch"
+        )
+    adapter = _corrected_replacement_adapter()
+    authenticator = getattr(adapter, "authenticate_collection", None)
+    if not callable(authenticator):
+        raise StrictALIngestError(
+            "corrected replacement public authenticator is unavailable"
+        )
+    try:
+        view = authenticator(path)
+    except Exception as exc:
+        contract_error = getattr(
+            adapter, "CorrectedReplacementCollectionError", None
+        )
+        if contract_error is not None and isinstance(exc, contract_error):
+            raise StrictALIngestError(
+                "corrected replacement collection authentication failed: "
+                f"{path}"
+            ) from exc
+        raise
+    required_view_fields = {
+        "schema_version",
+        "collection",
+        "plan",
+        "params",
+        "selected",
+        "submission",
+    }
+    if (
+        not isinstance(view, Mapping)
+        or set(view) != required_view_fields
+        or view.get("schema_version")
+        != CORRECTED_REPLACEMENT_AUTHENTICATED_COLLECTION_SCHEMA
+    ):
+        raise StrictALIngestError(
+            "corrected replacement authenticated view drifted"
+        )
+    collection = view.get("collection")
+    plan = view.get("plan")
+    selected = view.get("selected")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            collection,
+            plan,
+            view.get("params"),
+            selected,
+            view.get("submission"),
+        )
+    ):
+        raise StrictALIngestError(
+            "corrected replacement authenticated objects are incomplete"
+        )
+    required_safety = {
+        "scheduler_status": "completed",
+        "scheduler_get_only_collection": True,
+        "scheduler_mutation_performed": False,
+        "scientific_valid": True,
+        "unique_geometry_admitted": True,
+        "truth_use_only": True,
+        "diagnostic_only": True,
+        "production_eligible": False,
+        "automatic_promotion": False,
+        "legacy_collection_reused": False,
+        "legacy_collection_rows_reused": 0,
+    }
+    if any(
+        collection.get(key) != expected
+        for key, expected in required_safety.items()
+    ):
+        raise StrictALIngestError(
+            "corrected replacement collection safety boundary drifted"
+        )
+    return _authenticated_truth(
+        "corrected_replacement",
+        path,
+        collection=collection,
+        plan=plan,
+        selected=selected,
+    )
+
+
 def _authenticated_truth(
     adapter_kind: str,
     path: Path,
@@ -533,10 +665,82 @@ def authenticate_collection(path: Path) -> AuthenticatedTruth:
         return _authenticate_diagnostic_collection(resolved)
     if schema == POSTDEADLINE_COLLECTION_SCHEMA:
         return _authenticate_postdeadline_collection(resolved)
+    if schema == CORRECTED_REPLACEMENT_COLLECTION_SCHEMA:
+        return _authenticate_corrected_replacement_collection(resolved)
     raise StrictALIngestError(
         "unsupported collection schema; raw JSON/CSV ingestion is forbidden: "
         f"{schema!r}"
     )
+
+
+def collections_from_corrected_manifests(
+    manifest_paths: Sequence[Path],
+) -> tuple[Path, ...]:
+    """Expand only authenticated corrected-replacement aggregate manifests."""
+
+    if not manifest_paths:
+        return ()
+    if len(set(map(str, manifest_paths))) != len(manifest_paths):
+        raise StrictALIngestError(
+            "corrected replacement manifest paths are duplicated"
+        )
+    adapter = _corrected_replacement_adapter()
+    authenticator = getattr(adapter, "authenticate_manifest", None)
+    if not callable(authenticator):
+        raise StrictALIngestError(
+            "corrected replacement manifest authenticator is unavailable"
+        )
+    collections: list[Path] = []
+    for manifest_path in manifest_paths:
+        resolved = _regular_file(
+            manifest_path, "corrected replacement manifest"
+        )
+        raw = _read_json(resolved)
+        if (
+            raw.get("schema_version")
+            != CORRECTED_REPLACEMENT_MANIFEST_SCHEMA
+        ):
+            raise StrictALIngestError(
+                "corrected replacement manifest schema mismatch"
+            )
+        try:
+            view = authenticator(resolved)
+        except Exception as exc:
+            contract_error = getattr(
+                adapter, "CorrectedReplacementCollectionError", None
+            )
+            if contract_error is not None and isinstance(
+                exc, contract_error
+            ):
+                raise StrictALIngestError(
+                    "corrected replacement manifest authentication failed: "
+                    f"{resolved}"
+                ) from exc
+            raise
+        if (
+            not isinstance(view, Mapping)
+            or set(view)
+            != {
+                "schema_version",
+                "manifest",
+                "collection_paths",
+                "retraining_trigger",
+            }
+            or view.get("schema_version")
+            != CORRECTED_REPLACEMENT_AUTHENTICATED_MANIFEST_SCHEMA
+            or not isinstance(view.get("manifest"), Mapping)
+            or not isinstance(view.get("retraining_trigger"), Mapping)
+            or not isinstance(view.get("collection_paths"), tuple)
+        ):
+            raise StrictALIngestError(
+                "corrected replacement authenticated manifest view drifted"
+            )
+        collections.extend(view["collection_paths"])
+    if len(collections) != len(set(collections)):
+        raise StrictALIngestError(
+            "corrected replacement manifests duplicate a collection"
+        )
+    return tuple(collections)
 
 
 def _same_exact(actual: Any, expected: Any) -> bool:
@@ -1336,8 +1540,19 @@ def _parser() -> argparse.ArgumentParser:
         "--collection",
         type=Path,
         action="append",
-        required=True,
-        help="Repeat for each sealed production/diagnostic collection.",
+        help=(
+            "Repeat for each sealed production/diagnostic collection. "
+            "Cannot be mixed with --collection-manifest."
+        ),
+    )
+    parser.add_argument(
+        "--collection-manifest",
+        type=Path,
+        action="append",
+        help=(
+            "Repeat for each sealed corrected-replacement strict manifest. "
+            "The manifest's authenticated collections are consumed directly."
+        ),
     )
     parser.add_argument(
         "--minimum-useful-rows",
@@ -1367,11 +1582,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise StrictALIngestError("expected base SHA-256 is invalid")
     if args.expected_base_rows <= 0:
         raise StrictALIngestError("expected base row count must be positive")
+    if args.collection and args.collection_manifest:
+        raise StrictALIngestError(
+            "direct collections cannot be mixed with corrected replacement "
+            "manifests"
+        )
+    if args.collection_manifest:
+        collection_paths = collections_from_corrected_manifests(
+            args.collection_manifest
+        )
+    else:
+        collection_paths = tuple(args.collection or ())
+    if not collection_paths:
+        raise StrictALIngestError(
+            "at least one authenticated collection or corrected replacement "
+            "manifest collection is required"
+        )
     prepared = prepare_ingest(
         base_dataset=args.base_dataset,
         expected_base_sha256=args.expected_base_sha256.lower(),
         expected_base_rows=args.expected_base_rows,
-        collection_paths=args.collection,
+        collection_paths=collection_paths,
         minimum_useful_rows=args.minimum_useful_rows,
         minimum_source_tasks=args.minimum_source_tasks,
     )

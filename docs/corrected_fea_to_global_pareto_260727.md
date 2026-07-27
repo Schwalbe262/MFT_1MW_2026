@@ -33,14 +33,16 @@ infeasibility.
 
 The only corrected replacement authority is:
 
-`C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\rx_interface_corrected24_cutover_v1`
+`C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\clean_library_thermal24_replay_v1`
 
-Its sealed submission receipt binds tasks `97042..97065` to 24 unique physical
-geometries: 16 cooler-neighborhood lanes and 8 primary-temperature last-mile
-lanes. Task `97041` is the shared-interface canary and must not be added as a
-25th training row. The cancelled tasks `96743`, `97014..97029`, and
-`97033..97040` are diagnostic failure evidence only and must never enter a
-dataset, truth front, or model-quality calculation.
+Its sealed replay plan and submission receipt bind clean-library tasks
+`97116..97139` to 24 unique physical geometries. Tasks `97042..97065` are
+source-lineage identities only: their results and the old
+`collection_live_detailed_v1.json` are forbidden training inputs. Task `97041`
+is the shared-interface canary and must not be added as a 25th training row.
+The cancelled tasks `96743`, `97014..97029`, and `97033..97040` are diagnostic
+failure evidence only and must never enter a dataset, truth front, or
+model-quality calculation.
 
 Each admitted corrected result must satisfy all of the following:
 
@@ -70,6 +72,20 @@ Each admitted corrected result must satisfy all of the following:
 
 Thermally infeasible but scientifically valid rows are useful training data.
 Scientifically invalid rows are not.
+
+Collect an immutable GET-only snapshot with:
+
+```powershell
+python tools/mft_goal_corrected_replacement_strict_collect.py `
+  --receipt C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\clean_library_thermal24_replay_v1\submission_receipt.json `
+  --replay-plan C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\clean_library_thermal24_replay_v1\replay_plan.json `
+  --output-dir <new-immutable-output-directory>
+```
+
+The resulting `manifest.json` contains only scientific-valid unique
+collections. Supply that aggregate seal directly to strict ingest with
+`--collection-manifest <path-to-manifest.json>`. Do not combine this argument
+with direct `--collection` inputs.
 
 ## Retraining trigger
 
