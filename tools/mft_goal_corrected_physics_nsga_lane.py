@@ -1747,10 +1747,14 @@ def _configure_from_bundle(bundle_root: Path) -> dict[str, Any]:
     _coordinator_offload()
     bundle = _read_json(bundle_root / "bundle_manifest.json")
     relatives = bundle.get("task_relative_paths") or []
-    if len(relatives) != SEED_COUNT:
-        raise RuntimeError("corrected bundle does not contain exact60 tasks")
+    if not relatives:
+        raise RuntimeError("corrected bundle contains no tasks")
     first = (bundle_root / str(relatives[0])).resolve(strict=True)
     model = _model_from_payload(first)
+    if len(relatives) != SEED_COUNT:
+        raise RuntimeError(
+            "corrected bundle task count differs from its sealed interval"
+        )
     configure_runtime(model)
     return model
 

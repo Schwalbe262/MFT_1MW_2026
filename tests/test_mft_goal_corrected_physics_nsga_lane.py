@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -97,6 +98,38 @@ def test_corrected_successor_seed_interval_is_bounded(
     assert validated["authorized_seed_end_inclusive"] == 2_607_264_499
     with pytest.raises(RuntimeError, match="outside the sealed range"):
         lane._set_seed_interval(2_607_264_999, 2)
+
+
+def test_bundle_configuration_reads_successor_interval_before_count_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("SEED_START", "SEED_COUNT", "SEED_END"):
+        monkeypatch.setattr(lane, name, getattr(lane, name))
+    monkeypatch.setattr(lane, "_coordinator_offload", lambda: object())
+    monkeypatch.setattr(lane, "configure_runtime", lambda _model: None)
+    task_paths = [f"tasks/seed-{index}.json" for index in range(40)]
+    for relative in task_paths:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+    (tmp_path / "bundle_manifest.json").write_text(
+        '{"task_relative_paths": ['
+        + ",".join(f'"{relative}"' for relative in task_paths)
+        + "]}\n",
+        encoding="utf-8",
+    )
+
+    def configure_from_first(_path: Path) -> dict[str, str]:
+        lane._set_seed_interval(2_607_264_460, 40)
+        return {"model": "fixture"}
+
+    monkeypatch.setattr(lane, "_model_from_payload", configure_from_first)
+
+    assert lane._configure_from_bundle(tmp_path) == {"model": "fixture"}
+    assert lane.SEED_START == 2_607_264_460
+    assert lane.SEED_COUNT == 40
+    assert lane.SEED_END == 2_607_264_499
 
 
 def test_corrected_runtime_authorization_reaches_diagnostic_gate(
