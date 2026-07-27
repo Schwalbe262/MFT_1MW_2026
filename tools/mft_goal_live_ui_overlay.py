@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import copy
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -61,14 +62,19 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         staged_path.unlink(missing_ok=True)
 
 
-def _get_tasks(scheduler_url: str, prefix: str) -> list[dict[str, Any]]:
-    query = urllib.parse.urlencode(
-        {
-            "limit": 10000,
-            "project": PROJECT,
-            "name_prefix": prefix,
-        }
-    )
+def _get_tasks(
+    scheduler_url: str,
+    prefix: str,
+    *,
+    project: str | None = PROJECT,
+) -> list[dict[str, Any]]:
+    parameters: dict[str, Any] = {
+        "limit": 10000,
+        "name_prefix": prefix,
+    }
+    if project is not None:
+        parameters["project"] = project
+    query = urllib.parse.urlencode(parameters)
     request = urllib.request.Request(
         f"{scheduler_url.rstrip('/')}/api/tasks?{query}",
         method="GET",
@@ -79,6 +85,27 @@ def _get_tasks(scheduler_url: str, prefix: str) -> list[dict[str, Any]]:
     if not isinstance(value, list) or len(value) >= 10000:
         raise RuntimeError(f"Scheduler task inventory is malformed: {prefix}")
     return [dict(row) for row in value if isinstance(row, Mapping)]
+
+
+def _receipt_inventory(receipt_path: Path) -> tuple[set[int], str]:
+    raw = receipt_path.read_bytes()
+    receipt = json.loads(raw.decode("utf-8"))
+    tasks = receipt.get("tasks") or []
+    if (
+        receipt.get("scheduler_post_count") != 60
+        or len(tasks) != 60
+        or {int(row["seed"]) for row in tasks}
+        != set(range(2607264400, 2607264460))
+        or any(
+            not str(row.get("name") or "").startswith(NSGA_PREFIX)
+            for row in tasks
+        )
+    ):
+        raise RuntimeError("corrected exact60 receipt inventory mismatch")
+    task_ids = {int(row["task_id"]) for row in tasks}
+    if len(task_ids) != 60:
+        raise RuntimeError("corrected exact60 receipt task IDs are not unique")
+    return task_ids, hashlib.sha256(raw).hexdigest()
 
 
 def _counts(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
@@ -163,11 +190,20 @@ def update(
     status_file: Path,
     scheduler_url: str,
     core_rescue_plan: Path,
+    nsga_receipt: Path | None = None,
     fea_prefix: str = FEA_PREFIX,
     extra_fea_prefixes: Iterable[str] = (),
 ) -> dict[str, Any]:
     status = _read_json(status_file)
-    nsga_rows = _get_tasks(scheduler_url, NSGA_PREFIX)
+    receipt_ids: set[int] | None = None
+    receipt_sha256: str | None = None
+    if nsga_receipt is not None:
+        receipt_ids, receipt_sha256 = _receipt_inventory(nsga_receipt)
+    nsga_rows = _get_tasks(scheduler_url, NSGA_PREFIX, project=None)
+    if receipt_ids is not None:
+        nsga_rows = [
+            row for row in nsga_rows if int(row["id"]) in receipt_ids
+        ]
     fea_rows_by_id: dict[int, dict[str, Any]] = {}
     for prefix in (fea_prefix, *extra_fea_prefixes):
         for row in _get_tasks(scheduler_url, prefix):
@@ -198,6 +234,14 @@ def update(
         "physics-delta mean acquisition + final direct turn-graded FEA",
         "Scheduler access by this UI watcher=GET only",
     ]
+    if nsga_receipt is not None and receipt_ids is not None:
+        nsga_evidence.insert(
+            1,
+            "sealed receipt task IDs="
+            f"{min(receipt_ids)}..{max(receipt_ids)} / exact count=60",
+        )
+        nsga_evidence.insert(2, f"receipt={nsga_receipt}")
+        nsga_evidence.insert(3, f"receipt SHA256={receipt_sha256}")
     if not nsga_rows:
         nsga_evidence.insert(0, "상태=sealed prepare/stage/POST 진행 중")
 
@@ -284,6 +328,10 @@ def update(
         "scheduler_access": "GET_only",
         "scheduler_mutation_performed": False,
         "nsga_task_count": len(nsga_rows),
+        "nsga_receipt": str(nsga_receipt) if nsga_receipt else None,
+        "nsga_receipt_sha256": receipt_sha256,
+        "nsga_task_id_first": min(receipt_ids) if receipt_ids else None,
+        "nsga_task_id_last": max(receipt_ids) if receipt_ids else None,
         "fea_task_count": len(fea_rows),
         "fea_task_prefix": fea_prefix,
         "extra_fea_task_prefixes": list(extra_fea_prefixes),
@@ -300,6 +348,7 @@ def _parser() -> argparse.ArgumentParser:
         "--scheduler-url", default="http://127.0.0.1:8002"
     )
     parser.add_argument("--core-rescue-plan", type=Path, required=True)
+    parser.add_argument("--nsga-receipt", type=Path)
     parser.add_argument("--fea-prefix", default=FEA_PREFIX)
     parser.add_argument("--extra-fea-prefix", action="append", default=[])
     parser.add_argument("--pid-file", type=Path)
@@ -327,6 +376,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             status_file=args.status_file,
             scheduler_url=args.scheduler_url,
             core_rescue_plan=args.core_rescue_plan,
+            nsga_receipt=args.nsga_receipt,
             fea_prefix=args.fea_prefix,
             extra_fea_prefixes=args.extra_fea_prefix,
         )
