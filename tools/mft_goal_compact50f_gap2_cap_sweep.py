@@ -1,9 +1,10 @@
-"""Prepare the strict compact50f gap2 direct-cap sweep.
+"""Prepare strict compact50f gap2 or equal-height direct-cap sweeps.
 
-The exact task-97585 geometry is kept fixed except for secondary inter-turn
-spacing.  Each point is re-derived through the production strict validator and
-must remain inside 1200 x 900 x 750 mm (with the tighter 1150-mm width audit)
-before a feeder-compatible, sealed cap-screen plan is emitted.
+The exact task-97585 geometry is kept fixed except for either secondary
+inter-turn spacing or the common primary/secondary winding height.  Each point
+is re-derived through the production strict validator and must remain inside
+1200 x 900 x 750 mm (with the tighter 1150-mm width audit) before a
+feeder-compatible, sealed cap-screen plan is emitted.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ SOLVER_REVISION = "06726ed20c9a9a0eeb472f2457fde0d332bc4405"
 LIBRARY_REVISION = "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
 BASE_TASK_ID = 97585
 DEFAULT_GAPS = (0.85, 0.95, 1.05, 1.10)
+DEFAULT_HEIGHT_MM = 490.0
 CAP_MODE = "matrix_turngraded_rx_cap"
 
 
@@ -74,6 +76,8 @@ def _external_record(path: Path) -> dict[str, Any]:
 
 def _validated(
     raw: Mapping[str, Any],
+    *,
+    expected_height_mm: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         ok, frame, errors = validation_check(
@@ -102,9 +106,9 @@ def _validated(
             and float(row["l2"]) == 280.0
             and float(row["w1"]) == 484.0
         ),
-        "equal_winding_height_490": (
-            float(row["nwh1"]) == 490.0
-            and float(row["nwh2"]) == 490.0
+        "equal_winding_height_requested": (
+            float(row["nwh1"]) == expected_height_mm
+            and float(row["nwh2"]) == expected_height_mm
         ),
         "fixed_foils": (
             float(row["cw1"]) == 5.0
@@ -151,7 +155,11 @@ def _validated(
     }
 
 
-def prepare(output: Path, *, gaps: tuple[float, ...]) -> Path:
+def prepare(
+    output: Path,
+    *,
+    specs: tuple[tuple[float, float], ...],
+) -> Path:
     destination = output.resolve()
     if destination.exists():
         raise CompactSweepError(f"output exists: {destination}")
@@ -184,11 +192,13 @@ def prepare(output: Path, *, gaps: tuple[float, ...]) -> Path:
 
     rows: list[dict[str, Any]] = []
     lanes: list[dict[str, Any]] = []
-    for lane_index, gap2 in enumerate(gaps, start=1):
+    for lane_index, (gap2, winding_height) in enumerate(specs, start=1):
         raw = copy.deepcopy(base_params)
         raw.update(
             {
                 "gap2": float(gap2),
+                "nwh1": float(winding_height),
+                "nwh2": float(winding_height),
                 "matrix_on": 1,
                 "cap_on": 1,
                 "cap_turn_graded_active_winding": "Rx",
@@ -202,9 +212,14 @@ def prepare(output: Path, *, gaps: tuple[float, ...]) -> Path:
                 "full_model": 0,
             }
         )
-        effective, audit = _validated(raw)
+        effective, audit = _validated(
+            raw,
+            expected_height_mm=float(winding_height),
+        )
         candidate_sha = feeder._sha(effective)
-        candidate_id = f"gap2_{gap2:.2f}".replace(".", "p")
+        candidate_id = (
+            f"gap2_{gap2:.3f}_h{winding_height:.1f}".replace(".", "p")
+        )
         params_path = feeder._write(
             destination / "params" / f"lane-{lane_index:02d}.json",
             effective,
@@ -226,6 +241,7 @@ def prepare(output: Path, *, gaps: tuple[float, ...]) -> Path:
                 "candidate_id": candidate_id,
                 "candidate_sha256": candidate_sha,
                 "gap2_mm": float(gap2),
+                "equal_winding_height_mm": float(winding_height),
                 **audit,
             }
         )
@@ -280,7 +296,9 @@ def prepare(output: Path, *, gaps: tuple[float, ...]) -> Path:
                 "n_core_group": 5,
                 "l2_mm": 280.0,
                 "w1_mm": 484.0,
-                "equal_winding_height_mm": 490.0,
+                "equal_winding_height_values_mm": sorted(
+                    {height for _gap, height in specs}
+                ),
                 "cw1_mm": 5.0,
                 "gap1_mm": 1.6,
                 "cw2_mm": 0.3,
@@ -298,7 +316,10 @@ def prepare(output: Path, *, gaps: tuple[float, ...]) -> Path:
             },
             "selection": {
                 "candidate_count": len(rows),
-                "gap2_values_mm": list(gaps),
+                "gap2_values_mm": sorted({gap for gap, _height in specs}),
+                "equal_winding_height_values_mm": sorted(
+                    {height for _gap, height in specs}
+                ),
                 "strict_geometry_audit": rows,
                 "direct_cap_FEA_is_final_cap_authority": True,
             },
@@ -322,11 +343,31 @@ def main(argv: Iterable[str] | None = None) -> int:
         action="append",
         help="repeat for each requested gap; defaults to .85/.95/1.05/1.10",
     )
+    parser.add_argument(
+        "--height",
+        type=float,
+        action="append",
+        help=(
+            "repeat for an equal-winding-height sweep; when present, gap2 is "
+            "held at --fixed-gap2"
+        ),
+    )
+    parser.add_argument("--fixed-gap2", type=float, default=0.85)
     args = parser.parse_args(argv)
-    gaps = tuple(args.gap2) if args.gap2 else DEFAULT_GAPS
-    if len(gaps) != len(set(gaps)) or any(gap <= 0.0 for gap in gaps):
-        raise CompactSweepError("gap2 values must be unique and positive")
-    path = prepare(args.output, gaps=gaps)
+    if args.height and args.gap2:
+        raise CompactSweepError("--height and --gap2 are mutually exclusive")
+    if args.height:
+        heights = tuple(args.height)
+        specs = tuple((float(args.fixed_gap2), height) for height in heights)
+    else:
+        gaps = tuple(args.gap2) if args.gap2 else DEFAULT_GAPS
+        specs = tuple((gap, DEFAULT_HEIGHT_MM) for gap in gaps)
+    if (
+        len(specs) != len(set(specs))
+        or any(gap <= 0.0 or height <= 0.0 for gap, height in specs)
+    ):
+        raise CompactSweepError("gap2/height specs must be unique and positive")
+    path = prepare(args.output, specs=specs)
     print(path)
     return 0
 
