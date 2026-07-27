@@ -242,6 +242,69 @@ def test_bounded_secondary_batch_audit_reports_every_hard_failure() -> None:
     assert not any(record["passed"] for record in records)
 
 
+def test_exact_l_stratum_repair_uses_submillimetre_y_space_control() -> None:
+    class Problem:
+        fixed_primary_turns = 6
+        sobol_dimension_names = (
+            "cc_w2c_space_y",
+            "w2c_w1c_space_y",
+            "cs_w1s_space_y",
+        )
+
+        @staticmethod
+        def _unit_from_physical(_name: str, value: float) -> float:
+            return float(value)
+
+        @staticmethod
+        def repair_unit_coordinates(values: object) -> np.ndarray:
+            return np.asarray(values, dtype=float)
+
+        @staticmethod
+        def decode_batch(values: object) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+            coordinates = np.asarray(values, dtype=float)
+            frame = pd.DataFrame(
+                {
+                    "cc_w2c_space_y": coordinates[:, 0],
+                    "w2c_w1c_space_y": coordinates[:, 1],
+                    "cs_w1s_space_y": coordinates[:, 2],
+                    "gap2": 0.35,
+                    "cw2": 0.8,
+                    "L_test": 810.0 + 2.0 * coordinates[:, 0],
+                }
+            )
+            return (
+                frame,
+                np.zeros(len(frame), dtype=float),
+                np.ones(len(frame), dtype=bool),
+            )
+
+        @staticmethod
+        def _goal_bounding_box_lit(row: object) -> tuple[float, tuple[float, float, float]]:
+            return 0.0, (1165.0, float(row["L_test"]), 740.0)
+
+    effective = scout._effective_constraint_profile()
+    contract = scout.preflight.goal_diagnostic_l900_compact_search_contract(
+        6,
+        effective_constraint_profile_sha256=effective["payload_sha256"],
+    )
+    repaired, evidence = scout._repair_bounded_secondary_l_band(
+        Problem(),
+        np.asarray([44.878, 44.0, 44.0]),
+        lower_mm=899.0,
+        upper_mm=899.5,
+        compact_contract=contract,
+    )
+    _values, audit = scout._bounded_secondary_coordinate_audit(
+        Problem(),
+        repaired.reshape(1, -1),
+        compact_contract=contract,
+    )
+
+    assert evidence["passed"] is True
+    assert 899.0 <= audit[0]["L_mm"] <= 899.5
+    assert repaired[0] < 44.878
+
+
 def test_search_profile_accepts_only_aligned_hgap20_continuations() -> None:
     profile = _profile(20)
     unsigned = {

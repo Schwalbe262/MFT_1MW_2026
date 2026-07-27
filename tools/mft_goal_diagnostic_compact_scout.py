@@ -1139,6 +1139,124 @@ def _bounded_secondary_coordinate_audit(
     return repaired, records
 
 
+def _repair_bounded_secondary_l_band(
+    problem: Any,
+    coordinate: np.ndarray,
+    *,
+    lower_mm: float,
+    upper_mm: float,
+    compact_contract: Mapping[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Use 0.1-mm y-space controls to hit a narrow exact L stratum."""
+
+    names = {
+        name: index
+        for index, name in enumerate(problem.sobol_dimension_names)
+    }
+    controls = (
+        "cc_w2c_space_y",
+        "w2c_w1c_space_y",
+        "cs_w1s_space_y",
+    )
+    current = np.asarray(coordinate, dtype=float).copy()
+    history: list[dict[str, Any]] = []
+    plateau_budget = 6
+
+    def distance(value: float) -> float:
+        return max(float(lower_mm) - value, value - float(upper_mm), 0.0)
+
+    for attempt in range(48):
+        repaired, audit = _bounded_secondary_coordinate_audit(
+            problem,
+            current.reshape(1, -1),
+            compact_contract=compact_contract,
+        )
+        current = repaired[0]
+        observed = float(audit[0]["L_mm"])
+        current_distance = distance(observed)
+        if current_distance <= 1e-9:
+            return current, {
+                "target_L_mm": [float(lower_mm), float(upper_mm)],
+                "attempts": attempt,
+                "history": history,
+                "passed": True,
+            }
+        frame, _shrink, valid = problem.decode_batch(
+            current.reshape(1, -1)
+        )
+        if not bool(valid[0]):
+            break
+        row = frame.iloc[0]
+        direction = -1.0 if observed > float(upper_mm) else 1.0
+        candidates: list[tuple[float, float, str, np.ndarray, float]] = []
+        for control in controls:
+            physical = float(row[control])
+            for step in (0.1, 0.2, 0.3, 0.5, 1.0):
+                candidate = current.copy()
+                candidate[names[control]] = problem._unit_from_physical(
+                    control,
+                    physical + direction * step,
+                )
+                candidate_values, candidate_audit = (
+                    _bounded_secondary_coordinate_audit(
+                        problem,
+                        candidate.reshape(1, -1),
+                        compact_contract=compact_contract,
+                    )
+                )
+                item = candidate_audit[0]
+                disallowed = [
+                    name
+                    for name in item["violations"]
+                    if name != "L_above_hard_limit"
+                ]
+                if not item["decoder_valid"] or disallowed:
+                    continue
+                candidate_l = float(item["L_mm"])
+                candidates.append(
+                    (
+                        distance(candidate_l),
+                        abs(candidate_l - (lower_mm + upper_mm) / 2.0),
+                        control,
+                        candidate_values[0],
+                        candidate_l,
+                    )
+                )
+        if not candidates:
+            break
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        best = candidates[0]
+        if best[0] > current_distance + 1e-9:
+            break
+        if best[0] >= current_distance - 1e-9:
+            if plateau_budget <= 0:
+                break
+            plateau_budget -= 1
+        history.append(
+            {
+                "attempt": attempt,
+                "control": best[2],
+                "L_before_mm": observed,
+                "L_after_mm": best[4],
+                "distance_before_mm": current_distance,
+                "distance_after_mm": best[0],
+            }
+        )
+        current = best[3]
+    _values, final_audit = _bounded_secondary_coordinate_audit(
+        problem,
+        current.reshape(1, -1),
+        compact_contract=compact_contract,
+    )
+    return current, {
+        "target_L_mm": [float(lower_mm), float(upper_mm)],
+        "attempts": len(history),
+        "history": history,
+        "passed": False,
+        "final": final_audit[0],
+    }
+
+
 def _finalize_bounded_secondary_coordinates(
     problem: Any,
     coordinates: Any,
@@ -1162,6 +1280,7 @@ def _finalize_bounded_secondary_coordinates(
         for index, name in enumerate(problem.sobol_dimension_names)
     }
     limits = contract["hard_size_limits_mm"]
+    source_rows = list(source_bank.get("rows") or [])
     repair_records: list[dict[str, Any]] = []
     for index, record in enumerate(initial):
         if record["passed"]:
@@ -1216,7 +1335,6 @@ def _finalize_bounded_secondary_coordinates(
                 changed = True
             for axis, physical_name, observed in (
                 ("W", "total_length", item["W_mm"]),
-                ("L", "w1", item["L_mm"]),
                 ("H", "total_height", item["H_mm"]),
             ):
                 excess = float(observed) - float(limits[axis])
@@ -1255,6 +1373,43 @@ def _finalize_bounded_secondary_coordinates(
             }
         )
 
+    l_band_repairs: list[dict[str, Any]] = []
+    values, before_l_audit = _bounded_secondary_coordinate_audit(
+        problem,
+        values,
+        compact_contract=contract,
+    )
+    for index, record in enumerate(before_l_audit):
+        desired = set(
+            (source_rows[index] if index < len(source_rows) else {}).get(
+                "memberships", []
+            )
+        )
+        l_bounds = [
+            contract["strata"][name]["L_mm"]
+            for name in desired
+            if "L_mm" in contract["strata"][name]
+        ]
+        if l_bounds:
+            lower = max(float(bounds[0]) for bounds in l_bounds)
+            upper = min(float(bounds[1]) for bounds in l_bounds)
+        elif float(record["L_mm"]) > float(limits["L"]) + 1e-9:
+            lower = float(limits["L"]) - 0.2
+            upper = float(limits["L"])
+        else:
+            continue
+        if lower <= float(record["L_mm"]) <= upper:
+            continue
+        repaired, evidence = _repair_bounded_secondary_l_band(
+            problem,
+            values[index],
+            lower_mm=lower,
+            upper_mm=upper,
+            compact_contract=contract,
+        )
+        values[index] = repaired
+        l_band_repairs.append({"row": index, **evidence})
+
     values, repaired_audit = _bounded_secondary_coordinate_audit(
         problem,
         values,
@@ -1265,7 +1420,6 @@ def _finalize_bounded_secondary_coordinates(
         if record["passed"]
     ]
     replacements: list[dict[str, Any]] = []
-    source_rows = list(source_bank.get("rows") or [])
     for index, record in enumerate(repaired_audit):
         if record["passed"]:
             continue
@@ -1334,6 +1488,7 @@ def _finalize_bounded_secondary_coordinates(
             record for record in initial if not record["passed"]
         ],
         "repair_records": repair_records,
+        "exact_L_stratum_repairs": l_band_repairs,
         "replacement_records": replacements,
         "final_row_count": len(final_audit),
         "final_failed_row_count": 0,
@@ -1478,6 +1633,47 @@ def _project_bounded_secondary_bank(
     result["bounded_secondary_final_projection"] = final_projection
     result.pop("sha256", None)
     result["sha256"] = canonical_sha256(result)
+    initialization = contract["initialization"]
+    required_counts = {
+        name: (
+            int(initialization["minimum_exact_rows_height_boundary"])
+            if name == "height_boundary"
+            else int(initialization["minimum_exact_rows_per_WL_stratum"])
+        )
+        for name in contract["active_strata_for_this_N1"]
+    }
+    distinct_topologies = sum(
+        bool(count) for count in result["topology_counts"].values()
+    )
+    prevalidation_failures = {
+        "membership_deficits": {
+            name: {
+                "observed": result["membership_counts"][name],
+                "required": required,
+            }
+            for name, required in required_counts.items()
+            if result["membership_counts"][name] < required
+        },
+        "distinct_topologies": distinct_topologies,
+        "minimum_distinct_topologies": int(
+            initialization["minimum_distinct_N2_main_topologies"]
+        ),
+        "near_band_fallback_used": result.get("near_band_fallback_used"),
+    }
+    if (
+        prevalidation_failures["membership_deficits"]
+        or distinct_topologies
+        < prevalidation_failures["minimum_distinct_topologies"]
+        or result.get("near_band_fallback_used") is not False
+    ):
+        raise RuntimeError(
+            "bounded secondary final bank contract failed: "
+            + json.dumps(
+                prevalidation_failures,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
     preflight.validate_goal_compact_coordinate_bank(
         problem, result, compact_contract=contract
     )
