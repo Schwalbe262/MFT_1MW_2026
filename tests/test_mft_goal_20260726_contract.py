@@ -619,6 +619,22 @@ def test_compact_authority_binds_fresh512_seed_dataset_model_and_quality():
     contract = preflight.goal_compact_search_contract(6)
     bank = {"sha256": "f" * 64}
     authenticated = _compact_authenticated(quality_passed=True)
+    with pytest.raises(RuntimeError, match="quality state must be boolean"):
+        preflight.seal_goal_compact_run_authorization(
+            authorization_mode=preflight.GOAL_COMPACT_AUTH_FRESH512,
+            source_activation_schema=launch.FRESH512_ACTIVATION_SCHEMA,
+            source_activation_payload_sha256="0" * 64,
+            seed=launch.FRESH_AL_SEED_START,
+            fixed_primary_turns=6,
+            dataset_sha256="1" * 64,
+            evaluation_model_sha256="2" * 64,
+            quality_status_sha256="3" * 64,
+            source_quality_passed="true",
+            effective_hard_constraint_contract_sha256="4" * 64,
+            compact_search_contract_sha256="5" * 64,
+            compact_coordinate_bank_sha256="6" * 64,
+            dataset_authentication_sha256="7" * 64,
+        )
     seed = launch.FRESH_AL_SEED_START
     authorization, activation = _compact_authorization(
         problem,

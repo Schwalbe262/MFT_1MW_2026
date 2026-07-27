@@ -1340,6 +1340,8 @@ def seal_goal_compact_run_authorization(
     """Seal the only two authorities allowed to enter compact optimization."""
 
     mode = str(authorization_mode)
+    if not isinstance(source_quality_passed, bool):
+        raise RuntimeError("compact source quality state must be boolean")
     if mode == GOAL_COMPACT_AUTH_FRESH512:
         mode_fields = {
             "thermal_mesh_policy": GOAL_B7_THERMAL_MESH_POLICY,
@@ -1372,7 +1374,7 @@ def seal_goal_compact_run_authorization(
         "dataset_sha256": str(dataset_sha256),
         "evaluation_model_sha256": str(evaluation_model_sha256),
         "quality_status_sha256": str(quality_status_sha256),
-        "source_quality_passed": bool(source_quality_passed),
+        "source_quality_passed": source_quality_passed,
         "effective_hard_constraint_contract_sha256": str(
             effective_hard_constraint_contract_sha256
         ),
@@ -1504,7 +1506,9 @@ def validate_goal_compact_run_authorization(
         != authorization["source_activation_schema"]
     ):
         raise RuntimeError("compact source activation seal mismatch")
-    observed_quality_passed = bool(authenticated.quality.get("passed"))
+    observed_quality_passed = authenticated.quality.get("passed")
+    if not isinstance(observed_quality_passed, bool):
+        raise RuntimeError("authenticated compact quality state is not boolean")
     observed_model_sha = canonical_sha256(
         authenticated.report["artifacts"]
     )
