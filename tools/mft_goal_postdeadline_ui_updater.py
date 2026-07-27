@@ -63,9 +63,25 @@ STATUS_SCHEMA = "mft-codex-work-status-v1"
 ACTIVE_EXACT100_RECEIPT_SCHEMA = (
     "mft-goal-diagnostic-compact-submission-receipt-v1"
 )
+ACTIVE_EXACT100_RETRY_RECEIPT_SCHEMA = (
+    "mft-goal-diagnostic-compact-prestart-retry-receipt-v1"
+)
 ACTIVE_EXACT100_BUNDLE_ID = (
     "mft-goal-diag-compact-50320c178b89180a4383855d"
 )
+ACTIVE_EXACT100_ORIGINAL_RECEIPT_NAME = "submission_receipt.json"
+ACTIVE_EXACT100_RETRY_RECEIPT_RELATIVE = Path(
+    "retry1_nonharry/submission_receipt.json"
+)
+ACTIVE_EXACT100_ORIGINAL_PAYLOAD_SHA256 = (
+    "0993400b08b6d5ab6502921fbe79805ae9acd41dc27d4bf6f70721a0381902cc"
+)
+ACTIVE_EXACT100_RETRY_PAYLOAD_SHA256 = (
+    "de944c3e7522f5699079b413570a9bc4c1ceeadf115460a55c586a9d073621f4"
+)
+ACTIVE_EXACT100_LOGICAL_SEEDS = 100
+ACTIVE_EXACT100_RETRY_IDENTITIES = 47
+ACTIVE_EXACT100_SUBMITTED_ATTEMPTS = 147
 POSTSUCCESS_STATE_SCHEMA = "mft-goal-postdeadline-standard-postsuccess-state-v1"
 THERMAL_BRIDGE_STATE_SCHEMA = "mft-corrected-thermal-terminal-transport-watch-state-v1"
 STANDARD_FULL_CONTINUATION_STATE_SCHEMA = "mft-goal-standard-full-continuation-state-v1"
@@ -8431,105 +8447,376 @@ def _parallel_workstreams_card(
     }
 
 
+def _active_receipt_json(path: Path, label: str) -> tuple[dict[str, Any], Path]:
+    """Read one explicit receipt path without following an alternate receipt."""
+    if path.is_symlink():
+        raise UpdaterError(f"{label} receipt must not be a symlink")
+    try:
+        resolved = path.resolve(strict=True)
+        size = resolved.stat().st_size
+    except OSError as exc:
+        raise UpdaterError(f"{label} receipt is unavailable: {path}") from exc
+    if not resolved.is_file() or size > MAX_LOCAL_SEALED_STATE_BYTES:
+        raise UpdaterError(f"{label} receipt is not a bounded regular file")
+    try:
+        value = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdaterError(f"{label} receipt is not valid UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise UpdaterError(f"{label} receipt must contain one JSON object")
+    return value, resolved
+
+
+def _validated_original_exact100_receipt(
+    root: Path,
+    *,
+    require_full_identity: bool,
+) -> tuple[dict[str, Any], Path, list[dict[str, Any]]]:
+    receipt, path = _active_receipt_json(
+        root / ACTIVE_EXACT100_ORIGINAL_RECEIPT_NAME,
+        "original exact100",
+    )
+    unsigned = copy.deepcopy(receipt)
+    observed_sha256 = unsigned.pop("sha256", None)
+    tasks = receipt.get("tasks")
+    rows = (
+        [copy.deepcopy(row) for row in tasks if isinstance(row, dict)]
+        if isinstance(tasks, list)
+        else []
+    )
+    task_ids = [row.get("task_id") for row in rows]
+    valid = bool(
+        receipt.get("schema_version") == ACTIVE_EXACT100_RECEIPT_SCHEMA
+        and observed_sha256 == canonical_sha256(unsigned)
+        and receipt.get("bundle_id") == ACTIVE_EXACT100_BUNDLE_ID
+        and receipt.get("apply") is True
+        and receipt.get("task_count") == ACTIVE_EXACT100_LOGICAL_SEEDS
+        and receipt.get("submitted_count") == ACTIVE_EXACT100_LOGICAL_SEEDS
+        and receipt.get("existing_count") == 0
+        and receipt.get("absent_count") == 0
+        and receipt.get("campaign_authorized_post_count")
+        == ACTIVE_EXACT100_LOGICAL_SEEDS
+        and receipt.get("first_clean_run_exact100_scheduler_posts") is True
+        and receipt.get("scheduler_post_count") == ACTIVE_EXACT100_LOGICAL_SEEDS
+        and receipt.get("scheduler_endpoint") == "POST /api/tasks"
+        and isinstance(tasks, list)
+        and len(rows) == ACTIVE_EXACT100_LOGICAL_SEEDS
+        and len(task_ids) == ACTIVE_EXACT100_LOGICAL_SEEDS
+        and all(
+            isinstance(task_id, int) and not isinstance(task_id, bool)
+            for task_id in task_ids
+        )
+        and len(set(task_ids)) == ACTIVE_EXACT100_LOGICAL_SEEDS
+    )
+    if not valid:
+        raise UpdaterError("original exact100 receipt failed closed validation")
+    if require_full_identity:
+        seeds = [row.get("seed") for row in rows]
+        names = [row.get("name") for row in rows]
+        dedupes = [row.get("dedupe_key") for row in rows]
+        expected_prefix = f"{ACTIVE_EXACT100_BUNDLE_ID}-s"
+        if (
+            observed_sha256 != ACTIVE_EXACT100_ORIGINAL_PAYLOAD_SHA256
+            or task_ids != list(range(97145, 97245))
+            or seeds != list(range(2607264100, 2607264200))
+            or not all(
+                isinstance(name, str) and name.startswith(expected_prefix)
+                for name in names
+            )
+            or not all(
+                isinstance(dedupe, str) and len(dedupe) > 64
+                for dedupe in dedupes
+            )
+            or len(set(names)) != ACTIVE_EXACT100_LOGICAL_SEEDS
+            or len(set(dedupes)) != ACTIVE_EXACT100_LOGICAL_SEEDS
+        ):
+            raise UpdaterError("original exact100 immutable identity drifted")
+    return receipt, path, rows
+
+
+def _validated_retry1_receipt(
+    root: Path,
+) -> tuple[dict[str, Any], Path, list[dict[str, Any]]]:
+    receipt, path = _active_receipt_json(
+        root / ACTIVE_EXACT100_RETRY_RECEIPT_RELATIVE,
+        "retry1",
+    )
+    unsigned = copy.deepcopy(receipt)
+    observed_sha256 = unsigned.pop("payload_sha256", None)
+    tasks = receipt.get("tasks")
+    rows = (
+        [copy.deepcopy(row) for row in tasks if isinstance(row, dict)]
+        if isinstance(tasks, list)
+        else []
+    )
+    task_ids = [row.get("task_id") for row in rows]
+    seeds = [row.get("seed") for row in rows]
+    names = [row.get("name") for row in rows]
+    dedupes = [row.get("dedupe_key") for row in rows]
+    accounts = [row.get("requested_account") for row in rows]
+    allowed_accounts = receipt.get("allowed_accounts")
+    valid = bool(
+        receipt.get("schema_version") == ACTIVE_EXACT100_RETRY_RECEIPT_SCHEMA
+        and observed_sha256 == canonical_sha256(unsigned)
+        and observed_sha256 == ACTIVE_EXACT100_RETRY_PAYLOAD_SHA256
+        and receipt.get("apply") is True
+        and receipt.get("retry_task_count") == ACTIVE_EXACT100_RETRY_IDENTITIES
+        and receipt.get("submitted_count") == ACTIVE_EXACT100_RETRY_IDENTITIES
+        and receipt.get("scheduler_post_count")
+        == ACTIVE_EXACT100_RETRY_IDENTITIES
+        and receipt.get("existing_count") == 0
+        and receipt.get("absent_count") == 0
+        and receipt.get("target_active_inventory")
+        == ACTIVE_EXACT100_LOGICAL_SEEDS
+        and receipt.get("failed_account_excluded") == "harry261"
+        and receipt.get("equal_three_leg_air_gap_FEA_required") is True
+        and receipt.get("physical_Lm_2mH_symmetric_FEA_verification_required")
+        is True
+        and receipt.get("automatic_final_promotion_allowed") is False
+        and receipt.get("final_promotion_allowed") is False
+        and receipt.get("screening_only") is True
+        and receipt.get("production_eligible") is False
+        and isinstance(allowed_accounts, list)
+        and "harry261" not in allowed_accounts
+        and len(rows) == ACTIVE_EXACT100_RETRY_IDENTITIES
+        and task_ids == list(range(97245, 97292))
+        and seeds == list(range(2607264153, 2607264200))
+        and all(
+            isinstance(name, str)
+            and name.startswith(f"{ACTIVE_EXACT100_BUNDLE_ID}-retry1-s")
+            for name in names
+        )
+        and all(
+            isinstance(dedupe, str) and len(dedupe) > 64
+            for dedupe in dedupes
+        )
+        and len(set(names)) == ACTIVE_EXACT100_RETRY_IDENTITIES
+        and len(set(dedupes)) == ACTIVE_EXACT100_RETRY_IDENTITIES
+        and all(account in allowed_accounts for account in accounts)
+    )
+    if not valid:
+        raise UpdaterError("retry1 receipt failed closed validation")
+    return receipt, path, rows
+
+
 def _active_exact100_post_state(
     root: Path = DEFAULT_ACTIVE_EXACT100_ROOT,
 ) -> dict[str, Any]:
-    """Fail closed until a sealed first-clean exact-100 POST receipt exists."""
-    resolved = root.resolve()
+    """Fail closed until the explicit first-clean exact-100 receipt is valid."""
     state: dict[str, Any] = {
         "phase": "preparing",
         "submitted_count": 0,
-        "expected_count": 100,
+        "expected_count": ACTIVE_EXACT100_LOGICAL_SEEDS,
         "receipt_path": None,
         "verification_error": None,
     }
-    if not resolved.is_dir():
-        state["verification_error"] = "active exact100 preparation root is absent"
+    try:
+        receipt, path, rows = _validated_original_exact100_receipt(
+            root,
+            require_full_identity=False,
+        )
+    except UpdaterError as exc:
+        state["verification_error"] = str(exc)
         return state
+    task_ids = [int(row["task_id"]) for row in rows]
+    return {
+        "phase": "submitted",
+        "submitted_count": ACTIVE_EXACT100_LOGICAL_SEEDS,
+        "expected_count": ACTIVE_EXACT100_LOGICAL_SEEDS,
+        "receipt_path": str(path),
+        "receipt_file_sha256": _file_sha256(path),
+        "receipt_payload_sha256": receipt["sha256"],
+        "task_id_min": min(task_ids),
+        "task_id_max": max(task_ids),
+        "verification_error": None,
+    }
 
-    receipt_candidates = sorted(
-        (
-            path
-            for path in resolved.rglob("*.json")
-            if "receipt" in path.name.lower()
+
+def _validated_active_scheduler_task(
+    expected: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> dict[str, Any]:
+    task_id = expected.get("task_id")
+    observed_id = observed.get("id", observed.get("task_id"))
+    if (
+        observed_id != task_id
+        or observed.get("name") != expected.get("name")
+        or observed.get("dedupe_key") != expected.get("dedupe_key")
+    ):
+        raise UpdaterError(f"active search task{task_id} identity drifted")
+    state = _task_state(observed)
+    return {
+        "task_id": task_id,
+        "seed": expected.get("seed"),
+        "name": expected.get("name"),
+        "dedupe_key": expected.get("dedupe_key"),
+        "state": state,
+        "category": _category(state),
+        "account_name": str(observed.get("account_name") or ""),
+        "requested_account_name": str(
+            observed.get("requested_account_name") or ""
         ),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    matching_schema_seen = False
-    last_error: str | None = None
-    for path in receipt_candidates:
-        try:
-            if path.is_symlink() or path.stat().st_size > MAX_LOCAL_SEALED_STATE_BYTES:
-                continue
-            receipt = json.loads(path.read_text(encoding="utf-8"))
-            if (
-                not isinstance(receipt, dict)
-                or receipt.get("schema_version")
-                != ACTIVE_EXACT100_RECEIPT_SCHEMA
-            ):
-                continue
-            matching_schema_seen = True
-            unsigned = copy.deepcopy(receipt)
-            observed_sha256 = unsigned.pop("sha256", None)
-            tasks = receipt.get("tasks")
-            task_ids = [
-                row.get("task_id")
-                for row in tasks
-                if isinstance(row, dict)
-            ] if isinstance(tasks, list) else []
-            valid = bool(
-                observed_sha256 == canonical_sha256(unsigned)
-                and receipt.get("bundle_id") == ACTIVE_EXACT100_BUNDLE_ID
-                and receipt.get("apply") is True
-                and receipt.get("task_count") == 100
-                and receipt.get("submitted_count") == 100
-                and receipt.get("existing_count") == 0
-                and receipt.get("absent_count") == 0
-                and receipt.get("campaign_authorized_post_count") == 100
-                and receipt.get("first_clean_run_exact100_scheduler_posts")
-                is True
-                and receipt.get("scheduler_post_count") == 100
-                and receipt.get("scheduler_endpoint") == "POST /api/tasks"
-                and isinstance(tasks, list)
-                and len(tasks) == 100
-                and len(task_ids) == 100
-                and all(
-                    isinstance(task_id, int) and not isinstance(task_id, bool)
-                    for task_id in task_ids
-                )
-                and len(set(task_ids)) == 100
-            )
-            if not valid:
-                last_error = (
-                    f"exact100 receipt failed closed validation: {path.name}"
-                )
-                continue
-            return {
-                "phase": "submitted",
-                "submitted_count": 100,
-                "expected_count": 100,
-                "receipt_path": str(path.resolve()),
-                "receipt_payload_sha256": observed_sha256,
-                "task_id_min": min(task_ids),
-                "task_id_max": max(task_ids),
-                "verification_error": None,
-            }
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
+        "started_at": observed.get("started_at"),
+        "finished_at": observed.get("finished_at"),
+        "failure_message": str(observed.get("failure_message") or ""),
+        "remote_dir": str(observed.get("remote_dir") or ""),
+        "stdout_path": str(observed.get("stdout_path") or ""),
+        "stderr_path": str(observed.get("stderr_path") or ""),
+        "exit_code_path": str(observed.get("exit_code_path") or ""),
+    }
 
-    state["verification_error"] = (
-        last_error
-        if matching_schema_seen or last_error
-        else "sealed first-clean exact100 POST receipt not found"
+
+def _is_original_prestart_infrastructure_failure(
+    task: Mapping[str, Any],
+) -> bool:
+    return bool(
+        task.get("category") == "failed"
+        and task.get("account_name") == "harry261"
+        and task.get("started_at") in (None, "")
+        and task.get("failure_message") == "Failure"
+        and all(
+            not task.get(field)
+            for field in (
+                "remote_dir",
+                "stdout_path",
+                "stderr_path",
+                "exit_code_path",
+            )
+        )
     )
-    return state
+
+
+def _active_exact100_retry_state(
+    *,
+    scheduler_url: str,
+    root: Path = DEFAULT_ACTIVE_EXACT100_ROOT,
+    task_reader: TaskReader | None = None,
+) -> dict[str, Any]:
+    """Reconcile both immutable receipts with all 147 live GET identities."""
+    original_receipt, original_path, original_rows = (
+        _validated_original_exact100_receipt(
+            root,
+            require_full_identity=True,
+        )
+    )
+    retry_receipt, retry_path, retry_rows = _validated_retry1_receipt(root)
+    all_rows = [*original_rows, *retry_rows]
+    task_ids = [int(row["task_id"]) for row in all_rows]
+    if (
+        len(task_ids) != ACTIVE_EXACT100_SUBMITTED_ATTEMPTS
+        or len(set(task_ids)) != ACTIVE_EXACT100_SUBMITTED_ATTEMPTS
+        or len({row["name"] for row in all_rows})
+        != ACTIVE_EXACT100_SUBMITTED_ATTEMPTS
+        or len({row["dedupe_key"] for row in all_rows})
+        != ACTIVE_EXACT100_SUBMITTED_ATTEMPTS
+    ):
+        raise UpdaterError("active search attempt identities overlap")
+
+    reader = task_reader or _get_scheduler_task
+    with ThreadPoolExecutor(max_workers=min(32, len(all_rows))) as executor:
+        futures = {
+            int(row["task_id"]): executor.submit(
+                reader,
+                scheduler_url,
+                int(row["task_id"]),
+            )
+            for row in all_rows
+        }
+        observed = {
+            task_id: future.result() for task_id, future in futures.items()
+        }
+    live = {
+        int(row["task_id"]): _validated_active_scheduler_task(
+            row,
+            observed[int(row["task_id"])],
+        )
+        for row in all_rows
+    }
+    original_live = [live[int(row["task_id"])] for row in original_rows]
+    retry_live = [live[int(row["task_id"])] for row in retry_rows]
+    infrastructure_failures = [
+        task
+        for task in original_live
+        if _is_original_prestart_infrastructure_failure(task)
+    ]
+    infrastructure_failure_seeds = {
+        int(task["seed"]) for task in infrastructure_failures
+    }
+    retry_seeds = {int(row["seed"]) for row in retry_rows}
+    if infrastructure_failure_seeds != retry_seeds:
+        raise UpdaterError(
+            "retry1 seed identities do not match original infrastructure failures"
+        )
+
+    attempts_by_seed: dict[int, list[dict[str, Any]]] = {}
+    for task in live.values():
+        seed = task.get("seed")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise UpdaterError("active search Scheduler seed identity drifted")
+        attempts_by_seed.setdefault(seed, []).append(task)
+    logical_seeds = set(range(2607264100, 2607264200))
+    if set(attempts_by_seed) != logical_seeds:
+        raise UpdaterError("active search logical seed inventory drifted")
+    active_nonterminal = sum(
+        any(task["category"] in {"running", "queued"} for task in attempts)
+        for attempts in attempts_by_seed.values()
+    )
+    terminal_success = sum(
+        any(task["category"] == "succeeded" for task in attempts)
+        for attempts in attempts_by_seed.values()
+    )
+    unresolved = sum(
+        not any(
+            task["category"] in {"running", "queued", "succeeded"}
+            for task in attempts
+        )
+        for attempts in attempts_by_seed.values()
+    )
+
+    def category_counts(tasks: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+        return {
+            category: sum(task["category"] == category for task in tasks)
+            for category in ("running", "queued", "succeeded", "failed")
+        }
+
+    return {
+        "phase": "retry1_active",
+        "verified": True,
+        "logical_seed_count": len(logical_seeds),
+        "submitted_attempt_count": len(all_rows),
+        "original_attempt_count": len(original_rows),
+        "retry_identity_count": len(retry_rows),
+        "original_infrastructure_failed_count": len(
+            infrastructure_failures
+        ),
+        "active_nonterminal_seed_count": active_nonterminal,
+        "terminal_success_seed_count": terminal_success,
+        "unresolved_seed_count": unresolved,
+        "original_live_counts": category_counts(original_live),
+        "retry_live_counts": category_counts(retry_live),
+        "original_receipt_path": str(original_path),
+        "original_receipt_file_sha256": _file_sha256(original_path),
+        "original_receipt_payload_sha256": original_receipt["sha256"],
+        "retry_receipt_path": str(retry_path),
+        "retry_receipt_file_sha256": _file_sha256(retry_path),
+        "retry_receipt_payload_sha256": retry_receipt["payload_sha256"],
+        "scheduler_endpoint": "GET /api/tasks/{task_id}",
+        "scheduler_get_count": len(all_rows),
+        "scheduler_mutation_performed": False,
+        "equal_three_leg_air_gap_FEA_required": True,
+        "physical_Lm_2mH_symmetric_FEA_verification_required": True,
+        "final_promotion_allowed": False,
+        "automatic_final_promotion_allowed": False,
+        "screening_only": True,
+        "production_eligible": False,
+    }
 
 
 def _active_truth_ui_cards(
     *,
     observed_at: str,
     exact100: Mapping[str, Any],
+    retry_state: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     submitted = int(exact100.get("submitted_count") or 0)
     phase = "SUBMITTED" if submitted == 100 else "PREPARING"
@@ -8541,6 +8828,58 @@ def _active_truth_ui_cards(
             "sealed first-clean exact100 POST receipt=not verified / "
             "displayed submitted count is therefore fail-closed at 0"
         )
+    )
+    retry_verified = bool(retry_state and retry_state.get("verified") is True)
+    logical_seeds = int(
+        retry_state.get("logical_seed_count") if retry_verified else submitted
+    )
+    submitted_attempts = int(
+        retry_state.get("submitted_attempt_count")
+        if retry_verified
+        else submitted
+    )
+    infrastructure_failed = int(
+        retry_state.get("original_infrastructure_failed_count")
+        if retry_verified
+        else 0
+    )
+    retry_identities = int(
+        retry_state.get("retry_identity_count") if retry_verified else 0
+    )
+    active_nonterminal = int(
+        retry_state.get("active_nonterminal_seed_count")
+        if retry_verified
+        else 0
+    )
+    retry_evidence = (
+        [
+            (
+                "immutable original receipt="
+                f"{retry_state['original_receipt_path']} / payload_sha256="
+                f"{retry_state['original_receipt_payload_sha256']}"
+            ),
+            (
+                "sealed retry1 receipt="
+                f"{retry_state['retry_receipt_path']} / payload_sha256="
+                f"{retry_state['retry_receipt_payload_sha256']}"
+            ),
+            (
+                "live Scheduler GET aggregate: "
+                f"original={retry_state['original_live_counts']} / "
+                f"retry1={retry_state['retry_live_counts']}"
+            ),
+            (
+                "equal_three_leg_air_gap_FEA_required=true / "
+                "physical_Lm_2mH_symmetric_FEA_verification_required=true"
+            ),
+            (
+                "final_promotion_allowed=false / "
+                "automatic_final_promotion_allowed=false / "
+                "screening_only=true"
+            ),
+        ]
+        if retry_verified
+        else ["retry1 immutable receipt/live Scheduler reconciliation=pending"]
     )
     return [
         {
@@ -8571,8 +8910,10 @@ def _active_truth_ui_cards(
         {
             "id": "codex-active-exact100-gap2p35",
             "title": (
-                f"NSGA-II EXACT100 | {phase} | SUBMITTED "
-                f"{submitted}/100 | gap2=0.350"
+                f"NSGA-II | LOGICAL {logical_seeds} | ATTEMPTS "
+                f"{submitted_attempts} | ACTIVE {active_nonterminal} | "
+                f"INFRA-FAILED {infrastructure_failed} | RETRY "
+                f"{retry_identities}"
             ),
             "detail": (
                 "100개 독립 seed 캠페인을 준비·제출하는 활성 검색 lane입니다. "
@@ -8581,12 +8922,22 @@ def _active_truth_ui_cards(
             ),
             "state": "in_progress",
             "updated_at": observed_at,
-            "progress_pct": 45 if submitted == 100 else 15,
+            "progress_pct": (
+                55 if retry_verified else (45 if phase == "SUBMITTED" else 15)
+            ),
             "evidence": [
                 "active code revision=5823d475b9a6bf40fd709f4efca3f069e06bd722",
                 "seeds=2607264100..2607264199 / population=320 / generations=300",
                 "resources each=8CPU+65536MiB / max_workers_per_node=8 / priority=10",
                 post_evidence,
+                (
+                    f"receipt identities: logical_seeds={logical_seeds} / "
+                    f"submitted_attempts={submitted_attempts} / "
+                    f"original_infrastructure_failed={infrastructure_failed} / "
+                    f"retry_identities={retry_identities} / "
+                    f"active_nonterminal={active_nonterminal}"
+                ),
+                *retry_evidence,
                 (
                     "Scheduler repository/service modification=false / "
                     "MFT search bundle remains separate"
@@ -8664,6 +9015,7 @@ def merge_status(
     standard_full_continuation_state_file: Path | None = None,
     final_gate_root: Path | None = None,
     compact_active_truth_ui: bool = False,
+    active_exact100_retry_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if payload.get("schema_version") != STATUS_SCHEMA:
         raise UpdaterError("Codex status schema drifted")
@@ -8917,6 +9269,7 @@ def merge_status(
         active_truth_cards = _active_truth_ui_cards(
             observed_at=observed_at,
             exact100=active_exact100,
+            retry_state=active_exact100_retry_state,
         )
         exact100_submitted = int(active_exact100.get("submitted_count") or 0)
         exact100_phase = (
@@ -8933,6 +9286,21 @@ def merge_status(
             "16-core GUI legacy diagnostic은 HDF5 기준 49.999–136.247°C로 "
             "검증됐지만 새 최종 설계 PASS는 아닙니다."
         )
+        if active_exact100_retry_state is not None:
+            result["summary"] = (
+                "Active compact NSGA-II: logical seeds "
+                f"{active_exact100_retry_state['logical_seed_count']}, "
+                "submitted attempts "
+                f"{active_exact100_retry_state['submitted_attempt_count']}, "
+                "original infrastructure-failed "
+                f"{active_exact100_retry_state['original_infrastructure_failed_count']}, "
+                "retry identities "
+                f"{active_exact100_retry_state['retry_identity_count']}, "
+                "active nonterminal "
+                f"{active_exact100_retry_state['active_nonterminal_seed_count']}. "
+                "Equal physical air gaps on all three core legs still require "
+                "symmetric FEA; final promotion remains false."
+            )
         result["_automation_current"] = result["current"]
         result["current"] = active_truth_cards
     result["generated_at"] = observed_at
@@ -9009,6 +9377,11 @@ def merge_status(
             "scheduler_endpoint": "GET /api/tasks/{task_id}",
             "scheduler_methods_used": ["GET"],
             "scheduler_mutation_performed": False,
+            "active_exact100_retry": (
+                copy.deepcopy(dict(active_exact100_retry_state))
+                if active_exact100_retry_state is not None
+                else None
+            ),
             "managed_task_ids": [spec.task_id for spec in TASK_SPECS],
             "authoritative_task_ids": [
                 spec.task_id for spec in AUTHORITATIVE_AUXILIARY_TASK_SPECS
@@ -9354,6 +9727,14 @@ def synchronize_once(
     compact_active_truth_ui: bool = False,
 ) -> dict[str, Any]:
     tasks = fetch_tasks(scheduler_url, task_reader=task_reader)
+    active_exact100_retry_state = (
+        _active_exact100_retry_state(
+            scheduler_url=scheduler_url,
+            task_reader=task_reader,
+        )
+        if compact_active_truth_ui
+        else None
+    )
     auxiliary_tasks = (
         fetch_authoritative_auxiliary_tasks(
             scheduler_url,
@@ -9442,6 +9823,7 @@ def synchronize_once(
         standard_full_continuation_state_file=(standard_full_continuation_state_file),
         final_gate_root=final_gate_root,
         compact_active_truth_ui=compact_active_truth_ui,
+        active_exact100_retry_state=active_exact100_retry_state,
     )
     validate_status_sync(updated)
     if len(_json_bytes(updated)) > 256 * 1024:
