@@ -111,6 +111,32 @@ def test_search_profile_rejects_secondary_gap_drift() -> None:
         scout._validate_search_profile(launch._seal(unsigned))
 
 
+def test_search_profile_accepts_only_aligned_hgap20_continuations() -> None:
+    profile = _profile(20)
+    unsigned = {
+        key: copy.deepcopy(value)
+        for key, value in profile.items()
+        if key != "payload_sha256"
+    }
+    start = scout.CONTINUATION_SEED_START
+    unsigned["profile_id"] = scout._search_profile_id(20, start)
+    unsigned["authorized_seed_start"] = start
+    unsigned["authorized_seed_end_inclusive"] = start + 99
+    continuation = launch._seal(unsigned)
+    assert scout._validate_search_profile(continuation) == continuation
+
+    for invalid in (start + 1, start - 1):
+        changed = copy.deepcopy(unsigned)
+        changed["profile_id"] = scout._search_profile_id(20, invalid)
+        changed["authorized_seed_start"] = invalid
+        changed["authorized_seed_end_inclusive"] = invalid + 99
+        with pytest.raises(RuntimeError, match="search profile mismatch"):
+            scout._validate_search_profile(launch._seal(changed))
+
+    with pytest.raises(RuntimeError, match="20 mm aligned exact100"):
+        scout._authorized_profile_seed_start(30, start + 200)
+
+
 def test_l900_compact_contract_is_bound_to_effective_profile() -> None:
     effective = scout._effective_constraint_profile()
     contract = (

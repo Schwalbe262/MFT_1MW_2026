@@ -70,6 +70,8 @@ PROFILE_SEED_STARTS = {
     40: 2_607_264_300,
 }
 PROFILE_SEED_COUNT = 100
+CONTINUATION_SEED_START = 2_607_264_200
+CONTINUATION_SEED_STRIDE = PROFILE_SEED_COUNT
 FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM = 5.0
 FIXED_PRIMARY_INTERTURN_GAP_MM = 1.6
 FIXED_SECONDARY_TURNS = 60
@@ -187,16 +189,62 @@ def _geometry_profile(clearance_mm: Any) -> dict[str, Any]:
     )
 
 
+def _authorized_profile_seed_start(
+    clearance_mm: Any,
+    requested_seed_start: int | None = None,
+) -> int:
+    """Return one sealed exact100 cohort start.
+
+    The original three clearance profiles remain byte-compatible.  Only the
+    active 20 mm profile may advance beyond its original exact100 interval,
+    and continuation cohorts must be aligned, non-overlapping blocks.
+    """
+
+    clearance = _profile_clearance_mm(clearance_mm)
+    original = PROFILE_SEED_STARTS[clearance]
+    if requested_seed_start is None or requested_seed_start == original:
+        return original
+    if (
+        isinstance(requested_seed_start, bool)
+        or not isinstance(requested_seed_start, int)
+        or clearance != 20
+        or requested_seed_start < CONTINUATION_SEED_START
+        or (
+            requested_seed_start - CONTINUATION_SEED_START
+        )
+        % CONTINUATION_SEED_STRIDE
+        != 0
+    ):
+        raise RuntimeError(
+            "diagnostic continuation must be a 20 mm aligned exact100 cohort"
+        )
+    return requested_seed_start
+
+
+def _search_profile_id(clearance: int, seed_start: int) -> str:
+    stem = (
+        f"l900-temp110-130-130-hard-equal-hgap{clearance}-"
+        "gap2p35-plates20-exact100"
+    )
+    if seed_start == PROFILE_SEED_STARTS[clearance]:
+        return stem
+    return f"{stem}-s{seed_start}"
+
+
 def _build_search_profile(
     runner: preflight.Current7Tier1Runner,
     *,
     geometry_profile: Mapping[str, Any],
+    authorized_seed_start: int | None = None,
 ) -> dict[str, Any]:
     geometry = preflight.validate_goal_geometry_constraint_profile(
         geometry_profile
     )
     clearance = _profile_clearance_mm(
         geometry["primary_axial_clearance"]["minimum_mm"]
+    )
+    seed_start = _authorized_profile_seed_start(
+        clearance, authorized_seed_start
     )
     artifacts = runner.authenticated.report.get("artifacts")
     if not isinstance(artifacts, Mapping):
@@ -218,10 +266,7 @@ def _build_search_profile(
     effective_constraints = _effective_constraint_profile()
     value = {
         "schema_version": SEARCH_PROFILE_SCHEMA,
-        "profile_id": (
-            f"l900-temp110-130-130-hard-equal-hgap{clearance}-"
-            "gap2p35-plates20-exact100"
-        ),
+        "profile_id": _search_profile_id(clearance, seed_start),
         "fixed_primary_turns": FIXED_PRIMARY_TURNS,
         "fixed_secondary_turns": FIXED_SECONDARY_TURNS,
         "turns_ratio_N2_over_N1": 10.0,
@@ -250,10 +295,10 @@ def _build_search_profile(
         "maximum_decoded_winding_height_difference_mm": (
             MAXIMUM_DECODED_WINDING_HEIGHT_DIFFERENCE_MM
         ),
-        "authorized_seed_start": PROFILE_SEED_STARTS[clearance],
+        "authorized_seed_start": seed_start,
         "authorized_seed_count": PROFILE_SEED_COUNT,
         "authorized_seed_end_inclusive": (
-            PROFILE_SEED_STARTS[clearance] + PROFILE_SEED_COUNT - 1
+            seed_start + PROFILE_SEED_COUNT - 1
         ),
         "raw_same_metric_capacitance_gate": {
             "constraint_name": RAW_CRX_CONSTRAINT_NAME,
@@ -302,6 +347,15 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
     clearance = _profile_clearance_mm(
         geometry["primary_axial_clearance"]["minimum_mm"]
     )
+    seed_start = profile.get("authorized_seed_start")
+    try:
+        authorized_seed_start = _authorized_profile_seed_start(
+            clearance, seed_start
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "diagnostic manufacturing search profile mismatch"
+        ) from exc
     cap = profile.get("raw_same_metric_capacitance_gate") or {}
     expected_keys = {
         "schema_version",
@@ -356,10 +410,7 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
     if (
         set(profile) != expected_keys
         or profile.get("profile_id")
-        != (
-            f"l900-temp110-130-130-hard-equal-hgap{clearance}-"
-            "gap2p35-plates20-exact100"
-        )
+        != _search_profile_id(clearance, authorized_seed_start)
         or profile.get("fixed_primary_turns") != FIXED_PRIMARY_TURNS
         or profile.get("fixed_secondary_turns") != FIXED_SECONDARY_TURNS
         or profile.get("turns_ratio_N2_over_N1") != 10.0
@@ -383,11 +434,10 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         is not True
         or profile.get("maximum_decoded_winding_height_difference_mm")
         != MAXIMUM_DECODED_WINDING_HEIGHT_DIFFERENCE_MM
-        or profile.get("authorized_seed_start")
-        != PROFILE_SEED_STARTS[clearance]
+        or profile.get("authorized_seed_start") != authorized_seed_start
         or profile.get("authorized_seed_count") != PROFILE_SEED_COUNT
         or profile.get("authorized_seed_end_inclusive")
-        != PROFILE_SEED_STARTS[clearance] + PROFILE_SEED_COUNT - 1
+        != authorized_seed_start + PROFILE_SEED_COUNT - 1
         or set(cap) != cap_keys
         or cap.get("constraint_name") != RAW_CRX_CONSTRAINT_NAME
         or cap.get("target") != "C_rx_rx_F"
@@ -1191,6 +1241,7 @@ def prepare(args: argparse.Namespace) -> Path:
     search_profile = _build_search_profile(
         runner,
         geometry_profile=geometry_profile,
+        authorized_seed_start=seed_start,
     )
     expected_seeds = list(
         range(
