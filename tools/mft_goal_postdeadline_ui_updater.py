@@ -863,9 +863,17 @@ RX_MAIN_L5_NATIVE_CANARY_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
     r"\rx_main_l5_native_earliest_canary_v2"
 )
+RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_ROOT = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\rx_main_l5_native_earliest_canary_successor_v1"
+)
 RX_MAIN_L5_NATIVE_CANARY_TASK_ID = 97_140
 RX_MAIN_L5_NATIVE_CANARY_TASK_NAME = (
     "mft-goal-rxmain-l5-f7f6-earliest-v1"
+)
+RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID = 97_141
+RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_NAME = (
+    "mft-goal-rxmain-l5-f7f6-earliest-v2"
 )
 RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256 = (
     "f7f6f2890be76943230e82d4e50992fac602537df17b5cf3a8556b04207e75b5"
@@ -888,8 +896,35 @@ RX_MAIN_L5_NATIVE_CANARY_PAYLOAD_SHA256 = (
 RX_MAIN_L5_NATIVE_CANARY_PARAMS_SHA256 = (
     "d8ab19c738199230dc99cb788dc0654d0ae10895c40af445325c67cb2987cd10"
 )
-RX_MAIN_L5_NATIVE_CANARY_MONITOR_SCHEMA = (
-    "mft-goal-rx-main-l5-native-earliest-canary-monitor-v1"
+RX_MAIN_L5_NATIVE_CANARY_TERMINAL_GATE_SHA256 = (
+    "5a38e36b4c57d9c0707908705116bcae24b0270796347080bcb7ae6b6fbd1c05"
+)
+RX_MAIN_L5_NATIVE_CANARY_TERMINAL_GATE_PAYLOAD_SHA256 = (
+    "7a605a00269364222a19f72fd9b384b7e8448aa96ec30d891914d54b8b1c1bb4"
+)
+RX_MAIN_L5_NATIVE_CANARY_MONITOR_STATE_SHA256 = (
+    "9996e00bc3068b0e59c5111b44873aebac28e23771633a567d95c7bf32a88908"
+)
+RX_MAIN_L5_NATIVE_CANARY_OLD_CORE_AUTH_SHA256 = (
+    "aac640b0a02075eec505e7640ba8ce7807ffc91f39f82aefd6dac6508d3e17fa"
+)
+RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256 = (
+    "0b9a5dbfaca629a64f4cb46454b03c5233902c24f39c9a2e65370e73e625140d"
+)
+RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_RECEIPT_SHA256 = (
+    "3faf0616ccf0d44651a3c9881b7e093897a00b8df44a69e00ea80a1f21cca942"
+)
+RX_MAIN_L5_NATIVE_CANARY_LINEAGE_SHA256 = (
+    "2483d6520f8a6e592b0e1ed8b187d548bb5bbb68f836a9a177b8fd4e0b0a3381"
+)
+RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_PAYLOAD_SHA256 = (
+    "46a423089e8e6b8d9641db7299c3bad8da1dc8acd2b9722734c948244da8f1d4"
+)
+RX_MAIN_L5_NATIVE_CANARY_MONITOR_STATE_SCHEMA = (
+    "mft-goal-rx-main-l5-monitor-state-v1"
+)
+RX_MAIN_L5_NATIVE_CANARY_MONITOR_PROCESS_SCHEMA = (
+    "mft-goal-rx-main-l5-get-only-monitor-process-v1"
 )
 RX_MAIN_L5_NATIVE_CANARY_CPUS = 8
 RX_MAIN_L5_NATIVE_CANARY_MEMORY_MB = 65_536
@@ -6384,39 +6419,267 @@ def _rx_main_l5_canary_receipt(
     }
 
 
+def _rx_main_l5_monitor_payload_sha256(value: Mapping[str, Any]) -> str:
+    unsigned = copy.deepcopy(dict(value))
+    unsigned.pop("payload_sha256", None)
+    payload = (
+        json.dumps(
+            unsigned,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _rx_main_l5_predecessor_terminal(
+    root: Path,
+) -> dict[str, Any]:
+    resolved = root.resolve()
+    monitor = _read_rx_main_l5_canary_json(
+        resolved / "monitor_state.json",
+        expected_file_sha256=RX_MAIN_L5_NATIVE_CANARY_MONITOR_STATE_SHA256,
+    )
+    gate = _read_rx_main_l5_canary_json(
+        resolved / "terminal_gate.json",
+        expected_file_sha256=RX_MAIN_L5_NATIVE_CANARY_TERMINAL_GATE_SHA256,
+    )
+    task = monitor.get("task")
+    checks = gate.get("checks")
+    strict_fields = gate.get("strict_result_fields")
+    if (
+        monitor.get("schema") != RX_MAIN_L5_NATIVE_CANARY_MONITOR_STATE_SCHEMA
+        or monitor.get("payload_sha256")
+        != _rx_main_l5_monitor_payload_sha256(monitor)
+        or monitor.get("scheduler_mutation_performed") is not False
+        or not isinstance(task, Mapping)
+        or task.get("id") != RX_MAIN_L5_NATIVE_CANARY_TASK_ID
+        or task.get("name") != RX_MAIN_L5_NATIVE_CANARY_TASK_NAME
+        or task.get("status") != "failed"
+        or task.get("exit_code") != 1
+        or "standalone core opt-in authentication digest mismatch"
+        not in str(task.get("failure_message") or "")
+        or gate.get("schema") != "mft-goal-rx-main-l5-terminal-gate-v1"
+        or gate.get("payload_sha256")
+        != RX_MAIN_L5_NATIVE_CANARY_TERMINAL_GATE_PAYLOAD_SHA256
+        or gate.get("payload_sha256")
+        != _rx_main_l5_monitor_payload_sha256(gate)
+        or gate.get("task_id") != RX_MAIN_L5_NATIVE_CANARY_TASK_ID
+        or gate.get("task_status") != "failed"
+        or gate.get("scheduler_mutation_performed") is not False
+        or gate.get("physical_geometry_sha256")
+        != RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256
+        or gate.get("solver_revision")
+        != RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION
+        or gate.get("library_revision")
+        != RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION
+        or gate.get("interface_fix_canary_passed") is not False
+        or gate.get("scientific_design_promotion_passed") is not False
+        or gate.get("thermal_result_scientific_valid") is not False
+        or gate.get("one_iteration_canary_not_a_design_temperature_result")
+        is not True
+        or gate.get("result_json_sha256") != ""
+        or gate.get("coverage") is not None
+        or gate.get("preflight") is not None
+        or not isinstance(checks, Mapping)
+        or checks.get("terminal_status") is not True
+        or checks.get("result_json_present") is not False
+        or checks.get("coverage_json_present") is not False
+        or not isinstance(strict_fields, Mapping)
+        or any(value is not None for value in strict_fields.values())
+    ):
+        raise UpdaterError("Rx-main predecessor terminal truth boundary drifted")
+    payload = _read_rx_main_l5_canary_json(
+        resolved / "dry_run_payload.json",
+        expected_file_sha256=RX_MAIN_L5_NATIVE_CANARY_PAYLOAD_SHA256,
+    )
+    command = str(payload.get("command") or "")
+    if (
+        command.count(RX_MAIN_L5_NATIVE_CANARY_OLD_CORE_AUTH_SHA256) != 1
+        or RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256 in command
+    ):
+        raise UpdaterError("Rx-main predecessor core auth identity drifted")
+    return {
+        "status": "failed",
+        "exit_code": 1,
+        "slurm_job_id": str(task.get("slurm_job_id") or ""),
+        "node_name": str(task.get("actual_node_name") or ""),
+        "terminal_gate_payload_sha256": gate["payload_sha256"],
+    }
+
+
+def _rx_main_l5_successor_receipt(
+    root: Path,
+    *,
+    predecessor: Mapping[str, Any],
+) -> dict[str, Any]:
+    resolved = root.resolve()
+    receipt = _read_rx_main_l5_canary_json(
+        resolved / "submission_receipt.json",
+        expected_file_sha256=RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_RECEIPT_SHA256,
+    )
+    lineage = _read_rx_main_l5_canary_json(
+        resolved / "lineage_pre_submit.json",
+        expected_file_sha256=RX_MAIN_L5_NATIVE_CANARY_LINEAGE_SHA256,
+    )
+    payload = _read_rx_main_l5_canary_json(
+        resolved / "dry_run_payload.json",
+        expected_file_sha256=RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_PAYLOAD_SHA256,
+    )
+    params = _read_rx_main_l5_canary_json(
+        resolved / "params.json",
+        expected_file_sha256=RX_MAIN_L5_NATIVE_CANARY_PARAMS_SHA256,
+    )
+    receipt_predecessor = receipt.get("predecessor")
+    lineage_predecessor = lineage.get("predecessor")
+    unchanged = lineage.get("unchanged_identity")
+    checks = lineage.get("checks")
+    command = str(payload.get("command") or "")
+    if (
+        receipt.get("schema")
+        != "mft-goal-rx-main-l5-corrected-successor-submission-v1"
+        or receipt.get("task_id")
+        != RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID
+        or receipt.get("task_name")
+        != RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_NAME
+        or receipt.get("submission_source") != "post_created"
+        or receipt.get("scheduler_post_calls") != 1
+        or receipt.get("scheduler_mutation_performed") is not True
+        or receipt.get("existing_tasks_or_gui_mutated") is not False
+        or receipt.get("computed_core_auth_sha256")
+        != RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256
+        or receipt.get("lineage_pre_submit_file_sha256")
+        != RX_MAIN_L5_NATIVE_CANARY_LINEAGE_SHA256
+        or receipt.get("geometry_sha256")
+        != RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256
+        or receipt.get("solver_revision")
+        != RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION
+        or receipt.get("library_revision")
+        != RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION
+        or receipt.get("fixed_cooling")
+        != RX_MAIN_L5_NATIVE_CANARY_FIXED_COOLING
+        or receipt.get("thermal_max_iterations") != 1
+        or not isinstance(receipt_predecessor, Mapping)
+        or receipt_predecessor.get("id") != RX_MAIN_L5_NATIVE_CANARY_TASK_ID
+        or receipt_predecessor.get("status") != "failed"
+        or receipt_predecessor.get("exit_code") != 1
+        or receipt_predecessor.get("classification")
+        != "operational_pre_solver_core_auth_failure_no_scientific_result"
+        or receipt_predecessor.get("terminal_gate_payload_sha256")
+        != predecessor.get("terminal_gate_payload_sha256")
+        or lineage.get("schema")
+        != "mft-goal-rx-main-l5-corrected-successor-lineage-v1"
+        or lineage.get("scheduler_post_calls") != 0
+        or lineage.get("computed_core_auth_sha256")
+        != RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256
+        or lineage.get("geometry_sha256")
+        != RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256
+        or lineage.get("solver_revision")
+        != RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION
+        or lineage.get("library_revision")
+        != RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION
+        or lineage.get("successor_task_name")
+        != RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_NAME
+        or lineage_predecessor != receipt_predecessor
+        or not isinstance(checks, Mapping)
+        or not checks
+        or any(value is not True for value in checks.values())
+        or not isinstance(unchanged, Mapping)
+        or unchanged.get("cpus") != RX_MAIN_L5_NATIVE_CANARY_CPUS
+        or unchanged.get("memory_mb") != RX_MAIN_L5_NATIVE_CANARY_MEMORY_MB
+        or unchanged.get("timeout_seconds")
+        != RX_MAIN_L5_NATIVE_CANARY_TIMEOUT_SECONDS
+        or unchanged.get("thermal_max_iterations") != 1
+        or unchanged.get("fixed_cooling")
+        != RX_MAIN_L5_NATIVE_CANARY_FIXED_COOLING
+        or unchanged.get("mesh_plan_contract") != "thermal-mesh-plan-v8"
+        or unchanged.get("mesh_policy")
+        != "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+        or payload.get("name")
+        != RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_NAME
+        or payload.get("cpus") != RX_MAIN_L5_NATIVE_CANARY_CPUS
+        or payload.get("memory_mb") != RX_MAIN_L5_NATIVE_CANARY_MEMORY_MB
+        or payload.get("timeout_seconds")
+        != RX_MAIN_L5_NATIVE_CANARY_TIMEOUT_SECONDS
+        or params.get("thermal_max_iterations") != 1
+        or any(
+            params.get(key) != expected
+            for key, expected in RX_MAIN_L5_NATIVE_CANARY_FIXED_COOLING.items()
+        )
+        or command.count(RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256) != 1
+        or RX_MAIN_L5_NATIVE_CANARY_OLD_CORE_AUTH_SHA256 in command
+    ):
+        raise UpdaterError("Rx-main successor lineage truth boundary drifted")
+    return {
+        "receipt_file_sha256": RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_RECEIPT_SHA256,
+        "lineage_file_sha256": RX_MAIN_L5_NATIVE_CANARY_LINEAGE_SHA256,
+    }
+
+
 def _rx_main_l5_canary_monitor(
     root: Path,
     *,
-    receipt_file_sha256: str,
+    task_id: int,
+    task_name: str,
 ) -> tuple[dict[str, Any] | None, str]:
-    path = root.resolve() / "monitor_latest.json"
-    if not path.is_file():
+    resolved = root.resolve()
+    state_path = resolved / "monitor_state.json"
+    process_path = resolved / "monitor_process.json"
+    if not state_path.is_file() and not process_path.is_file():
         return None, "unavailable"
     try:
-        if path.is_symlink() or path.stat().st_size > MAX_LOCAL_SEALED_STATE_BYTES:
-            raise UpdaterError("Rx-main canary monitor is unsafe")
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict):
-            raise UpdaterError("Rx-main canary monitor must be an object")
-        unsigned = copy.deepcopy(value)
-        observed_sha256 = unsigned.pop("payload_sha256", None)
-        state = str(value.get("state") or "").strip().lower()
-        _category(state)
         if (
-            value.get("schema_version")
-            != RX_MAIN_L5_NATIVE_CANARY_MONITOR_SCHEMA
-            or observed_sha256 != canonical_sha256(unsigned)
-            or value.get("task_id") != RX_MAIN_L5_NATIVE_CANARY_TASK_ID
-            or value.get("task_name") != RX_MAIN_L5_NATIVE_CANARY_TASK_NAME
-            or value.get("receipt_file_sha256") != receipt_file_sha256
-            or value.get("scheduler_endpoint")
-            != f"GET /api/tasks/{RX_MAIN_L5_NATIVE_CANARY_TASK_ID}"
-            or value.get("scheduler_methods_used") != ["GET"]
-            or value.get("scheduler_mutation_performed") is not False
-            or not isinstance(value.get("observed_at"), str)
+            not state_path.is_file()
+            or not process_path.is_file()
+            or state_path.is_symlink()
+            or process_path.is_symlink()
+            or state_path.stat().st_size > MAX_LOCAL_SEALED_STATE_BYTES
+            or process_path.stat().st_size > MAX_LOCAL_SEALED_STATE_BYTES
+        ):
+            raise UpdaterError("Rx-main canary monitor is incomplete")
+        state_value = json.loads(state_path.read_text(encoding="utf-8"))
+        process_value = json.loads(process_path.read_text(encoding="utf-8"))
+        if not isinstance(state_value, dict) or not isinstance(process_value, dict):
+            raise UpdaterError("Rx-main canary monitor must be an object")
+        task = state_value.get("task")
+        if not isinstance(task, Mapping):
+            raise UpdaterError("Rx-main canary monitor task is absent")
+        state = str(task.get("status") or "").strip().lower()
+        category = _category(state)
+        node_name = str(task.get("actual_node_name") or "")
+        slurm_job_id = str(task.get("slurm_job_id") or "")
+        if (
+            state_value.get("schema")
+            != RX_MAIN_L5_NATIVE_CANARY_MONITOR_STATE_SCHEMA
+            or state_value.get("payload_sha256")
+            != _rx_main_l5_monitor_payload_sha256(state_value)
+            or state_value.get("scheduler_mutation_performed") is not False
+            or task.get("id") != task_id
+            or task.get("name") != task_name
+            or process_value.get("schema")
+            != RX_MAIN_L5_NATIVE_CANARY_MONITOR_PROCESS_SCHEMA
+            or process_value.get("payload_sha256")
+            != _rx_main_l5_monitor_payload_sha256(process_value)
+            or process_value.get("task_id") != task_id
+            or process_value.get("allowed_http_method") != "GET"
+            or process_value.get("scheduler_mutation_performed") is not False
+            or process_value.get("post_cancel_retry_forbidden") is not True
+            or not isinstance(state_value.get("updated_at_utc"), str)
+            or (
+                category == "running"
+                and (not node_name or not slurm_job_id)
+            )
         ):
             raise UpdaterError("Rx-main canary monitor truth boundary drifted")
-        return {**value, "state": state}, "authenticated"
+        return {
+            "state": state,
+            "observed_at": state_value["updated_at_utc"],
+            "node_name": node_name,
+            "slurm_job_id": slurm_job_id,
+        }, "authenticated"
     except (OSError, UnicodeError, json.JSONDecodeError, UpdaterError):
         return None, "invalid"
 
@@ -6425,17 +6688,18 @@ def _rx_main_l5_native_canary_fail_safe_card(
     observed_at: str,
     *,
     condition: str,
-    root: Path,
+    predecessor_root: Path,
+    successor_root: Path,
 ) -> dict[str, Any]:
-    label = "RECEIPT MISSING" if condition == "missing" else "RECEIPT INVALID"
+    label = "LINEAGE MISSING" if condition == "missing" else "LINEAGE INVALID"
     return {
         "id": RX_MAIN_L5_NATIVE_CANARY_CARD_ID,
         "title": (
-            "CODEX | B7/v8 RX-MAIN L5 NATIVE EARLIEST CANARY task97140 | "
+            "CODEX | B7/v8 RX-MAIN L5 NATIVE EARLIEST CANARY LINEAGE | "
             f"{label} | LIVE STATE UNCLAIMED | PROMOTION OFF"
         ),
         "detail": (
-            "The pinned local submission evidence is absent or invalid. No "
+            "The pinned predecessor/successor evidence is absent or invalid. No "
             "Scheduler lifecycle, interface pass, scientific validity, design "
             "promotion, or production claim is inferred."
         ),
@@ -6443,11 +6707,12 @@ def _rx_main_l5_native_canary_fail_safe_card(
         "updated_at": observed_at,
         "progress_pct": 0,
         "evidence": [
-            f"receipt_authentication={condition}_fail_closed",
+            f"lineage_authentication={condition}_fail_closed",
             "Scheduler lifecycle=unclaimed / authenticated GET monitor=false",
             "interface pass=unclaimed / scientific promotion=false",
             "design promotion=false / production promotion=false",
-            f"evidence root={root.resolve()}",
+            f"predecessor root={predecessor_root.resolve()}",
+            f"successor root={successor_root.resolve()}",
         ],
     }
 
@@ -6456,33 +6721,56 @@ def _rx_main_l5_native_canary_card(
     observed_at: str,
     *,
     root: Path | None = None,
+    successor_root: Path | None = None,
 ) -> dict[str, Any]:
-    evidence_root = root or RX_MAIN_L5_NATIVE_CANARY_ROOT
+    predecessor_evidence_root = root or RX_MAIN_L5_NATIVE_CANARY_ROOT
+    successor_evidence_root = (
+        successor_root or RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_ROOT
+    )
     try:
-        receipt = _rx_main_l5_canary_receipt(evidence_root)
-    except FileNotFoundError:
-        return _rx_main_l5_native_canary_fail_safe_card(
-            observed_at,
-            condition="missing",
-            root=evidence_root,
+        predecessor_receipt = _rx_main_l5_canary_receipt(
+            predecessor_evidence_root
+        )
+        predecessor = _rx_main_l5_predecessor_terminal(
+            predecessor_evidence_root
+        )
+        successor = _rx_main_l5_successor_receipt(
+            successor_evidence_root,
+            predecessor=predecessor,
         )
     except (OSError, UnicodeError, json.JSONDecodeError, UpdaterError):
         condition = (
             "missing"
-            if not (evidence_root.resolve() / "submission_receipt.json").is_file()
+            if (
+                not (
+                    predecessor_evidence_root.resolve()
+                    / "submission_receipt.json"
+                ).is_file()
+                or not (
+                    successor_evidence_root.resolve()
+                    / "submission_receipt.json"
+                ).is_file()
+            )
             else "invalid"
         )
         return _rx_main_l5_native_canary_fail_safe_card(
             observed_at,
             condition=condition,
-            root=evidence_root,
+            predecessor_root=predecessor_evidence_root,
+            successor_root=successor_evidence_root,
         )
     monitor, monitor_condition = _rx_main_l5_canary_monitor(
-        evidence_root,
-        receipt_file_sha256=receipt["receipt_file_sha256"],
+        successor_evidence_root,
+        task_id=RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID,
+        task_name=RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_NAME,
     )
     live_label = (
-        f"GET {monitor['state'].upper()}"
+        (
+            f"GET {monitor['state'].upper()} "
+            f"{monitor['node_name']}/j{monitor['slurm_job_id']}"
+            if monitor["state"] in RUNNING_STATES
+            else f"GET {monitor['state'].upper()}"
+        )
         if monitor is not None
         else (
             "MONITOR INVALID · LIVE STATE UNCLAIMED"
@@ -6492,7 +6780,9 @@ def _rx_main_l5_native_canary_card(
     )
     monitor_evidence = (
         "GET monitor authenticated=true / "
-        f"state={monitor['state']} / observed_at={monitor['observed_at']}"
+        f"state={monitor['state']} / node={monitor['node_name'] or 'none'} / "
+        f"job={monitor['slurm_job_id'] or 'none'} / "
+        f"observed_at={monitor['observed_at']}"
         if monitor is not None
         else (
             "GET monitor authenticated=false / monitor condition="
@@ -6502,34 +6792,49 @@ def _rx_main_l5_native_canary_card(
     return {
         "id": RX_MAIN_L5_NATIVE_CANARY_CARD_ID,
         "title": (
-            "CODEX | B7/v8 RX-MAIN L5 NATIVE EARLIEST CANARY task97140 | "
-            f"SUBMITTED 1 POST | {live_label} | PROMOTION OFF"
+            "CODEX | B7/v8 RX-MAIN L5 LINEAGE | 97140 PRE-SOLVER FAILED | "
+            f"97141 SUBMITTED 1 POST | {live_label} | PROMOTION OFF"
         ),
         "detail": (
-            "Pinned local evidence authenticates exactly one canary submission. "
-            "Submission-time queued readback is not shown as live state. The "
-            "one-iteration thermal run can test the interface fix only; design "
-            "scientific and production promotion remain forbidden."
+            "Sealed GET and terminal-gate evidence classifies task 97140 as an "
+            "operational pre-solver core-auth failure with no mesh, FEA, or "
+            "scientific result—not a design failure. A sealed lineage receipt "
+            "authenticates exactly one corrected successor POST for task 97141. "
+            "Its receipt-time queued value is not shown as live state."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 10,
+        "progress_pct": 15,
         "evidence": [
             (
-                "receipt authenticated=true / task97140 / Scheduler POST count=1 / "
-                "existing tasks or GUI mutated=false"
+                "lineage authenticated=true / predecessor receipt+GET terminal "
+                "gate=true / successor receipt=true"
             ),
             (
-                "resources=8CPU/65536MiB/43200s (12h) / "
-                "thermal_max_iterations=1"
+                f"task97140=FAILED exit1 {predecessor['node_name']}/"
+                f"j{predecessor['slurm_job_id']} / operational pre-solver "
+                "core-auth failure"
+            ),
+            (
+                f"predecessor auth={RX_MAIN_L5_NATIVE_CANARY_OLD_CORE_AUTH_SHA256} "
+                f"/ expected auth={RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256}"
+            ),
+            (
+                "task97140 mesh generated=false / FEA invoked=false / "
+                "result JSON=false / scientific result=false / design failure=false"
+            ),
+            (
+                "task97141 corrected successor / Scheduler POST count=1 / "
+                "resources=8CPU/65536MiB/43200s (12h)"
             ),
             (
                 f"geometry={RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256} / "
-                f"solver={RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION}"
+                f"solver={RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION} / "
+                f"library={RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION}"
             ),
             (
-                f"library={RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION} / "
-                "fixed cooling unchanged=true"
+                "B7 mesh policy + v8 mesh plan unchanged / fixed cooling "
+                "unchanged=true / thermal_max_iterations=1"
             ),
             (
                 "interface pass requires missing_rx_main_solids=[] / "
@@ -6545,8 +6850,10 @@ def _rx_main_l5_native_canary_card(
                 "production promotion=false"
             ),
             (
-                f"receipt SHA256={receipt['receipt_file_sha256']} / "
-                f"pre-submit SHA256={receipt['pre_submit_file_sha256']}"
+                f"97140 receipt SHA256="
+                f"{predecessor_receipt['receipt_file_sha256']} / "
+                f"97141 receipt SHA256={successor['receipt_file_sha256']} / "
+                f"lineage SHA256={successor['lineage_file_sha256']}"
             ),
         ],
     }

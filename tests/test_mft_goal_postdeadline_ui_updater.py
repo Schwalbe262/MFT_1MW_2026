@@ -2070,7 +2070,7 @@ def test_merge_upserts_one_compact_design_card_before_parallel() -> None:
 def _write_rx_main_l5_canary_evidence(
     root: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     fixed_cooling = copy.deepcopy(
         updater.RX_MAIN_L5_NATIVE_CANARY_FIXED_COOLING
@@ -2082,7 +2082,10 @@ def _write_rx_main_l5_canary_evidence(
     payload = {
         "name": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_NAME,
         "dedupe_key": "sealed-rx-main-l5-canary",
-        "command": "run exact B7/v8 native earliest canary",
+        "command": (
+            "run exact B7/v8 native earliest canary "
+            f"{updater.RX_MAIN_L5_NATIVE_CANARY_OLD_CORE_AUTH_SHA256}"
+        ),
         "cpus": updater.RX_MAIN_L5_NATIVE_CANARY_CPUS,
         "memory_mb": updater.RX_MAIN_L5_NATIVE_CANARY_MEMORY_MB,
         "timeout_seconds": updater.RX_MAIN_L5_NATIVE_CANARY_TIMEOUT_SECONDS,
@@ -2196,30 +2199,223 @@ def _write_rx_main_l5_canary_evidence(
         "RX_MAIN_L5_NATIVE_CANARY_RECEIPT_SHA256",
         updater._file_sha256(receipt_path),
     )
+    failure_message = (
+        "RuntimeError: AEDT desktop startup failed after 3 attempts: "
+        "RuntimeError: standalone core opt-in authentication digest mismatch"
+    )
+    monitor = {
+        "schema": updater.RX_MAIN_L5_NATIVE_CANARY_MONITOR_STATE_SCHEMA,
+        "scheduler_mutation_performed": False,
+        "updated_at_utc": OBSERVED,
+        "task": {
+            "id": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_ID,
+            "name": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_NAME,
+            "status": "failed",
+            "exit_code": 1,
+            "failure_message": failure_message,
+            "actual_node_name": "n113",
+            "slurm_job_id": "845126",
+        },
+    }
+    monitor["payload_sha256"] = updater._rx_main_l5_monitor_payload_sha256(
+        monitor
+    )
+    monitor_path = root / "monitor_state.json"
+    monitor_path.write_text(json.dumps(monitor), encoding="utf-8")
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_MONITOR_STATE_SHA256",
+        updater._file_sha256(monitor_path),
+    )
+    gate = {
+        "schema": "mft-goal-rx-main-l5-terminal-gate-v1",
+        "task_id": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_ID,
+        "task_status": "failed",
+        "scheduler_mutation_performed": False,
+        "physical_geometry_sha256": (
+            updater.RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256
+        ),
+        "solver_revision": updater.RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION,
+        "library_revision": updater.RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION,
+        "interface_fix_canary_passed": False,
+        "scientific_design_promotion_passed": False,
+        "thermal_result_scientific_valid": False,
+        "one_iteration_canary_not_a_design_temperature_result": True,
+        "result_json_sha256": "",
+        "coverage": None,
+        "preflight": None,
+        "checks": {
+            "terminal_status": True,
+            "result_json_present": False,
+            "coverage_json_present": False,
+        },
+        "strict_result_fields": {
+            "thermal_result_scientific_valid": None,
+            "thermal_rx_main_interface_coverage_passed": None,
+        },
+    }
+    gate["payload_sha256"] = updater._rx_main_l5_monitor_payload_sha256(gate)
+    gate_path = root / "terminal_gate.json"
+    gate_path.write_text(json.dumps(gate), encoding="utf-8")
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_TERMINAL_GATE_SHA256",
+        updater._file_sha256(gate_path),
+    )
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_TERMINAL_GATE_PAYLOAD_SHA256",
+        gate["payload_sha256"],
+    )
+    predecessor = {
+        "id": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_ID,
+        "status": "failed",
+        "exit_code": 1,
+        "classification": (
+            "operational_pre_solver_core_auth_failure_no_scientific_result"
+        ),
+        "terminal_gate_payload_sha256": gate["payload_sha256"],
+    }
+    successor_root = root / "successor"
+    successor_root.mkdir()
+    successor_params_path = successor_root / "params.json"
+    successor_params_path.write_text(
+        json.dumps(params, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    successor_payload = {
+        "name": updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_NAME,
+        "command": (
+            "run corrected B7/v8 native earliest canary "
+            f"{updater.RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256}"
+        ),
+        "cpus": updater.RX_MAIN_L5_NATIVE_CANARY_CPUS,
+        "memory_mb": updater.RX_MAIN_L5_NATIVE_CANARY_MEMORY_MB,
+        "timeout_seconds": updater.RX_MAIN_L5_NATIVE_CANARY_TIMEOUT_SECONDS,
+    }
+    successor_payload_path = successor_root / "dry_run_payload.json"
+    successor_payload_path.write_text(
+        json.dumps(successor_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_PAYLOAD_SHA256",
+        updater._file_sha256(successor_payload_path),
+    )
+    unchanged = {
+        "cpus": updater.RX_MAIN_L5_NATIVE_CANARY_CPUS,
+        "memory_mb": updater.RX_MAIN_L5_NATIVE_CANARY_MEMORY_MB,
+        "timeout_seconds": updater.RX_MAIN_L5_NATIVE_CANARY_TIMEOUT_SECONDS,
+        "thermal_max_iterations": 1,
+        "fixed_cooling": fixed_cooling,
+        "mesh_plan_contract": "thermal-mesh-plan-v8",
+        "mesh_policy": (
+            "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+        ),
+    }
+    lineage = {
+        "schema": "mft-goal-rx-main-l5-corrected-successor-lineage-v1",
+        "scheduler_post_calls": 0,
+        "computed_core_auth_sha256": (
+            updater.RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256
+        ),
+        "geometry_sha256": updater.RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256,
+        "solver_revision": updater.RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION,
+        "library_revision": updater.RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION,
+        "successor_task_name": (
+            updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_NAME
+        ),
+        "predecessor": predecessor,
+        "checks": {"all_lineage_checks": True},
+        "unchanged_identity": unchanged,
+    }
+    lineage_path = successor_root / "lineage_pre_submit.json"
+    lineage_path.write_text(json.dumps(lineage), encoding="utf-8")
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_LINEAGE_SHA256",
+        updater._file_sha256(lineage_path),
+    )
+    successor_receipt = {
+        "schema": "mft-goal-rx-main-l5-corrected-successor-submission-v1",
+        "task_id": updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID,
+        "task_name": updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_NAME,
+        "submission_source": "post_created",
+        "scheduler_post_calls": 1,
+        "scheduler_mutation_performed": True,
+        "existing_tasks_or_gui_mutated": False,
+        "computed_core_auth_sha256": (
+            updater.RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256
+        ),
+        "lineage_pre_submit_file_sha256": (
+            updater.RX_MAIN_L5_NATIVE_CANARY_LINEAGE_SHA256
+        ),
+        "geometry_sha256": updater.RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256,
+        "solver_revision": updater.RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION,
+        "library_revision": updater.RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION,
+        "fixed_cooling": fixed_cooling,
+        "thermal_max_iterations": 1,
+        "predecessor": predecessor,
+        "status": "queued",
+    }
+    successor_receipt_path = successor_root / "submission_receipt.json"
+    successor_receipt_path.write_text(
+        json.dumps(successor_receipt),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_RECEIPT_SHA256",
+        updater._file_sha256(successor_receipt_path),
+    )
+    return successor_root
 
 
 def test_rx_main_l5_native_canary_card_uses_receipt_without_live_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_rx_main_l5_canary_evidence(tmp_path, monkeypatch)
+    successor_root = _write_rx_main_l5_canary_evidence(
+        tmp_path, monkeypatch
+    )
 
     card = updater._rx_main_l5_native_canary_card(
         OBSERVED,
         root=tmp_path,
+        successor_root=successor_root,
     )
 
     assert card["id"] == updater.RX_MAIN_L5_NATIVE_CANARY_CARD_ID
     assert len(card["title"]) <= 160
     assert card["state"] == "in_progress"
     assert len(card["evidence"]) <= 12
-    assert "SUBMITTED 1 POST" in card["title"]
+    assert "97140 PRE-SOLVER FAILED" in card["title"]
+    assert "97141 SUBMITTED 1 POST" in card["title"]
     assert "LIVE STATE UNCLAIMED" in card["title"]
     assert "QUEUED" not in card["title"]
     assert any(
-        "8CPU/65536MiB/43200s (12h)" in item
-        and "thermal_max_iterations=1" in item
+        "operational pre-solver core-auth failure" in item
         for item in card["evidence"]
+    )
+    assert any(
+        "mesh generated=false" in item
+        and "FEA invoked=false" in item
+        and "scientific result=false" in item
+        and "design failure=false" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        updater.RX_MAIN_L5_NATIVE_CANARY_OLD_CORE_AUTH_SHA256 in item
+        and updater.RX_MAIN_L5_NATIVE_CANARY_CORE_AUTH_SHA256 in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "8CPU/65536MiB/43200s (12h)" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "thermal_max_iterations=1" in item for item in card["evidence"]
     )
     assert any(
         updater.RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256 in item
@@ -2228,8 +2424,10 @@ def test_rx_main_l5_native_canary_card_uses_receipt_without_live_claim(
     )
     assert any(
         updater.RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION in item
-        and "fixed cooling unchanged=true" in item
         for item in card["evidence"]
+    )
+    assert any(
+        "fixed cooling unchanged=true" in item for item in card["evidence"]
     )
     assert any(
         "missing_rx_main_solids=[]" in item
@@ -2254,8 +2452,10 @@ def test_rx_main_l5_native_canary_rejects_unsealed_live_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_rx_main_l5_canary_evidence(tmp_path, monkeypatch)
-    (tmp_path / "monitor_latest.json").write_text(
+    successor_root = _write_rx_main_l5_canary_evidence(
+        tmp_path, monkeypatch
+    )
+    (successor_root / "monitor_state.json").write_text(
         json.dumps({"state": "running"}),
         encoding="utf-8",
     )
@@ -2263,6 +2463,7 @@ def test_rx_main_l5_native_canary_rejects_unsealed_live_state(
     card = updater._rx_main_l5_native_canary_card(
         OBSERVED,
         root=tmp_path,
+        successor_root=successor_root,
     )
 
     assert "MONITOR INVALID" in card["title"]
@@ -2278,38 +2479,55 @@ def test_rx_main_l5_native_canary_accepts_sealed_get_monitor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_rx_main_l5_canary_evidence(tmp_path, monkeypatch)
-    monitor = updater._sealed(
-        {
-            "schema_version": updater.RX_MAIN_L5_NATIVE_CANARY_MONITOR_SCHEMA,
-            "task_id": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_ID,
-            "task_name": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_NAME,
-            "receipt_file_sha256": (
-                updater.RX_MAIN_L5_NATIVE_CANARY_RECEIPT_SHA256
-            ),
-            "scheduler_endpoint": (
-                f"GET /api/tasks/{updater.RX_MAIN_L5_NATIVE_CANARY_TASK_ID}"
-            ),
-            "scheduler_methods_used": ["GET"],
-            "scheduler_mutation_performed": False,
-            "observed_at": OBSERVED,
-            "state": "running",
-        }
+    successor_root = _write_rx_main_l5_canary_evidence(
+        tmp_path, monkeypatch
     )
-    (tmp_path / "monitor_latest.json").write_text(
+    monitor = {
+        "schema": updater.RX_MAIN_L5_NATIVE_CANARY_MONITOR_STATE_SCHEMA,
+        "scheduler_mutation_performed": False,
+        "updated_at_utc": OBSERVED,
+        "task": {
+            "id": updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID,
+            "name": updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_NAME,
+            "status": "running",
+            "actual_node_name": "n110",
+            "slurm_job_id": "840585",
+        },
+    }
+    monitor["payload_sha256"] = updater._rx_main_l5_monitor_payload_sha256(
+        monitor
+    )
+    process = {
+        "schema": updater.RX_MAIN_L5_NATIVE_CANARY_MONITOR_PROCESS_SCHEMA,
+        "task_id": updater.RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_TASK_ID,
+        "allowed_http_method": "GET",
+        "scheduler_mutation_performed": False,
+        "post_cancel_retry_forbidden": True,
+    }
+    process["payload_sha256"] = updater._rx_main_l5_monitor_payload_sha256(
+        process
+    )
+    (successor_root / "monitor_state.json").write_text(
         json.dumps(monitor),
+        encoding="utf-8",
+    )
+    (successor_root / "monitor_process.json").write_text(
+        json.dumps(process),
         encoding="utf-8",
     )
 
     card = updater._rx_main_l5_native_canary_card(
         OBSERVED,
         root=tmp_path,
+        successor_root=successor_root,
     )
 
-    assert "GET RUNNING" in card["title"]
+    assert "GET RUNNING n110/j840585" in card["title"]
     assert any(
         "GET monitor authenticated=true" in item
         and "state=running" in item
+        and "node=n110" in item
+        and "job=840585" in item
         for item in card["evidence"]
     )
     assert any(
@@ -2323,7 +2541,9 @@ def test_rx_main_l5_native_canary_receipt_tamper_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_rx_main_l5_canary_evidence(tmp_path, monkeypatch)
+    successor_root = _write_rx_main_l5_canary_evidence(
+        tmp_path, monkeypatch
+    )
     receipt_path = tmp_path / "submission_receipt.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     receipt["scheduler_post_calls"] = 2
@@ -2332,12 +2552,13 @@ def test_rx_main_l5_native_canary_receipt_tamper_fails_closed(
     card = updater._rx_main_l5_native_canary_card(
         OBSERVED,
         root=tmp_path,
+        successor_root=successor_root,
     )
 
-    assert "RECEIPT INVALID" in card["title"]
+    assert "LINEAGE INVALID" in card["title"]
     assert "SUBMITTED" not in card["title"]
     assert any(
-        "receipt_authentication=invalid_fail_closed" == item
+        "lineage_authentication=invalid_fail_closed" == item
         for item in card["evidence"]
     )
     assert any(
@@ -2351,11 +2572,18 @@ def test_merge_upserts_one_rx_main_l5_native_canary_card(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_rx_main_l5_canary_evidence(tmp_path, monkeypatch)
+    successor_root = _write_rx_main_l5_canary_evidence(
+        tmp_path, monkeypatch
+    )
     monkeypatch.setattr(
         updater,
         "RX_MAIN_L5_NATIVE_CANARY_ROOT",
         tmp_path,
+    )
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_SUCCESSOR_ROOT",
+        successor_root,
     )
 
     merged = updater.merge_status(
