@@ -84,8 +84,15 @@ EFFICIENCY_EXPERIMENT_INPUT_KEYS = (
 # Fixed-run-only geometry controls are not Sobol coordinates and therefore do
 # not alter the sealed candidate digest. They are append-only in the complete
 # input schema so pre-extension fixed payloads remain explicitly admissible.
-FIXED_GEOMETRY_INPUT_KEYS = (
+LEGACY_FIXED_GEOMETRY_INPUT_KEYS = (
     "core_center_gap_mm",
+)
+AIR_GAP_TOPOLOGY_INPUT_KEYS = (
+    "core_equal_three_leg_air_gap",
+)
+FIXED_GEOMETRY_INPUT_KEYS = (
+    *LEGACY_FIXED_GEOMETRY_INPUT_KEYS,
+    *AIR_GAP_TOPOLOGY_INPUT_KEYS,
 )
 # Optional electrostatic-stage controls are accepted and echoed by fixed runs,
 # but deliberately stay outside KEYS.  KEYS is the sealed campaign identity;
@@ -132,11 +139,15 @@ PRE_CORE_CENTER_GAP_INPUT_KEYS = [
 ]
 PRE_TURN_GRADED_INPUT_KEYS = [
     *PRE_CORE_CENTER_GAP_INPUT_KEYS,
-    *FIXED_GEOMETRY_INPUT_KEYS,
+    *LEGACY_FIXED_GEOMETRY_INPUT_KEYS,
 ]
-ALL_INPUT_KEYS = [
+PRE_EQUAL_THREE_LEG_AIR_GAP_INPUT_KEYS = [
     *PRE_TURN_GRADED_INPUT_KEYS,
     *TURN_GRADED_ELECTROSTATIC_INPUT_KEYS,
+]
+ALL_INPUT_KEYS = [
+    *PRE_EQUAL_THREE_LEG_AIR_GAP_INPUT_KEYS,
+    *AIR_GAP_TOPOLOGY_INPUT_KEYS,
 ]
 
 # Candidate authentication remains fail-closed: sealed fronts use KEYS, while
@@ -147,6 +158,7 @@ SUPPORTED_CANDIDATE_INPUT_SCHEMAS = frozenset({
     frozenset(PRE_ANISOTROPIC_CORE_K_INPUT_KEYS),
     frozenset(PRE_CORE_CENTER_GAP_INPUT_KEYS),
     frozenset(PRE_TURN_GRADED_INPUT_KEYS),
+    frozenset(PRE_EQUAL_THREE_LEG_AIR_GAP_INPUT_KEYS),
     frozenset(ALL_INPUT_KEYS),
 })
 
@@ -303,6 +315,10 @@ def get_drawing_default_params():
         # Fixed-run-only physical center-leg air gap. Zero preserves the
         # historical five-piece/group core geometry exactly.
         "core_center_gap_mm": 0.0,
+        # Append-only manufacturable air-gap topology selector.  Zero preserves
+        # historical center-leg-only artifacts; new tuning/final flows force 1
+        # so the center and both side legs receive the same physical gap.
+        "core_equal_three_leg_air_gap": 0,
         # 권선 도체의 운전 온도 기준 [C]: EM 도전율을 이 온도의 구리로 설정
         # (20C 기준이면 실물(~80-100C) 권선손실 ~25% 과소평가 - 손실/온도 라벨 현실화)
         "conductor_temp_C": 80.0,
@@ -674,8 +690,12 @@ def _add_derived_features(inp):
     face_mm2 = (4 * l1 + 2 * l2) * (h1 + 2 * l1) - 2 * l2 * h1
     core_vol_gross_m3 = face_mm2 * iron_depth * 1e-9
     center_gap_mm = float(inp["core_center_gap_mm"].iloc[0])
+    equal_three_leg_gap = int(
+        inp["core_equal_three_leg_air_gap"].iloc[0]
+    )
+    removed_volume_multiplier = 2.0 if equal_three_leg_gap == 1 else 1.0
     core_center_gap_removed_volume_m3 = (
-        Ae_gross_m2 * center_gap_mm * 1e-3
+        removed_volume_multiplier * Ae_gross_m2 * center_gap_mm * 1e-3
     )
     core_vol_gapped_m3 = (
         core_vol_gross_m3 - core_center_gap_removed_volume_m3
@@ -721,6 +741,22 @@ def _add_derived_features(inp):
     inp["core_mass_effective_kg"] = [core_mass_effective_kg]
     inp["core_center_gap_removed_volume_m3"] = [
         core_center_gap_removed_volume_m3
+    ]
+    inp["core_air_gap_removed_volume_m3"] = [
+        core_center_gap_removed_volume_m3
+    ]
+    inp["core_air_gap_gapped_leg_count"] = [
+        0 if center_gap_mm <= 0.0 else
+        3 if equal_three_leg_gap == 1 else 1
+    ]
+    inp["core_air_gap_topology"] = [
+        "continuous_no_physical_gap"
+        if center_gap_mm <= 0.0
+        else (
+            "equal_center_and_both_side_legs"
+            if equal_three_leg_gap == 1
+            else "legacy_center_leg_only"
+        )
     ]
     inp["core_vol_gapped_geometry_m3"] = [core_vol_gapped_geometry_m3]
     inp["core_vol_gapped_effective_m3"] = [core_vol_gapped_effective_m3]
@@ -812,6 +848,15 @@ def validation_check(input_df, strict=False, return_errors=False):
         core_center_gap_mm = float(inp["core_center_gap_mm"].iloc[0])
     except (TypeError, ValueError, OverflowError):
         core_center_gap_mm = float("nan")
+    try:
+        core_equal_three_leg_air_gap_raw = inp[
+            "core_equal_three_leg_air_gap"
+        ].iloc[0]
+        core_equal_three_leg_air_gap = int(
+            core_equal_three_leg_air_gap_raw
+        )
+    except (TypeError, ValueError, OverflowError):
+        core_equal_three_leg_air_gap = -1
     cw1 = float(inp["cw1"].iloc[0])
     gap1 = float(inp["gap1"].iloc[0])
     cw2 = float(inp["cw2"].iloc[0])
@@ -937,6 +982,19 @@ def validation_check(input_df, strict=False, return_errors=False):
         errors.append(
             "core_center_gap_mm must be smaller than h1 "
             f"({core_center_gap_mm} >= {h1})"
+        )
+    if (
+        core_equal_three_leg_air_gap not in (0, 1)
+        or not isinstance(
+            core_equal_three_leg_air_gap_raw,
+            (int, float, np.integer, np.floating),
+        )
+        or float(core_equal_three_leg_air_gap_raw)
+        != float(core_equal_three_leg_air_gap)
+    ):
+        errors.append(
+            "core_equal_three_leg_air_gap must be exactly 0 or 1 "
+            f"({inp['core_equal_three_leg_air_gap'].iloc[0]!r})"
         )
     if nwh1 > h1:
         errors.append(f"nwh1 ({nwh1}) > h1 ({h1})")
@@ -1241,6 +1299,7 @@ NON_DESIGN_VAR_KEYS = {
     "thermal_rx_side_block_mesh_level",
     "core_lamination_factor", "core_loss_margin",
     "physics_data_revision",
+    "core_equal_three_leg_air_gap",
 }
 
 

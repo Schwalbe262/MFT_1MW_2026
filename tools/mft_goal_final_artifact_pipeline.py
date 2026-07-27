@@ -51,6 +51,9 @@ from module.mft_goal_20260726_contract import (  # noqa: E402
     GOAL_TEMPERATURE_CONTRACT_SHA256,
     TEMPERATURE_FAMILY_LIMITS_C,
 )
+from module.core_air_gap_contract import (  # noqa: E402
+    validate_air_gap_contract,
+)
 
 
 WINNER_AUTHORITY_SCHEMA = "mft-goal-final-artifact-winner-authority-v1"
@@ -343,6 +346,8 @@ def _validate_graded_capacitance_provenance(
         or provenance.get("geometry_and_gap_exact_match") is not True
         or provenance.get("actual_connection_topology_attested") is not True
         or provenance.get("legacy_two_net_result_used") is not False
+        or provenance.get("core_equal_three_leg_air_gap") != 1
+        or provenance.get("equal_three_leg_air_gap_FEA_required") is not True
         or provenance.get("candidate_physics_sha256")
         != source["candidate_physics_sha256"]
     ):
@@ -395,6 +400,7 @@ def _validate_graded_capacitance_provenance(
                 f"turn-graded {active} center gap",
             )
             != physical_gap
+            or row.get("core_equal_three_leg_air_gap") != 1
             or not isinstance(row.get("solver_revision"), str)
             or not re.fullmatch(r"[0-9a-f]{40}", row["solver_revision"])
             or not isinstance(row.get("library_revision"), str)
@@ -601,6 +607,38 @@ def validate_winner_authority(
         raise FinalArtifactPipelineError(
             "actual primary-referred Lm is outside 2 mH tolerance"
         )
+    try:
+        air_gap_contract = validate_air_gap_contract(
+            verification.get("equal_three_leg_air_gap_contract"),
+            require_equal_three_leg=True,
+            require_verified=True,
+        )
+    except ValueError as exc:
+        raise FinalArtifactPipelineError(
+            "equal-three-leg physical air-gap promotion contract is absent"
+        ) from exc
+    if (
+        verification.get("equal_three_leg_air_gap_FEA_required") is not True
+        or verification.get(
+            "physical_Lm_2mH_symmetric_FEA_verified"
+        ) is not True
+        or air_gap_contract.get("final_promotion_allowed") is not True
+        or not math.isclose(
+            air_gap_contract["physical_gap_mm"],
+            _finite(params.get("core_center_gap_mm"), "winner physical gap"),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or not math.isclose(
+            air_gap_contract["physical_Lm_H"],
+            lm_h,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise FinalArtifactPipelineError(
+            "equal-three-leg physical air-gap promotion contract drifted"
+        )
     graded_capacitance = _validate_graded_capacitance_provenance(
         verification.get("graded_capacitance_provenance"),
         source=source,
@@ -642,6 +680,7 @@ def validate_winner_authority(
         "thermal_symmetry": "eighth",
         "cw1": 5.0,
         "gap1": 1.6,
+        "core_equal_three_leg_air_gap": 1,
     }.items():
         _exact(params.get(key), expected, f"params.{key}")
     n1 = int(_finite(params.get("N1_main"), "N1_main")) + int(
@@ -669,6 +708,7 @@ def validate_winner_authority(
         },
         "params": copy.deepcopy(dict(params)),
         "verification": copy.deepcopy(dict(verification)),
+        "equal_three_leg_air_gap_contract": air_gap_contract,
         "graded_capacitance_provenance": graded_capacitance,
         "fixed_boundary_attestation": boundary_attestation,
         "turns": {"N1": n1, "N2": n2},
@@ -829,6 +869,12 @@ def build_pipeline_manifest(
             "turns": copy.deepcopy(authenticated["turns"]),
             "primary_conductor_thickness_mm": 5.0,
             "primary_turn_gap_mm": 1.6,
+            "equal_three_leg_air_gap_contract": copy.deepcopy(
+                authenticated["equal_three_leg_air_gap_contract"]
+            ),
+            "equal_three_leg_air_gap_FEA_required": True,
+            "physical_Lm_2mH_symmetric_FEA_verified": True,
+            "final_promotion_allowed": True,
             "axis_contract": {
                 "W": "drawing x / original 973-mm direction",
                 "L": "perpendicular drawing y",

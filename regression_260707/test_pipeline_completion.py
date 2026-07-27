@@ -53,7 +53,9 @@ from module.input_parameter_260706 import (
     KEYS,
     PRE_ANISOTROPIC_CORE_K_INPUT_KEYS,
     PRE_CORE_CENTER_GAP_INPUT_KEYS,
+    PRE_EQUAL_THREE_LEG_AIR_GAP_INPUT_KEYS,
     PRE_ELECTROSTATIC_INPUT_KEYS,
+    PRE_TURN_GRADED_INPUT_KEYS,
     create_input_parameter,
 )
 from module.core_material_contract import (
@@ -1333,6 +1335,13 @@ class FineValidationTests(unittest.TestCase):
         pre_center_gap = {
             key: complete[key] for key in PRE_CORE_CENTER_GAP_INPUT_KEYS
         }
+        pre_turn_graded = {
+            key: complete[key] for key in PRE_TURN_GRADED_INPUT_KEYS
+        }
+        pre_equal_three_leg = {
+            key: complete[key]
+            for key in PRE_EQUAL_THREE_LEG_AIR_GAP_INPUT_KEYS
+        }
         cap_diagnostic = dict(
             complete,
             cap_on=1,
@@ -1343,13 +1352,14 @@ class FineValidationTests(unittest.TestCase):
         self.assertEqual(len(KEYS), 71)
         self.assertEqual(len(PRE_ANISOTROPIC_CORE_K_INPUT_KEYS), 75)
         self.assertEqual(len(PRE_CORE_CENTER_GAP_INPUT_KEYS), 81)
-        self.assertEqual(len(ALL_INPUT_KEYS), 82)
+        self.assertEqual(len(ALL_INPUT_KEYS), 90)
         self.assertEqual(
             {len(schema) for schema in ALLOWED_CANDIDATE_INPUT_SCHEMAS},
-            {71, 75, 81, 82},
+            {71, 75, 81, 82, 89, 90},
         )
         for params in (
             sealed, pre_anisotropic, pre_cap, pre_center_gap, complete,
+            pre_turn_graded, pre_equal_three_leg,
             legacy_thermal, cap_diagnostic,
         ):
             with self.subTest(schema_size=len(params)):

@@ -1,11 +1,12 @@
-"""Tune the rank-1 MFT center-leg air gap to 2.000 mH with symmetric FEA.
+"""Tune the rank-1 MFT equal-three-leg air gap to 2.000 mH with symmetric FEA.
 
 The driver is intentionally separate from the pre-gap 16-candidate FEA lane.
 It prepares an eight-point parallel matrix-only bracket, authenticates native
-L11/L22/M/k/Lm readback and physical gap geometry, then advances with guarded
-secant/bisection refinement.  A successful terminal manifest emits exact tuned
-parameter payloads for the later symmetric loss/thermal, full, and rounded
-model stages.
+L11/L22/M/k/Lm readback and identical center/left/right physical-gap geometry,
+then advances with guarded secant/bisection refinement.  Historical
+center-only artifacts remain readable as diagnostic evidence but cannot emit a
+final manifest.  A successful terminal manifest emits exact tuned parameter
+payloads for the later symmetric loss/thermal, full, and rounded model stages.
 
 Scheduler mutation is possible only through ``submit --apply`` or
 ``drive --apply``.  Preparation, collection, and dry-run commands are local or
@@ -41,6 +42,11 @@ from module.input_parameter_260706 import (  # noqa: E402
     create_input_parameter,
     get_drawing_default_params,
     validation_check,
+)
+from module.core_air_gap_contract import (  # noqa: E402
+    EQUAL_THREE_LEG_RESULT_TOPOLOGY,
+    LEGACY_CENTER_ONLY_RESULT_TOPOLOGY,
+    build_air_gap_contract,
 )
 from regression_260707.verify import scheduler_client  # noqa: E402
 
@@ -245,7 +251,8 @@ def _profile() -> dict[str, Any]:
         "schema_version": PROFILE_SCHEMA,
         "stage": "symmetric_matrix_only_physical_gap_tuning",
         "comment": (
-            "Eighth-symmetry Matrix-only physical center-gap tuning; no "
+            "Eighth-symmetry Matrix-only identical center-and-side-leg gap "
+            "tuning; no "
             "capacitance, loss, thermal, or retained AEDT artifact"
         ),
         "reviewed_solver_path": "run_simulation_260706.py --fixed --headless",
@@ -266,6 +273,7 @@ def _profile() -> dict[str, Any]:
             "fan_config": "dual",
             "core_plate_pad_t": 2.0,
             "wcp_pad_t": 2.0,
+            "core_equal_three_leg_air_gap": 1,
         },
         "fixed_boundary_contract": {
             "fan_velocity_m_s": 1.5,
@@ -354,6 +362,7 @@ def _authority_rank1(authority_root: Path) -> tuple[dict[str, Any], Path]:
     }
     params.update(_profile()["param_overrides"])
     params["core_center_gap_mm"] = 0.0
+    params["core_equal_three_leg_air_gap"] = 1
     ok, validated = validation_check(
         create_input_parameter(params), strict=True
     )
@@ -461,6 +470,7 @@ def _authority_neighborhood_rank1(
     }
     params.update(_profile()["param_overrides"])
     params["core_center_gap_mm"] = 0.0
+    params["core_equal_three_leg_air_gap"] = 1
     ok, validated = validation_check(
         create_input_parameter(params), strict=True
     )
@@ -568,6 +578,7 @@ def _lane(
     params = dict(candidate["base_params"])
     params.update(profile["param_overrides"])
     params["core_center_gap_mm"] = gap
+    params["core_equal_three_leg_air_gap"] = 1
     ok, _validated = validation_check(
         create_input_parameter(params), strict=True
     )
@@ -590,6 +601,8 @@ def _lane(
     return {
         "lane_index": lane_index,
         "core_center_gap_mm": gap,
+        "core_equal_three_leg_air_gap": 1,
+        "air_gap_topology": "equal_center_and_both_side_legs",
         "params": _file_record(params_path, relative_to=root),
         "params_sha256": _sha(params),
         "scheduler": {
@@ -665,6 +678,9 @@ def _write_round(
             "matrix_only": True,
             "symmetric_eighth_model": True,
             "full_physical_inductance_scale": 2.0,
+            "core_equal_three_leg_air_gap": 1,
+            "equal_three_leg_air_gap_FEA_required": True,
+            "final_promotion_allowed": False,
             "scheduler_submission_performed": False,
         }
     )
@@ -752,6 +768,11 @@ def _prepare_candidate(
                     "parallel bracket sweep then guarded secant/bisection"
                 ),
                 "native_eighth_to_full_inductance_scale": 2.0,
+                "air_gap_topology": "equal_center_and_both_side_legs",
+                "core_equal_three_leg_air_gap": 1,
+                "equal_three_leg_air_gap_FEA_required": True,
+                "legacy_center_only_artifacts": "diagnostic_only",
+                "final_promotion_allowed_before_symmetric_FEA": False,
             },
             "downstream_required_variants": [
                 "symmetric_matrix_confirmation",
@@ -761,6 +782,8 @@ def _prepare_candidate(
             ],
             "pre_gap_16_candidate_lane_modified": False,
             "scheduler_repository_modified": False,
+            "equal_three_leg_air_gap_FEA_required": True,
+            "final_promotion_allowed": False,
         }
     )
     campaign_path = _atomic_json(
@@ -1162,7 +1185,9 @@ def _result_json(task: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def _matrix_observation(
-    result: Mapping[str, Any], expected_gap_mm: float
+    result: Mapping[str, Any],
+    expected_gap_mm: float,
+    expected_equal_three_leg: bool = True,
 ) -> dict[str, Any]:
     gap = _finite(expected_gap_mm, "expected center gap")
     reasons = []
@@ -1177,6 +1202,10 @@ def _matrix_observation(
     exact("cap_on", 0)
     exact("loss_on", 0)
     exact("thermal_on", 0)
+    exact(
+        "core_equal_three_leg_air_gap",
+        1 if expected_equal_three_leg else 0,
+    )
     observed_gap = _finite(
         result.get("core_center_gap_mm"), "result core_center_gap_mm"
     )
@@ -1193,16 +1222,45 @@ def _matrix_observation(
     if not math.isclose(gap_readback, gap, rel_tol=0.0, abs_tol=1e-6):
         reasons.append("core_center_gap_readback_mismatch")
     if gap > 0.0:
-        if (
-            result.get("core_center_gap_topology")
-            != "center_leg_bottom_top_physical_air_interval"
-        ):
+        expected_topology = (
+            EQUAL_THREE_LEG_RESULT_TOPOLOGY
+            if expected_equal_three_leg
+            else LEGACY_CENTER_ONLY_RESULT_TOPOLOGY
+        )
+        if result.get("core_center_gap_topology") != expected_topology:
             reasons.append("physical_gap_topology_mismatch")
+        if expected_equal_three_leg:
+            if int(_finite(
+                result.get("core_air_gap_gapped_leg_count"),
+                "gapped leg count",
+            )) != 3:
+                reasons.append("equal_three_leg_gapped_leg_count_mismatch")
+            if int(_finite(
+                result.get(
+                    "core_equal_three_leg_air_gap_geometry_attested"
+                ),
+                "equal-three-leg full geometry attestation",
+            )) != 1:
+                reasons.append("equal_three_leg_geometry_not_attested")
+            if int(_finite(
+                result.get(
+                    "core_air_gap_identical_all_gapped_legs_attested"
+                ),
+                "identical all-leg gap attestation",
+            )) != 1:
+                reasons.append("all_leg_gap_equality_not_attested")
         if int(_finite(
             result.get("core_center_gap_symmetry_geometry_attested"),
             "symmetric gap attestation",
         )) != 1:
             reasons.append("symmetric_gap_geometry_not_attested")
+        if expected_equal_three_leg and int(_finite(
+            result.get(
+                "core_equal_three_leg_air_gap_symmetry_geometry_attested"
+            ),
+            "equal-three-leg symmetric geometry attestation",
+        )) != 1:
+            reasons.append("equal_three_leg_symmetry_not_attested")
 
     native_l11_uH = _finite(result.get("Ltx"), "native L11")
     native_l22_uH = _finite(result.get("Lrx"), "native L22")
@@ -1259,6 +1317,11 @@ def _matrix_observation(
         "contract_valid": not reasons,
         "reasons": reasons,
         "core_center_gap_mm": gap,
+        "core_equal_three_leg_air_gap": (
+            1 if expected_equal_three_leg else 0
+        ),
+        "legacy_center_only_diagnostic": not expected_equal_three_leg,
+        "equal_three_leg_air_gap_FEA_required": True,
         "core_center_gap_readback_mm": gap_readback,
         "geometry_attestation": {
             "topology": result.get("core_center_gap_topology"),
@@ -1266,6 +1329,23 @@ def _matrix_observation(
                 _finite(
                     result.get("core_center_gap_geometry_attested"),
                     "geometry attested",
+                )
+            ),
+            "equal_three_leg_geometry_attested": int(
+                result.get(
+                    "core_equal_three_leg_air_gap_geometry_attested", 0
+                )
+            ),
+            "equal_three_leg_symmetry_geometry_attested": int(
+                result.get(
+                    "core_equal_three_leg_air_gap_symmetry_geometry_attested",
+                    0,
+                )
+            ),
+            "gapped_leg_count": int(
+                result.get(
+                    "core_air_gap_gapped_leg_count",
+                    1 if gap > 0.0 else 0,
                 )
             ),
             "symmetry_geometry_attested": int(
@@ -1373,7 +1453,11 @@ def collect(
             result = _result_json(task)
             if result is not None:
                 observation = _matrix_observation(
-                    result, lane["core_center_gap_mm"]
+                    result,
+                    lane["core_center_gap_mm"],
+                    expected_equal_three_leg=bool(
+                        lane.get("core_equal_three_leg_air_gap", 0)
+                    ),
                 )
                 item.update(observation)
                 item["result_available"] = True
@@ -1566,6 +1650,7 @@ def _variant_params(
 ) -> dict[str, dict[str, Any]]:
     common = dict(base)
     common["core_center_gap_mm"] = gap_mm
+    common["core_equal_three_leg_air_gap"] = 1
     variants = {
         "symmetric_matrix_confirmation": dict(
             common,
@@ -1655,6 +1740,36 @@ def finalize_or_refine(
             return _validate_seal(_read_json(final_path), FINAL_SCHEMA)
         selected = decision["selected"]
         gap = float(selected["core_center_gap_mm"])
+        if (
+            gap <= 0.0
+            or int(selected.get("core_equal_three_leg_air_gap", 0)) != 1
+            or selected.get("legacy_center_only_diagnostic") is True
+            or selected.get("geometry_attestation", {}).get(
+                "equal_three_leg_geometry_attested"
+            ) != 1
+            or selected.get("geometry_attestation", {}).get(
+                "equal_three_leg_symmetry_geometry_attested"
+            ) != 1
+            or selected.get("geometry_attestation", {}).get(
+                "gapped_leg_count"
+            ) != 3
+        ):
+            raise GapTuningError(
+                "legacy center-only/continuous air-gap evidence is "
+                "diagnostic-only; equal-three-leg symmetric FEA is required"
+            )
+        physical_lm_h = selected["full_physical_matrix_readback"][
+            "Lm_primary_referred_H"
+        ]
+        air_gap_contract = build_air_gap_contract(
+            gap_mm=gap,
+            equal_three_leg=1,
+            symmetric_fea_verified=True,
+            physical_lm_h=physical_lm_h,
+            target_lm_h=TARGET_LM_H,
+            tolerance_h=LM_ABS_TOLERANCE_H,
+            final_promotion_allowed=False,
+        )
         base = _read_json(root / campaign["base_params"]["path"])
         variants = _variant_params(base, gap)
         variant_records = {}
@@ -1686,6 +1801,10 @@ def finalize_or_refine(
                 ]["Lm_primary_referred_mH"],
                 "target_abs_error_H": selected["target_abs_error_H"],
                 "physical_gap_geometry_attested": True,
+                "equal_three_leg_air_gap_contract": air_gap_contract,
+                "core_equal_three_leg_air_gap": 1,
+                "equal_three_leg_air_gap_FEA_required": True,
+                "physical_Lm_2mH_symmetric_FEA_verified": True,
                 "symmetric_matrix_convergence_attested": True,
                 "native_L11_L22_M_k_Lm_readback_attested": True,
                 "observation_files": [
@@ -1697,6 +1816,7 @@ def finalize_or_refine(
                 "TIM_mutated": False,
                 "pre_gap_16_candidate_lane_modified": False,
                 "production_eligible": False,
+                "final_promotion_allowed": False,
                 "remaining_gates": [
                     "symmetric loss and thermal FEA",
                     "resonance recomputation with measured leakage/capacitance",

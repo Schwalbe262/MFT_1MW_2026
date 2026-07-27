@@ -17,6 +17,12 @@ def _observation(gap_mm, lm_h):
 
 
 class GapDecisionTests(unittest.TestCase):
+    def test_active_profile_forces_equal_three_leg_topology(self):
+        profile = tuner._profile()
+        self.assertEqual(
+            profile["param_overrides"]["core_equal_three_leg_air_gap"], 1
+        )
+
     def test_selects_tuned_observation_inside_explicit_tolerance(self):
         decision = tuner._next_gap_decision(
             [_observation(0.75, 0.00201)], refinement_count=0
@@ -68,11 +74,16 @@ class MatrixReadbackTests(unittest.TestCase):
             "loss_on": 0,
             "thermal_on": 0,
             "core_center_gap_mm": 0.75,
+            "core_equal_three_leg_air_gap": 1,
             "core_center_gap_geometry_attested": 1,
             "core_center_gap_readback_mm": 0.75,
             "core_center_gap_topology":
-                "center_leg_bottom_top_physical_air_interval",
+                "center_and_both_side_legs_bottom_top_physical_air_intervals",
+            "core_air_gap_gapped_leg_count": 3,
+            "core_equal_three_leg_air_gap_geometry_attested": 1,
+            "core_air_gap_identical_all_gapped_legs_attested": 1,
             "core_center_gap_symmetry_geometry_attested": 1,
+            "core_equal_three_leg_air_gap_symmetry_geometry_attested": 1,
             "core_center_gap_removed_volume_readback_mm3": 123.0,
             "core_center_gap_removed_volume_rel_error": 0.0,
             "Ltx": l11,
@@ -106,6 +117,51 @@ class MatrixReadbackTests(unittest.TestCase):
             observed["full_physical_matrix_readback"]["L11_uH"],
             2.0 * l11,
         )
+        self.assertFalse(observed["legacy_center_only_diagnostic"])
+        self.assertEqual(
+            observed["geometry_attestation"]["gapped_leg_count"], 3
+        )
+
+    def test_legacy_center_only_readback_is_diagnostic_only(self):
+        l11 = 1010.0
+        native_lm = 1000.0
+        coupling = math.sqrt(native_lm / l11)
+        l22 = 101000.0
+        result = {
+            "full_model": 0,
+            "round_corner": 0,
+            "matrix_on": 1,
+            "cap_on": 0,
+            "loss_on": 0,
+            "thermal_on": 0,
+            "core_center_gap_mm": 0.75,
+            "core_equal_three_leg_air_gap": 0,
+            "core_center_gap_geometry_attested": 1,
+            "core_center_gap_readback_mm": 0.75,
+            "core_center_gap_topology":
+                "center_leg_bottom_top_physical_air_interval",
+            "core_center_gap_symmetry_geometry_attested": 1,
+            "core_center_gap_removed_volume_readback_mm3": 123.0,
+            "core_center_gap_removed_volume_rel_error": 0.0,
+            "Ltx": l11,
+            "Lrx": l22,
+            "M": coupling * math.sqrt(l11 * l22),
+            "k": coupling,
+            "Lmt": native_lm,
+            "Llt": l11 - native_lm,
+            "matrix_percent_error": 0.5,
+            "matrix_min_converged": 1,
+            "conv_passes_matrix": 6,
+            "conv_consecutive_matrix": 1,
+            "conv_error_pct_matrix": 0.4,
+            "conv_delta_pct_matrix": 0.2,
+        }
+        observed = tuner._matrix_observation(
+            result, 0.75, expected_equal_three_leg=False
+        )
+        self.assertTrue(observed["contract_valid"])
+        self.assertTrue(observed["legacy_center_only_diagnostic"])
+        self.assertTrue(observed["equal_three_leg_air_gap_FEA_required"])
 
 
 if __name__ == "__main__":

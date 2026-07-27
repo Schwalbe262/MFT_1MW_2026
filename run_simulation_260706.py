@@ -119,6 +119,10 @@ from module.modeling_260706 import (
     create_winding_cooling_plates,
     create_coil_section,
 )
+from module.core_air_gap_contract import (
+    EQUAL_THREE_LEG_RESULT_TOPOLOGY,
+    LEGACY_CENTER_ONLY_RESULT_TOPOLOGY,
+)
 from module.core_material_contract import (
     LEG_STACKING_DIRECTION,
     PHYSICS_DATA_REVISION,
@@ -234,7 +238,8 @@ def _raw_aedt_material_props(materials, material_name):
 def _core_group_index(object_name):
     """Extract the depth-group index from legacy or segmented core names."""
     match = re.fullmatch(
-        r"core_(\d+)(?:_(?:leg_(?:left|right|center_bottom|center_top|center)"
+        r"core_(\d+)(?:_(?:leg_(?:(?:left|right|center)"
+        r"(?:_bottom|_top)?|center)"
         r"|yoke_(?:top|bottom)))?",
         str(object_name),
     )
@@ -250,11 +255,21 @@ _NATIVE_CORE_REGION_ORDER = (
     "yoke_bottom",
     "yoke_top",
 )
-_NATIVE_GAPPED_CORE_REGION_ORDER = (
+_NATIVE_LEGACY_GAPPED_CORE_REGION_ORDER = (
     "leg_left",
     "leg_center_bottom",
     "leg_center_top",
     "leg_right",
+    "yoke_bottom",
+    "yoke_top",
+)
+_NATIVE_EQUAL_THREE_LEG_GAPPED_CORE_REGION_ORDER = (
+    "leg_left_bottom",
+    "leg_left_top",
+    "leg_center_bottom",
+    "leg_center_top",
+    "leg_right_bottom",
+    "leg_right_top",
     "yoke_bottom",
     "yoke_top",
 )
@@ -287,11 +302,18 @@ def _native_core_report_plan(
             f"core_{group_index}_leg_center_bottom",
             f"core_{group_index}_leg_center_top",
         }
-        region_order = (
-            _NATIVE_GAPPED_CORE_REGION_ORDER
-            if set(by_name) & split_center_names
-            else _NATIVE_CORE_REGION_ORDER
-        )
+        split_side_names = {
+            f"core_{group_index}_leg_left_bottom",
+            f"core_{group_index}_leg_left_top",
+            f"core_{group_index}_leg_right_bottom",
+            f"core_{group_index}_leg_right_top",
+        }
+        if set(by_name) & split_side_names:
+            region_order = _NATIVE_EQUAL_THREE_LEG_GAPPED_CORE_REGION_ORDER
+        elif set(by_name) & split_center_names:
+            region_order = _NATIVE_LEGACY_GAPPED_CORE_REGION_ORDER
+        else:
+            region_order = _NATIVE_CORE_REGION_ORDER
         expected_names = tuple(
             f"core_{group_index}_{region}"
             for region in region_order
@@ -3247,6 +3269,9 @@ class Simulation():
         center_gap_mm = float(
             self.df_plus["core_center_gap_mm"].iloc[0]
         )
+        equal_three_leg_gap = int(
+            self.df_plus["core_equal_three_leg_air_gap"].iloc[0]
+        )
 
         core_objs, plate_objs, pad_objs = create_core(
             design=self.design1,
@@ -3263,11 +3288,20 @@ class Simulation():
             core_material_leg=leg_name,
             core_material_yoke=yoke_name,
             core_center_gap_mm=center_gap_mm,
+            core_equal_three_leg_air_gap=equal_three_leg_gap,
         )
         if native_stacking:
             if center_gap_mm > 0.0:
-                expected_regions = set(_NATIVE_GAPPED_CORE_REGION_ORDER)
-                expected_piece_count = 6 * n_group
+                if equal_three_leg_gap:
+                    expected_regions = set(
+                        _NATIVE_EQUAL_THREE_LEG_GAPPED_CORE_REGION_ORDER
+                    )
+                    expected_piece_count = 8 * n_group
+                else:
+                    expected_regions = set(
+                        _NATIVE_LEGACY_GAPPED_CORE_REGION_ORDER
+                    )
+                    expected_piece_count = 6 * n_group
             else:
                 expected_regions = set(_NATIVE_CORE_REGION_ORDER)
                 expected_piece_count = 5 * n_group
@@ -3374,7 +3408,7 @@ class Simulation():
             )
             if removed_rel_error > 1e-9:
                 raise RuntimeError(
-                    "center-gap removed-volume attestation failed: "
+                    "physical air-gap removed-volume attestation failed: "
                     f"actual={removed_mm3:.12g}mm3, "
                     f"expected={expected_removed_mm3:.12g}mm3"
                 )
@@ -3382,29 +3416,37 @@ class Simulation():
             gap_readbacks = []
             gap_center_offsets = []
             if center_gap_mm > 0.0:
+                gapped_legs = (
+                    ("left", "center", "right")
+                    if equal_three_leg_gap
+                    else ("center",)
+                )
                 for index in range(1, n_group + 1):
-                    bottom = objects_by_group[index]["leg_center_bottom"]
-                    top = objects_by_group[index]["leg_center_top"]
-                    bottom_bbox = list(bottom.bounding_box)
-                    top_bbox = list(top.bounding_box)
-                    if len(bottom_bbox) != 6 or len(top_bbox) != 6:
-                        raise RuntimeError(
-                            "center-gap bounding-box readback is unavailable "
-                            f"for core group {index}"
+                    for leg in gapped_legs:
+                        bottom = objects_by_group[index][
+                            f"leg_{leg}_bottom"
+                        ]
+                        top = objects_by_group[index][f"leg_{leg}_top"]
+                        bottom_bbox = list(bottom.bounding_box)
+                        top_bbox = list(top.bounding_box)
+                        if len(bottom_bbox) != 6 or len(top_bbox) != 6:
+                            raise RuntimeError(
+                                "air-gap bounding-box readback is unavailable "
+                                f"for core group {index}, leg={leg}"
+                            )
+                        bottom_z_max = float(bottom_bbox[5])
+                        top_z_min = float(top_bbox[2])
+                        if not all(math.isfinite(value) for value in (
+                            bottom_z_max, top_z_min
+                        )):
+                            raise RuntimeError(
+                                "air-gap bounding-box readback is non-finite "
+                                f"for core group {index}, leg={leg}"
+                            )
+                        gap_readbacks.append(top_z_min - bottom_z_max)
+                        gap_center_offsets.append(
+                            (top_z_min + bottom_z_max) / 2.0
                         )
-                    bottom_z_max = float(bottom_bbox[5])
-                    top_z_min = float(top_bbox[2])
-                    if not all(math.isfinite(value) for value in (
-                        bottom_z_max, top_z_min
-                    )):
-                        raise RuntimeError(
-                            "center-gap bounding-box readback is non-finite "
-                            f"for core group {index}"
-                        )
-                    gap_readbacks.append(top_z_min - bottom_z_max)
-                    gap_center_offsets.append(
-                        (top_z_min + bottom_z_max) / 2.0
-                    )
                 gap_readback_mm = sum(gap_readbacks) / len(gap_readbacks)
                 gap_spread_mm = max(gap_readbacks) - min(gap_readbacks)
                 gap_center_offset_mm = max(
@@ -3420,13 +3462,17 @@ class Simulation():
                     or gap_center_offset_mm > gap_tolerance_mm
                 ):
                     raise RuntimeError(
-                        "physical center-gap bounding-box attestation failed: "
+                        "physical air-gap bounding-box attestation failed: "
                         f"requested={center_gap_mm:.12g}mm, "
                         f"readback={gap_readback_mm:.12g}mm, "
                         f"spread={gap_spread_mm:.12g}mm, "
                         f"center_offset={gap_center_offset_mm:.12g}mm"
                     )
-                gap_topology = "center_leg_bottom_top_physical_air_interval"
+                gap_topology = (
+                    EQUAL_THREE_LEG_RESULT_TOPOLOGY
+                    if equal_three_leg_gap
+                    else LEGACY_CENTER_ONLY_RESULT_TOPOLOGY
+                )
             else:
                 gap_readback_mm = 0.0
                 gap_spread_mm = 0.0
@@ -3440,6 +3486,24 @@ class Simulation():
             self.df_plus["core_segmented_mass_rel_error"] = [mass_rel_error]
             self.df_plus["core_center_gap_requested_mm"] = [center_gap_mm]
             self.df_plus["core_center_gap_topology"] = [gap_topology]
+            self.df_plus["core_air_gap_gapped_leg_count"] = [
+                3 if center_gap_mm > 0.0 and equal_three_leg_gap else
+                1 if center_gap_mm > 0.0 else 0
+            ]
+            self.df_plus[
+                "core_equal_three_leg_air_gap_geometry_attested"
+            ] = [
+                int(
+                    center_gap_mm > 0.0
+                    and equal_three_leg_gap == 1
+                    and gap_topology == EQUAL_THREE_LEG_RESULT_TOPOLOGY
+                )
+            ]
+            self.df_plus[
+                "core_air_gap_identical_all_gapped_legs_attested"
+            ] = [int(center_gap_mm > 0.0 and gap_spread_mm <= max(
+                1e-6, abs(center_gap_mm) * 1e-9
+            ))]
             self.df_plus["core_center_gap_readback_mm"] = [gap_readback_mm]
             self.df_plus["core_center_gap_readback_rel_error"] = [
                 gap_readback_rel_error
@@ -3741,24 +3805,58 @@ class Simulation():
         center_gap_mm = float(
             self.df_plus["core_center_gap_mm"].iloc[0]
         )
+        equal_three_leg_gap = int(
+            self.df_plus["core_equal_three_leg_air_gap"].iloc[0]
+        )
         if center_gap_mm > 0.0:
-            retained_center = [
-                obj for obj in self.design1.core_objs
-                if "_leg_center" in obj.name
-            ]
-            unexpected_center = [
-                obj.name for obj in retained_center
-                if not obj.name.endswith("_leg_center_top")
-            ]
-            if not retained_center or unexpected_center:
+            if equal_three_leg_gap:
+                retained_gap_pieces = [
+                    obj for obj in self.design1.core_objs
+                    if obj.name.endswith((
+                        "_leg_left_top", "_leg_center_top",
+                        "_leg_left_bottom", "_leg_center_bottom",
+                        "_leg_right_top", "_leg_right_bottom",
+                    ))
+                ]
+                expected_names = {
+                    f"core_{index}_leg_{leg}_top"
+                    for index in range(
+                        1,
+                        int(self.df_plus["n_core_group"].iloc[0]) + 1,
+                    )
+                    for leg in ("left", "center")
+                }
+                actual_names = {
+                    obj.name for obj in retained_gap_pieces
+                }
+                if actual_names != expected_names:
+                    raise RuntimeError(
+                        "equal-three-leg air-gap symmetry retention mismatch: "
+                        f"actual={sorted(actual_names)!r}, "
+                        f"expected={sorted(expected_names)!r}"
+                    )
+            else:
+                retained_gap_pieces = [
+                    obj for obj in self.design1.core_objs
+                    if "_leg_center" in obj.name
+                ]
+                unexpected_center = [
+                    obj.name for obj in retained_gap_pieces
+                    if not obj.name.endswith("_leg_center_top")
+                ]
+                if not retained_gap_pieces or unexpected_center:
+                    raise RuntimeError(
+                        "center-gap symmetry retention mismatch: "
+                        f"retained={[obj.name for obj in retained_gap_pieces]!r}, "
+                        f"unexpected={unexpected_center!r}"
+                    )
+            if not retained_gap_pieces:
                 raise RuntimeError(
-                    "center-gap symmetry retention mismatch: "
-                    f"retained={[obj.name for obj in retained_center]!r}, "
-                    f"unexpected={unexpected_center!r}"
+                    "air-gap symmetry retained no physical gap pieces"
                 )
             expected_z_min = center_gap_mm / 2.0
             z_min_errors = []
-            for obj in retained_center:
+            for obj in retained_gap_pieces:
                 bbox = list(obj.bounding_box)
                 if len(bbox) != 6:
                     raise RuntimeError(
@@ -3778,14 +3876,25 @@ class Simulation():
                 )
             self.df_plus[
                 "core_center_gap_symmetry_retained_center_piece_count"
-            ] = [len(retained_center)]
+            ] = [
+                sum(
+                    obj.name.endswith("_leg_center_top")
+                    for obj in retained_gap_pieces
+                )
+            ]
+            self.df_plus[
+                "core_air_gap_symmetry_retained_gapped_piece_count"
+            ] = [len(retained_gap_pieces)]
             self.df_plus[
                 "core_center_gap_symmetry_half_gap_readback_mm"
             ] = [2.0 * min(
                 float(list(obj.bounding_box)[2])
-                for obj in retained_center
+                for obj in retained_gap_pieces
             )]
             self.df_plus["core_center_gap_symmetry_geometry_attested"] = [1]
+            self.df_plus[
+                "core_equal_three_leg_air_gap_symmetry_geometry_attested"
+            ] = [int(equal_three_leg_gap == 1)]
         self.design1.core_flux_sheets = [
             o for o in self.design1.core_flux_sheets if o.name in existing
         ]

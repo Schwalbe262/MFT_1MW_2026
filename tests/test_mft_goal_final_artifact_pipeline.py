@@ -15,6 +15,7 @@ from module.mft_goal_20260726_contract import (
     GOAL_TEMPERATURE_CONTRACT_SHA256,
 )
 from module.fixed_boundary_contract import FIXED_BOUNDARY_CONTRACT_SHA256
+from module.core_air_gap_contract import build_air_gap_contract
 from tools import mft_goal_final_artifact_pipeline as pipeline
 
 
@@ -39,6 +40,8 @@ def _params():
             "loss_sym_on": 1,
             "thermal_symmetry": "eighth",
             "keep_project": 1,
+            "core_center_gap_mm": 0.65,
+            "core_equal_three_leg_air_gap": 1,
         }
     )
     return params
@@ -107,6 +110,21 @@ def _authority(tmp_path: Path, *, params=None):
                 },
                 "actual_resonance_Hz": 15_100.0,
                 "actual_Lm_primary_referred_H": 0.00199,
+                "equal_three_leg_air_gap_contract": (
+                    build_air_gap_contract(
+                        gap_mm=params["core_center_gap_mm"],
+                        equal_three_leg=1,
+                        symmetric_fea_verified=True,
+                        physical_lm_h=0.00199,
+                        target_lm_h=pipeline.TARGET_LM_H,
+                        tolerance_h=(
+                            pipeline.TARGET_LM_ABS_TOLERANCE_H
+                        ),
+                        final_promotion_allowed=True,
+                    )
+                ),
+                "equal_three_leg_air_gap_FEA_required": True,
+                "physical_Lm_2mH_symmetric_FEA_verified": True,
                 "graded_capacitance_provenance": {
                     "schema_version": pipeline.GRADED_CAP_PROVENANCE_SCHEMA,
                     "provenance_authenticated": True,
@@ -121,6 +139,8 @@ def _authority(tmp_path: Path, *, params=None):
                     "legacy_two_net_result_used": False,
                     "candidate_physics_sha256": candidate_sha256,
                     "core_center_gap_mm": params["core_center_gap_mm"],
+                    "core_equal_three_leg_air_gap": 1,
+                    "equal_three_leg_air_gap_FEA_required": True,
                     "minimum_resonance_Hz": 15_100.0,
                     "tx": {
                         "task_id": 2001,
@@ -130,6 +150,7 @@ def _authority(tmp_path: Path, *, params=None):
                         ),
                         "candidate_physics_sha256": candidate_sha256,
                         "core_center_gap_mm": params["core_center_gap_mm"],
+                        "core_equal_three_leg_air_gap": 1,
                         "solver_revision": "b" * 40,
                         "library_revision": "c" * 40,
                         "result_sha256": "d" * 64,
@@ -148,6 +169,7 @@ def _authority(tmp_path: Path, *, params=None):
                         ),
                         "candidate_physics_sha256": candidate_sha256,
                         "core_center_gap_mm": params["core_center_gap_mm"],
+                        "core_equal_three_leg_air_gap": 1,
                         "solver_revision": "b" * 40,
                         "library_revision": "c" * 40,
                         "result_sha256": "e" * 64,
@@ -248,6 +270,20 @@ def test_winner_authority_rejects_legacy_two_net_capacitance(
     with pytest.raises(
         pipeline.FinalArtifactPipelineError,
         match="legacy_two_net_capacitance_used_for_final_resonance drifted",
+    ):
+        pipeline.validate_winner_authority(
+            pipeline.seal(body), authority_directory=tmp_path
+        )
+
+
+def test_winner_authority_rejects_legacy_center_only_air_gap(tmp_path):
+    authority = _authority(tmp_path)
+    body = copy.deepcopy(authority)
+    body.pop("payload_sha256")
+    body["params"]["core_equal_three_leg_air_gap"] = 0
+    with pytest.raises(
+        pipeline.FinalArtifactPipelineError,
+        match="equal-three-leg|core_equal_three_leg_air_gap",
     ):
         pipeline.validate_winner_authority(
             pipeline.seal(body), authority_directory=tmp_path

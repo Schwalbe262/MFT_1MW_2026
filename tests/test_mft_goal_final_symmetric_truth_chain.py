@@ -7,11 +7,20 @@ from regression_260707.verify import scheduler_client
 from tools import mft_goal_final_symmetric_truth_chain as final_chain
 from tools import mft_goal_lm2mh_gap_tuner as gap_tuner
 from tools import mft_goal_targeted_symmetric_fea_batch as targeted
+from module.core_air_gap_contract import build_air_gap_contract
 
 
 def _actual_cap_gate():
     geometry = "6" * 64
-    tuned = {"tuned_core_center_gap_mm": 0.65}
+    tuned = {
+        "tuned_core_center_gap_mm": 0.65,
+        "equal_three_leg_air_gap_contract": build_air_gap_contract(
+            gap_mm=0.65,
+            equal_three_leg=1,
+            symmetric_fea_verified=True,
+            physical_lm_h=0.002,
+        ),
+    }
     campaign = {
         "candidate": {"physical_geometry_sha256": geometry}
     }
@@ -81,6 +90,47 @@ def test_actual_cap_gate_rejects_legacy_cap_only():
             campaign=campaign,
             cap_plan=cap_plan,
             cap_collection=collection,
+        )
+
+
+def test_load_upstream_rejects_legacy_center_only_tuned_manifest(
+    tmp_path, monkeypatch
+):
+    legacy = gap_tuner._seal(
+        {
+            "schema_version": gap_tuner.FINAL_SCHEMA,
+            "campaign_payload_sha256": "a" * 64,
+            "tuned_core_center_gap_mm": 0.65,
+            "tuned_Lm_primary_referred_H": 0.002,
+            "physical_gap_geometry_attested": True,
+            "symmetric_matrix_convergence_attested": True,
+            "native_L11_L22_M_k_Lm_readback_attested": True,
+        }
+    )
+    manifest = tmp_path / "tuned_gap_manifest.json"
+    manifest.write_text(json.dumps(legacy), encoding="utf-8")
+    campaign = {
+        "payload_sha256": "a" * 64,
+        "candidate": {
+            "authenticated_temperatures_C": {
+                "primary_winding_max_C": 90.0,
+                "secondary_winding_max_C": 110.0,
+                "core_max_C": 110.0,
+            }
+        },
+    }
+    monkeypatch.setattr(
+        gap_tuner,
+        "_load_campaign",
+        lambda _path: (campaign, tmp_path),
+    )
+    with pytest.raises(
+        final_chain.FinalTruthError, match="legacy center-only"
+    ):
+        final_chain._load_upstream(
+            gap_manifest_path=manifest,
+            cap_plan_path=tmp_path / "unused-cap-plan.json",
+            cap_collection_path=tmp_path / "unused-cap-collection.json",
         )
 
 
@@ -191,6 +241,9 @@ def test_same_candidate_tuned_and_actual_graded_builds_plan(
     assert plan["single_final_authority_task"] is True
     assert plan["rounded_FEA_used"] is False
     assert params["core_center_gap_mm"] == pytest.approx(0.65)
+    assert params["core_equal_three_leg_air_gap"] == 1
+    assert plan["equal_three_leg_air_gap_FEA_required"] is True
+    assert plan["final_promotion_allowed"] is False
     assert profile["param_overrides"][
         "cap_turn_graded_active_winding"
     ] == "Rx"
@@ -220,11 +273,16 @@ def _completed_result():
         "wcp_pad_t": 2.0,
         "k_ins": 0.2,
         "core_center_gap_mm": 0.65,
+        "core_equal_three_leg_air_gap": 1,
         "core_center_gap_geometry_attested": 1,
         "core_center_gap_symmetry_geometry_attested": 1,
         "core_center_gap_topology": (
-            "center_leg_bottom_top_physical_air_interval"
+            "center_and_both_side_legs_bottom_top_physical_air_intervals"
         ),
+        "core_air_gap_gapped_leg_count": 3,
+        "core_equal_three_leg_air_gap_geometry_attested": 1,
+        "core_equal_three_leg_air_gap_symmetry_geometry_attested": 1,
+        "core_air_gap_identical_all_gapped_legs_attested": 1,
         "core_center_gap_readback_mm": 0.65,
         "Ltx": l11_uH,
         "Lrx": l22_uH,

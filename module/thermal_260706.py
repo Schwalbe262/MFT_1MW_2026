@@ -6858,6 +6858,9 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
     plate_on = int(df["core_plate_on"].iloc[0]) != 0
     pad_on = float(df["core_plate_pad_t"].iloc[0]) > 0
     center_gap_mm = float(df["core_center_gap_mm"].iloc[0])
+    equal_three_leg_gap = int(
+        df["core_equal_three_leg_air_gap"].iloc[0]
+    )
     core_contract = _core_thermal_conductivity_contract(df)
     if core_contract["anisotropic"] or center_gap_mm > 0.0:
         leg_material = (
@@ -6880,6 +6883,7 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
             core_material_leg=leg_material,
             core_material_yoke=yoke_material,
             core_center_gap_mm=center_gap_mm,
+            core_equal_three_leg_air_gap=equal_three_leg_gap,
         )
     else:
         core_objs, plate_objs, pad_objs = create_core(
@@ -6889,23 +6893,34 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
             pad_material="thermal_pad", plate_on=plate_on, pad_on=pad_on,
             plate_color=[144, 190, 144], pad_color=[200, 160, 200],
             core_center_gap_mm=center_gap_mm,
+            core_equal_three_leg_air_gap=equal_three_leg_gap,
         )
     if center_gap_mm > 0.0:
-        expected_center_names = {
-            f"core_{index}_{suffix}"
+        gapped_legs = (
+            ("left", "center", "right")
+            if equal_three_leg_gap else ("center",)
+        )
+        expected_gap_names = {
+            f"core_{index}_leg_{leg}_{half}"
             for index in range(1, n_group + 1)
-            for suffix in ("leg_center_bottom", "leg_center_top")
+            for leg in gapped_legs
+            for half in ("bottom", "top")
         }
-        actual_center_names = {
-            obj.name for obj in core_objs if "_leg_center" in obj.name
+        actual_gap_names = {
+            obj.name
+            for obj in core_objs
+            if any(f"_leg_{leg}_" in obj.name for leg in gapped_legs)
         }
-        if actual_center_names != expected_center_names:
+        if actual_gap_names != expected_gap_names:
             raise RuntimeError(
-                "thermal center-gap core topology mismatch: "
-                f"actual={sorted(actual_center_names)!r}, "
-                f"expected={sorted(expected_center_names)!r}"
+                "thermal physical air-gap core topology mismatch: "
+                f"actual={sorted(actual_gap_names)!r}, "
+                f"expected={sorted(expected_gap_names)!r}"
             )
         sim.df_plus["core_center_gap_thermal_geometry_attested"] = [1]
+        sim.df_plus[
+            "core_equal_three_leg_air_gap_thermal_geometry_attested"
+        ] = [int(equal_three_leg_gap == 1)]
     objs["core"] = core_objs
     objs["core_plates"] = plate_objs
     objs["core_pads"] = pad_objs

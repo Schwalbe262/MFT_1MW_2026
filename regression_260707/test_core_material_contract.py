@@ -526,6 +526,37 @@ class CoreGeometrySegmentationTests(unittest.TestCase):
             self.assertEqual(top.sizes[2], "(h1-core_center_gap_mm)/2")
             self.assertNotIn(f"core_{group}_leg_center", pieces)
 
+    def test_equal_three_leg_gap_splits_every_leg_with_same_expression(self):
+        modeler = _GeometryModeler()
+        design = SimpleNamespace(modeler=modeler)
+        cores, _, _ = create_core_geometry(
+            design,
+            n_group=2,
+            plate_on=False,
+            pad_on=False,
+            segmented_lamination=True,
+            core_material_leg="leg_v1",
+            core_material_yoke="yoke_v3",
+            core_center_gap_mm=1.25,
+            core_equal_three_leg_air_gap=1,
+        )
+
+        self.assertEqual(len(cores), 16)
+        pieces = {obj.name: obj for obj in cores}
+        for group in (1, 2):
+            for leg in ("left", "center", "right"):
+                bottom = pieces[f"core_{group}_leg_{leg}_bottom"]
+                top = pieces[f"core_{group}_leg_{leg}_top"]
+                self.assertEqual(bottom.origin[2], "-h1/2")
+                self.assertEqual(
+                    bottom.sizes[2], "(h1-core_center_gap_mm)/2"
+                )
+                self.assertEqual(top.origin[2], "core_center_gap_mm/2")
+                self.assertEqual(
+                    top.sizes[2], "(h1-core_center_gap_mm)/2"
+                )
+                self.assertNotIn(f"core_{group}_leg_{leg}", pieces)
+
     def test_zero_center_gap_preserves_exact_legacy_piece_contract(self):
         modeler = _GeometryModeler()
         design = SimpleNamespace(modeler=modeler)
@@ -635,6 +666,35 @@ class NativeCoreReportPlanTests(unittest.TestCase):
         self.assertEqual(
             set(symmetry_plan["object_names"]),
             {piece.name for piece in retained},
+        )
+
+        equal_full = [
+            SimpleNamespace(name=f"core_1_{region}")
+            for region in (
+                "leg_left_bottom", "leg_left_top",
+                "leg_center_bottom", "leg_center_top",
+                "leg_right_bottom", "leg_right_top",
+                "yoke_bottom", "yoke_top",
+            )
+        ]
+        equal_full_plan = _native_core_report_plan(
+            {1: equal_full},
+            lambda _name: 2,
+            require_complete_groups=True,
+        )
+        self.assertEqual(len(equal_full_plan["object_names"]), 8)
+        equal_retained = [
+            piece for piece in equal_full
+            if piece.name.endswith(
+                ("leg_left_top", "leg_center_top", "yoke_top")
+            )
+        ]
+        equal_symmetry_plan = _native_core_report_plan(
+            {1: equal_retained}, lambda _name: 2
+        )
+        self.assertEqual(
+            set(equal_symmetry_plan["object_names"]),
+            {piece.name for piece in equal_retained},
         )
 
     def test_native_batch_restoration_equals_legacy_group_math(self):

@@ -364,6 +364,7 @@ def _profile() -> dict[str, Any]:
             "cap_percent_error": 1.0,
             "cap_max_passes": 10,
             "keep_project": 0,
+            "core_equal_three_leg_air_gap": 1,
         },
         "mem_mb": MEMORY_MB,
         "cpus": CPUS,
@@ -407,8 +408,16 @@ def prepare(
     ).resolve(strict=True)
     source = _read(source_params_path)
     gap_mm = float(source["core_center_gap_mm"])
-    if not math.isfinite(gap_mm) or gap_mm <= 0.0:
-        raise TurnGradedBatchError("positive physical center gap is required")
+    if (
+        not math.isfinite(gap_mm)
+        or gap_mm <= 0.0
+        or int(source.get("core_equal_three_leg_air_gap", 0)) != 1
+        or int(source_lane.get("core_equal_three_leg_air_gap", 0)) != 1
+    ):
+        raise TurnGradedBatchError(
+            "positive equal-three-leg physical air gap is required; "
+            "legacy center-only lanes are diagnostic-only"
+        )
     base = create_input_parameter(source).iloc[0].to_dict()
     profile = _profile()
     destination = output.resolve()
@@ -491,6 +500,9 @@ def prepare(
                 "params": _record(source_params_path),
                 "params_payload_sha256": _sha(source),
                 "core_center_gap_mm": gap_mm,
+                "core_equal_three_leg_air_gap": 1,
+                "air_gap_topology": "equal_center_and_both_side_legs",
+                "equal_three_leg_air_gap_FEA_required": True,
                 "physical_geometry_sha256": campaign["candidate"][
                     "physical_geometry_sha256"
                 ],
@@ -508,6 +520,8 @@ def prepare(
             "symmetric_nonrounded": True,
             "full_model_series_interconnect_attested": False,
             "final_design_pass_allowed": False,
+            "equal_three_leg_air_gap_FEA_required": True,
+            "final_promotion_allowed": False,
         }
     )
     return _write(destination / "batch_plan.json", plan)
@@ -544,6 +558,8 @@ def _load_plan(path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
         or plan.get("parallel_execution_requested") is not True
         or plan.get("symmetric_nonrounded") is not True
         or plan.get("final_design_pass_allowed") is not False
+        or plan.get("equal_three_leg_air_gap_FEA_required") is not True
+        or plan.get("final_promotion_allowed") is not False
         or _record(profile_path, relative_to=root) != plan["profile"]
         or _sha(profile) != plan["profile_sha256"]
         or profile != _profile()
@@ -808,6 +824,8 @@ def collect(
                     and result.get("cap_turn_graded_active_winding") == active
                     and float(result.get("core_center_gap_mm"))
                     == float(plan["source"]["core_center_gap_mm"])
+                    and int(result.get("core_equal_three_leg_air_gap"))
+                    == 1
                     and float(capacitance) > 0.0
                     and float(resonance) > 0.0
                     and row["even_potential_symmetry_assumed"] == 1

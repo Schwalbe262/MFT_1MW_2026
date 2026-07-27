@@ -9,7 +9,8 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
                 plate_material="aluminum", pad_material="thermal_pad",
                 plate_on=True, pad_on=True, plate_color=None, pad_color=None,
                 segmented_lamination=False, core_material_leg=None,
-                core_material_yoke=None, core_center_gap_mm=0.0):
+                core_material_yoke=None, core_center_gap_mm=0.0,
+                core_equal_three_leg_air_gap=False):
     """
     설계도면260706 반영 코어 생성.
 
@@ -39,6 +40,7 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
     plate_objs = []
     pad_objs = []
     center_gap_mm = float(core_center_gap_mm)
+    equal_three_leg_gap = int(core_equal_three_leg_air_gap)
     if not math.isfinite(center_gap_mm) or center_gap_mm < 0.0:
         raise ValueError(
             "core_center_gap_mm must be finite and >= 0, got "
@@ -47,6 +49,14 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
     if center_gap_mm > 0.0 and not segmented_lamination:
         raise ValueError(
             "a positive core_center_gap_mm requires segmented_lamination"
+        )
+    if (
+        equal_three_leg_gap not in (0, 1)
+        or float(core_equal_three_leg_air_gap)
+        != float(equal_three_leg_gap)
+    ):
+        raise ValueError(
+            "core_equal_three_leg_air_gap must be exactly 0 or 1"
         )
 
     for i in range(n_group):
@@ -59,11 +69,9 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
             leg_material = core_material_leg or core_material
             yoke_material = core_material_yoke or core_material
             if center_gap_mm > 0.0:
-                # A real, centred magnetic air gap: the center leg is two
-                # disjoint solids and the interval
-                # [-core_center_gap_mm/2, +core_center_gap_mm/2] is air.
-                # Keep the expression tied to the AEDT design variable so a
-                # saved fixed-run model remains directly tunable.
+                # Keep every gap expression tied to the same AEDT design
+                # variable.  The explicit new topology splits all three legs
+                # at z=0; flag 0 retains the historical center-only artifact.
                 center_pieces = (
                     (
                         "leg_center_bottom", "-l1", "-h1/2", "2*l1",
@@ -74,6 +82,44 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
                         "2*l1", "(h1-core_center_gap_mm)/2", leg_material,
                     ),
                 )
+                if equal_three_leg_gap:
+                    left_pieces = (
+                        (
+                            "leg_left_bottom", "-(2*l1+l2)", "-h1/2",
+                            "l1", "(h1-core_center_gap_mm)/2",
+                            leg_material,
+                        ),
+                        (
+                            "leg_left_top", "-(2*l1+l2)",
+                            "core_center_gap_mm/2", "l1",
+                            "(h1-core_center_gap_mm)/2", leg_material,
+                        ),
+                    )
+                    right_pieces = (
+                        (
+                            "leg_right_bottom", "(l1+l2)", "-h1/2",
+                            "l1", "(h1-core_center_gap_mm)/2",
+                            leg_material,
+                        ),
+                        (
+                            "leg_right_top", "(l1+l2)",
+                            "core_center_gap_mm/2", "l1",
+                            "(h1-core_center_gap_mm)/2", leg_material,
+                        ),
+                    )
+                else:
+                    left_pieces = (
+                        (
+                            "leg_left", "-(2*l1+l2)", "-h1/2",
+                            "l1", "h1", leg_material,
+                        ),
+                    )
+                    right_pieces = (
+                        (
+                            "leg_right", "(l1+l2)", "-h1/2",
+                            "l1", "h1", leg_material,
+                        ),
+                    )
             else:
                 # Preserve the exact legacy object topology and expressions
                 # when the fixed-run-only gap control is left at its default.
@@ -83,10 +129,22 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
                         leg_material,
                     ),
                 )
+                left_pieces = (
+                    (
+                        "leg_left", "-(2*l1+l2)", "-h1/2", "l1",
+                        "h1", leg_material,
+                    ),
+                )
+                right_pieces = (
+                    (
+                        "leg_right", "(l1+l2)", "-h1/2", "l1",
+                        "h1", leg_material,
+                    ),
+                )
             pieces = (
-                ("leg_left", "-(2*l1+l2)", "-h1/2", "l1", "h1", leg_material),
+                *left_pieces,
                 *center_pieces,
-                ("leg_right", "(l1+l2)", "-h1/2", "l1", "h1", leg_material),
+                *right_pieces,
                 ("yoke_bottom", "-(2*l1+l2)", "-(h1/2+l1)",
                  "4*l1+2*l2", "l1", yoke_material),
                 ("yoke_top", "-(2*l1+l2)", "h1/2",

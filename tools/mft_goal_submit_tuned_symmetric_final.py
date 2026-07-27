@@ -28,6 +28,7 @@ from module.input_parameter_260706 import (  # noqa: E402
 )
 from regression_260707.verify import scheduler_client  # noqa: E402
 from tools import mft_goal_lm2mh_gap_tuner as tuner  # noqa: E402
+from module.core_air_gap_contract import validate_air_gap_contract  # noqa: E402
 
 
 PLAN_SCHEMA = "mft-goal-tuned-symmetric-final-plan-v1"
@@ -84,6 +85,16 @@ def _load_inputs(
     final = tuner._validate_seal(
         tuner._read_json(final_path), tuner.FINAL_SCHEMA
     )
+    try:
+        validate_air_gap_contract(
+            final.get("equal_three_leg_air_gap_contract"),
+            require_equal_three_leg=True,
+            require_verified=True,
+        )
+    except ValueError as exc:
+        raise tuner.GapTuningError(
+            "legacy center-only tuned artifacts are diagnostic-only"
+        ) from exc
     if (
         campaign.get("campaign_id") != EXPECTED_CAMPAIGN_ID
         or campaign.get("candidate", {}).get("physical_geometry_sha256")
@@ -98,6 +109,9 @@ def _load_inputs(
         or final.get("physical_gap_geometry_attested") is not True
         or final.get("symmetric_matrix_convergence_attested") is not True
         or final.get("native_L11_L22_M_k_Lm_readback_attested") is not True
+        or final.get("core_equal_three_leg_air_gap") != 1
+        or final.get("equal_three_leg_air_gap_FEA_required") is not True
+        or final.get("physical_Lm_2mH_symmetric_FEA_verified") is not True
     ):
         raise tuner.GapTuningError("tuned 2b213 authority drifted")
     gap = _finite(final.get("tuned_core_center_gap_mm"), "tuned gap")
@@ -119,6 +133,7 @@ def _load_inputs(
     params = tuner._read_json(params_path)
     required = {
         "core_center_gap_mm": gap,
+        "core_equal_three_leg_air_gap": 1,
         "full_model": 0,
         "round_corner": 0,
         "matrix_on": 1,
@@ -230,6 +245,12 @@ def prepare(*, campaign_root: Path, solver_revision: str) -> Path:
             "tuned_matrix_readback": copy.deepcopy(
                 final["selected_observation"]["full_physical_matrix_readback"]
             ),
+            "equal_three_leg_air_gap_contract": copy.deepcopy(
+                final["equal_three_leg_air_gap_contract"]
+            ),
+            "equal_three_leg_air_gap_FEA_required": True,
+            "physical_Lm_2mH_symmetric_FEA_verified": True,
+            "final_promotion_allowed": False,
             "params": copy.deepcopy(
                 final["downstream_params"]["symmetric_loss_thermal"]
             ),

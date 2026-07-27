@@ -29,6 +29,11 @@ from regression_260707.verify import scheduler_client  # noqa: E402
 from tools import mft_goal_lm2mh_gap_tuner as gap_tuner  # noqa: E402
 from tools import mft_goal_targeted_symmetric_fea_batch as targeted  # noqa: E402
 from tools import mft_goal_turn_graded_cap_batch as graded_cap  # noqa: E402
+from module.core_air_gap_contract import (  # noqa: E402
+    EQUAL_THREE_LEG_RESULT_TOPOLOGY,
+    build_air_gap_contract,
+    validate_air_gap_contract,
+)
 
 
 PLAN_SCHEMA = "mft-goal-final-symmetric-truth-chain-plan-v1"
@@ -192,6 +197,16 @@ def _load_upstream(
     tuned_lm = _finite(
         tuned.get("tuned_Lm_primary_referred_H"), "tuned Lm"
     )
+    try:
+        air_gap_contract = validate_air_gap_contract(
+            tuned.get("equal_three_leg_air_gap_contract"),
+            require_equal_three_leg=True,
+            require_verified=True,
+        )
+    except ValueError as exc:
+        raise FinalTruthError(
+            "legacy center-only air-gap evidence cannot enter final truth"
+        ) from exc
     if (
         observed_root != gap_root
         or tuned.get("campaign_payload_sha256")
@@ -200,6 +215,10 @@ def _load_upstream(
         or tuned.get("physical_gap_geometry_attested") is not True
         or tuned.get("symmetric_matrix_convergence_attested") is not True
         or tuned.get("native_L11_L22_M_k_Lm_readback_attested") is not True
+        or tuned.get("core_equal_three_leg_air_gap") != 1
+        or tuned.get("equal_three_leg_air_gap_FEA_required") is not True
+        or tuned.get("physical_Lm_2mH_symmetric_FEA_verified") is not True
+        or air_gap_contract["physical_gap_mm"] != gap
         or abs(tuned_lm - gap_tuner.TARGET_LM_H)
         > gap_tuner.LM_ABS_TOLERANCE_H
         or candidate.get("source_kind")
@@ -332,6 +351,7 @@ def prepare(
     params.update(profile["param_overrides"])
     gap = _finite(tuned["tuned_core_center_gap_mm"], "tuned gap")
     params["core_center_gap_mm"] = gap
+    params["core_equal_three_leg_air_gap"] = 1
     if (
         _finite(params.get("fan_velocity"), "fan velocity") != 1.5
         or params.get("fan_config") != "dual"
@@ -340,6 +360,7 @@ def prepare(
         or _finite(params.get("k_ins"), "TIM conductivity") != 0.2
         or int(params.get("full_model")) != 0
         or int(params.get("round_corner")) != 0
+        or int(params.get("core_equal_three_leg_air_gap")) != 1
         or params.get("thermal_symmetry") != "eighth"
         or params.get("cap_turn_graded_active_winding") != "Rx"
         or _finite(params.get("cw1"), "primary conductor thickness") != 5.0
@@ -411,6 +432,13 @@ def prepare(
             "tuned_Lm_primary_referred_H": tuned[
                 "tuned_Lm_primary_referred_H"
             ],
+            "equal_three_leg_air_gap_contract": copy.deepcopy(
+                tuned["equal_three_leg_air_gap_contract"]
+            ),
+            "core_equal_three_leg_air_gap": 1,
+            "equal_three_leg_air_gap_FEA_required": True,
+            "physical_Lm_2mH_symmetric_FEA_verified": True,
+            "final_promotion_allowed": False,
             "upstream_actual_connection_results": copy.deepcopy(actual),
             "actual_graded_variant_in_chain": copy.deepcopy(rx_variant),
             "profile": gap_tuner._file_record(  # noqa: SLF001
@@ -476,6 +504,11 @@ def _load_plan(
         or plan.get("symmetric_model") is not True
         or plan.get("single_final_authority_task") is not True
         or plan.get("final_design_pass") is not False
+        or plan.get("core_equal_three_leg_air_gap") != 1
+        or plan.get("equal_three_leg_air_gap_FEA_required") is not True
+        or plan.get("physical_Lm_2mH_symmetric_FEA_verified") is not True
+        or plan.get("final_promotion_allowed") is not False
+        or int(params.get("core_equal_three_leg_air_gap", 0)) != 1
         or not HEX40.fullmatch(str(plan.get("solver_revision") or ""))
         or not HEX40.fullmatch(str(plan.get("library_revision") or ""))
         or profile.get("schema_version") != PROFILE_SCHEMA
@@ -699,6 +732,7 @@ def collect(
             ("thermal_symmetry", "eighth"),
             ("cap_turn_graded_active_winding", "Rx"),
             ("fan_config", "dual"),
+            ("core_equal_three_leg_air_gap", 1),
         ):
             require(result.get(name) == expected, f"identity_mismatch:{name}")
         for name, expected in (
@@ -744,8 +778,46 @@ def collect(
         )
         require(
             result.get("core_center_gap_topology")
-            == "center_leg_bottom_top_physical_air_interval",
+            == EQUAL_THREE_LEG_RESULT_TOPOLOGY,
             "physical_gap_topology_mismatch",
+        )
+        require(
+            int(_finite(
+                result.get("core_air_gap_gapped_leg_count"),
+                "physical gap gapped-leg count",
+            ))
+            == 3,
+            "equal_three_leg_gapped_leg_count_mismatch",
+        )
+        require(
+            int(_finite(
+                result.get(
+                    "core_equal_three_leg_air_gap_geometry_attested"
+                ),
+                "equal-three-leg geometry attestation",
+            ))
+            == 1,
+            "equal_three_leg_geometry_not_attested",
+        )
+        require(
+            int(_finite(
+                result.get(
+                    "core_equal_three_leg_air_gap_symmetry_geometry_attested"
+                ),
+                "equal-three-leg symmetry attestation",
+            ))
+            == 1,
+            "equal_three_leg_symmetry_not_attested",
+        )
+        require(
+            int(_finite(
+                result.get(
+                    "core_air_gap_identical_all_gapped_legs_attested"
+                ),
+                "identical all-leg gap attestation",
+            ))
+            == 1,
+            "all_leg_gap_equality_not_attested",
         )
         require(
             math.isclose(
@@ -880,6 +952,30 @@ def collect(
             "size_envelope_failed",
         )
         final_pass = not reasons and status == "completed"
+        physical_lm_gap_verified = not any(
+            reason in reasons
+            for reason in (
+                "physical_gap_input_mismatch",
+                "physical_gap_geometry_not_attested",
+                "physical_gap_symmetry_not_attested",
+                "physical_gap_topology_mismatch",
+                "physical_gap_readback_mismatch",
+                "equal_three_leg_gapped_leg_count_mismatch",
+                "equal_three_leg_geometry_not_attested",
+                "equal_three_leg_symmetry_not_attested",
+                "all_leg_gap_equality_not_attested",
+                "physical_Lm_not_within_2mH_tolerance",
+            )
+        )
+        final_air_gap_contract = build_air_gap_contract(
+            gap_mm=gap,
+            equal_three_leg=1,
+            symmetric_fea_verified=physical_lm_gap_verified,
+            physical_lm_h=physical_lm_h,
+            target_lm_h=gap_tuner.TARGET_LM_H,
+            tolerance_h=gap_tuner.LM_ABS_TOLERANCE_H,
+            final_promotion_allowed=final_pass,
+        )
         row.update(
             {
                 "result_sha256": gap_tuner._sha(result),  # noqa: SLF001
@@ -891,6 +987,14 @@ def collect(
                     and "physical_gap_topology_mismatch" not in reasons
                     and "physical_gap_readback_mismatch" not in reasons
                 ),
+                "equal_three_leg_air_gap_contract": final_air_gap_contract,
+                "equal_three_leg_air_gap_FEA_required": True,
+                "physical_Lm_2mH_symmetric_FEA_verified": (
+                    final_air_gap_contract[
+                        "physical_Lm_2mH_symmetric_FEA_verified"
+                    ]
+                ),
+                "final_promotion_allowed": final_pass,
                 "Lm_primary_referred_H": physical_lm_h,
                 "Lm_primary_referred_mH": physical_lm_h * 1e3,
                 "actual_graded_Rx_C_F": rx_cap,
@@ -930,6 +1034,11 @@ def collect(
             "ungapped_acquisition_used_as_final_authority": False,
             "rounded_FEA_used": False,
             "production_eligible": row["final_design_pass"],
+            "equal_three_leg_air_gap_FEA_required": True,
+            "physical_Lm_2mH_symmetric_FEA_verified": row.get(
+                "physical_Lm_2mH_symmetric_FEA_verified", False
+            ),
+            "final_promotion_allowed": row["final_design_pass"],
         }
     )
     return gap_tuner._atomic_json(  # noqa: SLF001
