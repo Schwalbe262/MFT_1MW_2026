@@ -2067,6 +2067,316 @@ def test_merge_upserts_one_compact_design_card_before_parallel() -> None:
     updater.validate_status_sync(merged_again)
 
 
+def _write_rx_main_l5_canary_evidence(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    fixed_cooling = copy.deepcopy(
+        updater.RX_MAIN_L5_NATIVE_CANARY_FIXED_COOLING
+    )
+    params = {
+        **fixed_cooling,
+        "thermal_max_iterations": 1,
+    }
+    payload = {
+        "name": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_NAME,
+        "dedupe_key": "sealed-rx-main-l5-canary",
+        "command": "run exact B7/v8 native earliest canary",
+        "cpus": updater.RX_MAIN_L5_NATIVE_CANARY_CPUS,
+        "memory_mb": updater.RX_MAIN_L5_NATIVE_CANARY_MEMORY_MB,
+        "timeout_seconds": updater.RX_MAIN_L5_NATIVE_CANARY_TIMEOUT_SECONDS,
+        "max_workers_per_node": 1,
+    }
+    params_path = root / "params.json"
+    payload_path = root / "dry_run_payload.json"
+    params_path.write_text(
+        json.dumps(params, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    payload_path.write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    params_file_sha256 = updater._file_sha256(params_path)
+    payload_file_sha256 = updater._file_sha256(payload_path)
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_PARAMS_SHA256",
+        params_file_sha256,
+    )
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_PAYLOAD_SHA256",
+        payload_file_sha256,
+    )
+    promotion_gate = {
+        "design_scientific_promotion_forbidden_for_one_iteration_canary": True,
+        "interface_fix_canary_requires": {
+            "contract": "thermal-rx-block-interface-coverage-v1",
+            "mesh_plan_contract": "thermal-mesh-plan-v8",
+            "mesh_policy": (
+                "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+            ),
+            "missing_fluid_coupling": [],
+            "missing_rx_main_solids": [],
+            "no_unpaired_log_marker": True,
+            "rx_main_adjacency_passed": True,
+            "unpaired_interfaces": [],
+        },
+    }
+    command_sha256 = updater.hashlib.sha256(
+        payload["command"].encode("utf-8")
+    ).hexdigest()
+    identity = {
+        "task_name": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_NAME,
+        "geometry_sha256": updater.RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256,
+        "solver_revision": updater.RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION,
+        "library_revision": updater.RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION,
+    }
+    pre_submit = {
+        "schema": (
+            "mft-goal-rx-main-l5-native-earliest-canary-pre-submit-v1"
+        ),
+        **identity,
+        "dedupe_key": payload["dedupe_key"],
+        "scheduler_post_calls": 0,
+        "fixed_cooling": fixed_cooling,
+        "payload_file_sha256": payload_file_sha256,
+        "params_file_sha256": params_file_sha256,
+        "payload_canonical_sha256": updater.canonical_sha256(payload),
+        "params_canonical_sha256": updater.canonical_sha256(params),
+        "command_sha256": command_sha256,
+        "promotion_gate": promotion_gate,
+    }
+    pre_submit_path = root / "pre_submit_receipt.json"
+    pre_submit_path.write_text(
+        json.dumps(pre_submit, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    pre_submit_file_sha256 = updater._file_sha256(pre_submit_path)
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_PRE_SUBMIT_SHA256",
+        pre_submit_file_sha256,
+    )
+    receipt = {
+        "schema": (
+            "mft-goal-rx-main-l5-native-earliest-canary-submission-v1"
+        ),
+        **identity,
+        "task_id": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_ID,
+        "dedupe_key": payload["dedupe_key"],
+        "submission_source": "post_created",
+        "scheduler_post_calls": 1,
+        "scheduler_mutation_performed": True,
+        "existing_tasks_or_gui_mutated": False,
+        "thermal_max_iterations": 1,
+        "fixed_cooling": fixed_cooling,
+        "interface_contract": "thermal-rx-block-interface-coverage-v1",
+        "mesh_plan_contract": "thermal-mesh-plan-v8",
+        "mesh_policy": (
+            "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+        ),
+        "pre_submit_receipt_file_sha256": pre_submit_file_sha256,
+        "payload_canonical_sha256": updater.canonical_sha256(payload),
+        "params_canonical_sha256": updater.canonical_sha256(params),
+        "command_sha256": command_sha256,
+        "promotion_gate": promotion_gate,
+        "task_readback_sha256": "c" * 64,
+        "status": "queued",
+    }
+    receipt_path = root / "submission_receipt.json"
+    receipt_path.write_text(
+        json.dumps(receipt, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_RECEIPT_SHA256",
+        updater._file_sha256(receipt_path),
+    )
+
+
+def test_rx_main_l5_native_canary_card_uses_receipt_without_live_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_rx_main_l5_canary_evidence(tmp_path, monkeypatch)
+
+    card = updater._rx_main_l5_native_canary_card(
+        OBSERVED,
+        root=tmp_path,
+    )
+
+    assert card["id"] == updater.RX_MAIN_L5_NATIVE_CANARY_CARD_ID
+    assert len(card["title"]) <= 160
+    assert card["state"] == "in_progress"
+    assert len(card["evidence"]) <= 12
+    assert "SUBMITTED 1 POST" in card["title"]
+    assert "LIVE STATE UNCLAIMED" in card["title"]
+    assert "QUEUED" not in card["title"]
+    assert any(
+        "8CPU/65536MiB/43200s (12h)" in item
+        and "thermal_max_iterations=1" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        updater.RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256 in item
+        and updater.RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION in item
+        for item in card["evidence"]
+    )
+    assert any(
+        updater.RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION in item
+        and "fixed cooling unchanged=true" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "missing_rx_main_solids=[]" in item
+        and "missing_fluid_coupling=[]" in item
+        and "rx_main_adjacency_passed=true" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "unpaired_interfaces=[]" in item
+        and "no_unpaired_log_marker=true" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "interface pass claimed=false" in item
+        and "design scientific promotion=false" in item
+        and "production promotion=false" in item
+        for item in card["evidence"]
+    )
+
+
+def test_rx_main_l5_native_canary_rejects_unsealed_live_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_rx_main_l5_canary_evidence(tmp_path, monkeypatch)
+    (tmp_path / "monitor_latest.json").write_text(
+        json.dumps({"state": "running"}),
+        encoding="utf-8",
+    )
+
+    card = updater._rx_main_l5_native_canary_card(
+        OBSERVED,
+        root=tmp_path,
+    )
+
+    assert "MONITOR INVALID" in card["title"]
+    assert "GET RUNNING" not in card["title"]
+    assert any(
+        "GET monitor authenticated=false" in item
+        and "live state=unclaimed" in item
+        for item in card["evidence"]
+    )
+
+
+def test_rx_main_l5_native_canary_accepts_sealed_get_monitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_rx_main_l5_canary_evidence(tmp_path, monkeypatch)
+    monitor = updater._sealed(
+        {
+            "schema_version": updater.RX_MAIN_L5_NATIVE_CANARY_MONITOR_SCHEMA,
+            "task_id": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_ID,
+            "task_name": updater.RX_MAIN_L5_NATIVE_CANARY_TASK_NAME,
+            "receipt_file_sha256": (
+                updater.RX_MAIN_L5_NATIVE_CANARY_RECEIPT_SHA256
+            ),
+            "scheduler_endpoint": (
+                f"GET /api/tasks/{updater.RX_MAIN_L5_NATIVE_CANARY_TASK_ID}"
+            ),
+            "scheduler_methods_used": ["GET"],
+            "scheduler_mutation_performed": False,
+            "observed_at": OBSERVED,
+            "state": "running",
+        }
+    )
+    (tmp_path / "monitor_latest.json").write_text(
+        json.dumps(monitor),
+        encoding="utf-8",
+    )
+
+    card = updater._rx_main_l5_native_canary_card(
+        OBSERVED,
+        root=tmp_path,
+    )
+
+    assert "GET RUNNING" in card["title"]
+    assert any(
+        "GET monitor authenticated=true" in item
+        and "state=running" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "interface pass claimed=false" in item
+        and "production promotion=false" in item
+        for item in card["evidence"]
+    )
+
+
+def test_rx_main_l5_native_canary_receipt_tamper_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_rx_main_l5_canary_evidence(tmp_path, monkeypatch)
+    receipt_path = tmp_path / "submission_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["scheduler_post_calls"] = 2
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    card = updater._rx_main_l5_native_canary_card(
+        OBSERVED,
+        root=tmp_path,
+    )
+
+    assert "RECEIPT INVALID" in card["title"]
+    assert "SUBMITTED" not in card["title"]
+    assert any(
+        "receipt_authentication=invalid_fail_closed" == item
+        for item in card["evidence"]
+    )
+    assert any(
+        "design promotion=false" in item
+        and "production promotion=false" in item
+        for item in card["evidence"]
+    )
+
+
+def test_merge_upserts_one_rx_main_l5_native_canary_card(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_rx_main_l5_canary_evidence(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        updater,
+        "RX_MAIN_L5_NATIVE_CANARY_ROOT",
+        tmp_path,
+    )
+
+    merged = updater.merge_status(
+        _status(),
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+    )
+    merged_again = updater.merge_status(
+        merged,
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+    )
+    ids = [item["id"] for item in merged_again["current"]]
+
+    assert ids.count(updater.RX_MAIN_L5_NATIVE_CANARY_CARD_ID) == 1
+    assert ids.index(updater.RX_MAIN_L5_NATIVE_CANARY_CARD_ID) < ids.index(
+        "parallel-workstreams"
+    )
+    updater.validate_status_sync(merged_again)
+
+
 def test_merge_removes_stale_automatic_continuation_card_when_disarmed() -> None:
     source = _status()
     source["current"].insert(

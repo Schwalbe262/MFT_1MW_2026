@@ -724,6 +724,7 @@ LOCAL_SYMMETRIC_SELECTION_CARD_ID = "codex-local-symmetric-selection"
 LEGACY_CONTINUATION_CARD_ID = "codex-standard-full-continuation"
 FINAL_DRAWING_CARD_ID = "codex-final-drawing-readiness"
 COMPACT_DESIGN_STATUS_CARD_ID = "codex-compact-design-status"
+RX_MAIN_L5_NATIVE_CANARY_CARD_ID = "codex-rx-main-l5-native-canary"
 PRIMARY_5T_RECOVERY_CARD_ID = "codex-primary-5t-constraint-recovery"
 AXIS_V6_CARD_ID = "codex-axis-v6-fixed-5t-nsga"
 TARGET_AXIS_CARD_ID = "codex-target-axis-1200x1000-nsga"
@@ -858,6 +859,50 @@ COMPACT_FOCUS_W_MAX_MM = 1_170.0
 COMPACT_FOCUS_L_MAX_MM = 975.0
 COMPACT_REFERENCE_VOLUME_L = 830.95994977
 COMPACT_FRESH_EXACT_SEED_COUNT = 512
+RX_MAIN_L5_NATIVE_CANARY_ROOT = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\rx_main_l5_native_earliest_canary_v2"
+)
+RX_MAIN_L5_NATIVE_CANARY_TASK_ID = 97_140
+RX_MAIN_L5_NATIVE_CANARY_TASK_NAME = (
+    "mft-goal-rxmain-l5-f7f6-earliest-v1"
+)
+RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256 = (
+    "f7f6f2890be76943230e82d4e50992fac602537df17b5cf3a8556b04207e75b5"
+)
+RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION = (
+    "6ef2b687ae39a08d1b8b3c5fe7d4e553789107b8"
+)
+RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION = (
+    "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+)
+RX_MAIN_L5_NATIVE_CANARY_RECEIPT_SHA256 = (
+    "9ab0941c687c71472cbcba6161e7132bab30364d1c3263ccfae22811301fd4c4"
+)
+RX_MAIN_L5_NATIVE_CANARY_PRE_SUBMIT_SHA256 = (
+    "a0884da3024ba67c48812dae43479d7a25483eb43ceca8062355c7bdcda26a52"
+)
+RX_MAIN_L5_NATIVE_CANARY_PAYLOAD_SHA256 = (
+    "755e58b238990df46534bcfbd63c87d2032086cde9c71f60ed3dae9deac45562"
+)
+RX_MAIN_L5_NATIVE_CANARY_PARAMS_SHA256 = (
+    "d8ab19c738199230dc99cb788dc0654d0ae10895c40af445325c67cb2987cd10"
+)
+RX_MAIN_L5_NATIVE_CANARY_MONITOR_SCHEMA = (
+    "mft-goal-rx-main-l5-native-earliest-canary-monitor-v1"
+)
+RX_MAIN_L5_NATIVE_CANARY_CPUS = 8
+RX_MAIN_L5_NATIVE_CANARY_MEMORY_MB = 65_536
+RX_MAIN_L5_NATIVE_CANARY_TIMEOUT_SECONDS = 43_200
+RX_MAIN_L5_NATIVE_CANARY_FIXED_COOLING = {
+    "core_plate_pad_t": 2.0,
+    "fan_config": "dual",
+    "fan_velocity": 1.5,
+    "full_model": 0,
+    "k_ins": 0.2,
+    "round_corner": 0,
+    "wcp_pad_t": 2.0,
+}
 TARGET_AXIS_CAMPAIGN = (
     "mft-goal-fixed-primary-5t-lm2mh-axis-w1200-l1000-"
     "old16-plus-splittemp512-global-v3"
@@ -6192,6 +6237,321 @@ def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
     }
 
 
+def _read_rx_main_l5_canary_json(
+    path: Path,
+    *,
+    expected_file_sha256: str,
+) -> dict[str, Any]:
+    if (
+        not path.is_file()
+        or path.is_symlink()
+        or path.stat().st_size > MAX_LOCAL_SEALED_STATE_BYTES
+        or _file_sha256(path) != expected_file_sha256
+    ):
+        raise UpdaterError(f"Rx-main canary evidence unavailable: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdaterError(f"Rx-main canary evidence invalid: {path}") from exc
+    if not isinstance(value, dict):
+        raise UpdaterError(f"Rx-main canary evidence is not an object: {path}")
+    return value
+
+
+def _rx_main_l5_canary_promotion_gate_valid(
+    value: Mapping[str, Any],
+) -> bool:
+    promotion = value.get("promotion_gate")
+    if not isinstance(promotion, Mapping):
+        return False
+    required = promotion.get("interface_fix_canary_requires")
+    return (
+        promotion.get(
+            "design_scientific_promotion_forbidden_for_one_iteration_canary"
+        )
+        is True
+        and isinstance(required, Mapping)
+        and required.get("contract")
+        == "thermal-rx-block-interface-coverage-v1"
+        and required.get("mesh_plan_contract") == "thermal-mesh-plan-v8"
+        and required.get("mesh_policy")
+        == "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+        and required.get("missing_fluid_coupling") == []
+        and required.get("missing_rx_main_solids") == []
+        and required.get("rx_main_adjacency_passed") is True
+        and required.get("unpaired_interfaces") == []
+        and required.get("no_unpaired_log_marker") is True
+    )
+
+
+def _rx_main_l5_canary_receipt(
+    root: Path,
+) -> dict[str, Any]:
+    resolved = root.resolve()
+    receipt = _read_rx_main_l5_canary_json(
+        resolved / "submission_receipt.json",
+        expected_file_sha256=RX_MAIN_L5_NATIVE_CANARY_RECEIPT_SHA256,
+    )
+    pre_submit = _read_rx_main_l5_canary_json(
+        resolved / "pre_submit_receipt.json",
+        expected_file_sha256=RX_MAIN_L5_NATIVE_CANARY_PRE_SUBMIT_SHA256,
+    )
+    payload = _read_rx_main_l5_canary_json(
+        resolved / "dry_run_payload.json",
+        expected_file_sha256=RX_MAIN_L5_NATIVE_CANARY_PAYLOAD_SHA256,
+    )
+    params = _read_rx_main_l5_canary_json(
+        resolved / "params.json",
+        expected_file_sha256=RX_MAIN_L5_NATIVE_CANARY_PARAMS_SHA256,
+    )
+    payload_canonical_sha256 = canonical_sha256(payload)
+    params_canonical_sha256 = canonical_sha256(params)
+    command = payload.get("command")
+    command_sha256 = (
+        hashlib.sha256(command.encode("utf-8")).hexdigest()
+        if isinstance(command, str)
+        else None
+    )
+    expected_identity = {
+        "task_name": RX_MAIN_L5_NATIVE_CANARY_TASK_NAME,
+        "geometry_sha256": RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256,
+        "solver_revision": RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION,
+        "library_revision": RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION,
+    }
+    if (
+        receipt.get("schema")
+        != "mft-goal-rx-main-l5-native-earliest-canary-submission-v1"
+        or receipt.get("task_id") != RX_MAIN_L5_NATIVE_CANARY_TASK_ID
+        or receipt.get("submission_source") != "post_created"
+        or receipt.get("scheduler_post_calls") != 1
+        or receipt.get("scheduler_mutation_performed") is not True
+        or receipt.get("existing_tasks_or_gui_mutated") is not False
+        or receipt.get("thermal_max_iterations") != 1
+        or receipt.get("fixed_cooling")
+        != RX_MAIN_L5_NATIVE_CANARY_FIXED_COOLING
+        or receipt.get("interface_contract")
+        != "thermal-rx-block-interface-coverage-v1"
+        or receipt.get("mesh_plan_contract") != "thermal-mesh-plan-v8"
+        or receipt.get("mesh_policy")
+        != "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+        or receipt.get("pre_submit_receipt_file_sha256")
+        != RX_MAIN_L5_NATIVE_CANARY_PRE_SUBMIT_SHA256
+        or receipt.get("payload_canonical_sha256")
+        != payload_canonical_sha256
+        or receipt.get("params_canonical_sha256")
+        != params_canonical_sha256
+        or receipt.get("command_sha256") != command_sha256
+        or not _rx_main_l5_canary_promotion_gate_valid(receipt)
+        or any(receipt.get(key) != expected for key, expected in expected_identity.items())
+        or pre_submit.get("schema")
+        != "mft-goal-rx-main-l5-native-earliest-canary-pre-submit-v1"
+        or pre_submit.get("scheduler_post_calls") != 0
+        or pre_submit.get("fixed_cooling")
+        != RX_MAIN_L5_NATIVE_CANARY_FIXED_COOLING
+        or pre_submit.get("payload_file_sha256")
+        != RX_MAIN_L5_NATIVE_CANARY_PAYLOAD_SHA256
+        or pre_submit.get("params_file_sha256")
+        != RX_MAIN_L5_NATIVE_CANARY_PARAMS_SHA256
+        or pre_submit.get("payload_canonical_sha256")
+        != payload_canonical_sha256
+        or pre_submit.get("params_canonical_sha256")
+        != params_canonical_sha256
+        or pre_submit.get("command_sha256") != command_sha256
+        or not _rx_main_l5_canary_promotion_gate_valid(pre_submit)
+        or any(
+            pre_submit.get(key) != expected
+            for key, expected in expected_identity.items()
+        )
+        or receipt.get("dedupe_key") != pre_submit.get("dedupe_key")
+        or receipt.get("dedupe_key") != payload.get("dedupe_key")
+        or payload.get("name") != RX_MAIN_L5_NATIVE_CANARY_TASK_NAME
+        or payload.get("cpus") != RX_MAIN_L5_NATIVE_CANARY_CPUS
+        or payload.get("memory_mb") != RX_MAIN_L5_NATIVE_CANARY_MEMORY_MB
+        or payload.get("timeout_seconds")
+        != RX_MAIN_L5_NATIVE_CANARY_TIMEOUT_SECONDS
+        or payload.get("max_workers_per_node") != 1
+        or params.get("thermal_max_iterations") != 1
+        or any(
+            params.get(key) != expected
+            for key, expected in RX_MAIN_L5_NATIVE_CANARY_FIXED_COOLING.items()
+        )
+    ):
+        raise UpdaterError("Rx-main canary receipt truth boundary drifted")
+    return {
+        "receipt_file_sha256": RX_MAIN_L5_NATIVE_CANARY_RECEIPT_SHA256,
+        "pre_submit_file_sha256": RX_MAIN_L5_NATIVE_CANARY_PRE_SUBMIT_SHA256,
+        "task_readback_sha256": receipt.get("task_readback_sha256"),
+    }
+
+
+def _rx_main_l5_canary_monitor(
+    root: Path,
+    *,
+    receipt_file_sha256: str,
+) -> tuple[dict[str, Any] | None, str]:
+    path = root.resolve() / "monitor_latest.json"
+    if not path.is_file():
+        return None, "unavailable"
+    try:
+        if path.is_symlink() or path.stat().st_size > MAX_LOCAL_SEALED_STATE_BYTES:
+            raise UpdaterError("Rx-main canary monitor is unsafe")
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise UpdaterError("Rx-main canary monitor must be an object")
+        unsigned = copy.deepcopy(value)
+        observed_sha256 = unsigned.pop("payload_sha256", None)
+        state = str(value.get("state") or "").strip().lower()
+        _category(state)
+        if (
+            value.get("schema_version")
+            != RX_MAIN_L5_NATIVE_CANARY_MONITOR_SCHEMA
+            or observed_sha256 != canonical_sha256(unsigned)
+            or value.get("task_id") != RX_MAIN_L5_NATIVE_CANARY_TASK_ID
+            or value.get("task_name") != RX_MAIN_L5_NATIVE_CANARY_TASK_NAME
+            or value.get("receipt_file_sha256") != receipt_file_sha256
+            or value.get("scheduler_endpoint")
+            != f"GET /api/tasks/{RX_MAIN_L5_NATIVE_CANARY_TASK_ID}"
+            or value.get("scheduler_methods_used") != ["GET"]
+            or value.get("scheduler_mutation_performed") is not False
+            or not isinstance(value.get("observed_at"), str)
+        ):
+            raise UpdaterError("Rx-main canary monitor truth boundary drifted")
+        return {**value, "state": state}, "authenticated"
+    except (OSError, UnicodeError, json.JSONDecodeError, UpdaterError):
+        return None, "invalid"
+
+
+def _rx_main_l5_native_canary_fail_safe_card(
+    observed_at: str,
+    *,
+    condition: str,
+    root: Path,
+) -> dict[str, Any]:
+    label = "RECEIPT MISSING" if condition == "missing" else "RECEIPT INVALID"
+    return {
+        "id": RX_MAIN_L5_NATIVE_CANARY_CARD_ID,
+        "title": (
+            "CODEX | B7/v8 RX-MAIN L5 NATIVE EARLIEST CANARY task97140 | "
+            f"{label} | LIVE STATE UNCLAIMED | PROMOTION OFF"
+        ),
+        "detail": (
+            "The pinned local submission evidence is absent or invalid. No "
+            "Scheduler lifecycle, interface pass, scientific validity, design "
+            "promotion, or production claim is inferred."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 0,
+        "evidence": [
+            f"receipt_authentication={condition}_fail_closed",
+            "Scheduler lifecycle=unclaimed / authenticated GET monitor=false",
+            "interface pass=unclaimed / scientific promotion=false",
+            "design promotion=false / production promotion=false",
+            f"evidence root={root.resolve()}",
+        ],
+    }
+
+
+def _rx_main_l5_native_canary_card(
+    observed_at: str,
+    *,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    evidence_root = root or RX_MAIN_L5_NATIVE_CANARY_ROOT
+    try:
+        receipt = _rx_main_l5_canary_receipt(evidence_root)
+    except FileNotFoundError:
+        return _rx_main_l5_native_canary_fail_safe_card(
+            observed_at,
+            condition="missing",
+            root=evidence_root,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, UpdaterError):
+        condition = (
+            "missing"
+            if not (evidence_root.resolve() / "submission_receipt.json").is_file()
+            else "invalid"
+        )
+        return _rx_main_l5_native_canary_fail_safe_card(
+            observed_at,
+            condition=condition,
+            root=evidence_root,
+        )
+    monitor, monitor_condition = _rx_main_l5_canary_monitor(
+        evidence_root,
+        receipt_file_sha256=receipt["receipt_file_sha256"],
+    )
+    live_label = (
+        f"GET {monitor['state'].upper()}"
+        if monitor is not None
+        else (
+            "MONITOR INVALID · LIVE STATE UNCLAIMED"
+            if monitor_condition == "invalid"
+            else "LIVE STATE UNCLAIMED"
+        )
+    )
+    monitor_evidence = (
+        "GET monitor authenticated=true / "
+        f"state={monitor['state']} / observed_at={monitor['observed_at']}"
+        if monitor is not None
+        else (
+            "GET monitor authenticated=false / monitor condition="
+            f"{monitor_condition} / live state=unclaimed"
+        )
+    )
+    return {
+        "id": RX_MAIN_L5_NATIVE_CANARY_CARD_ID,
+        "title": (
+            "CODEX | B7/v8 RX-MAIN L5 NATIVE EARLIEST CANARY task97140 | "
+            f"SUBMITTED 1 POST | {live_label} | PROMOTION OFF"
+        ),
+        "detail": (
+            "Pinned local evidence authenticates exactly one canary submission. "
+            "Submission-time queued readback is not shown as live state. The "
+            "one-iteration thermal run can test the interface fix only; design "
+            "scientific and production promotion remain forbidden."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 10,
+        "evidence": [
+            (
+                "receipt authenticated=true / task97140 / Scheduler POST count=1 / "
+                "existing tasks or GUI mutated=false"
+            ),
+            (
+                "resources=8CPU/65536MiB/43200s (12h) / "
+                "thermal_max_iterations=1"
+            ),
+            (
+                f"geometry={RX_MAIN_L5_NATIVE_CANARY_GEOMETRY_SHA256} / "
+                f"solver={RX_MAIN_L5_NATIVE_CANARY_SOLVER_REVISION}"
+            ),
+            (
+                f"library={RX_MAIN_L5_NATIVE_CANARY_LIBRARY_REVISION} / "
+                "fixed cooling unchanged=true"
+            ),
+            (
+                "interface pass requires missing_rx_main_solids=[] / "
+                "missing_fluid_coupling=[] / rx_main_adjacency_passed=true"
+            ),
+            (
+                "interface pass also requires unpaired_interfaces=[] / "
+                "no_unpaired_log_marker=true"
+            ),
+            monitor_evidence,
+            (
+                "interface pass claimed=false / design scientific promotion=false / "
+                "production promotion=false"
+            ),
+            (
+                f"receipt SHA256={receipt['receipt_file_sha256']} / "
+                f"pre-submit SHA256={receipt['pre_submit_file_sha256']}"
+            ),
+        ],
+    }
+
+
 def _counter(pattern: re.Pattern[str], title: str, label: str) -> int:
     values = {int(value) for value in pattern.findall(title)}
     if len(values) != 1:
@@ -6567,6 +6927,10 @@ def merge_status(
             result,
             _final_gate_card(final_gate_root, observed_at),
         )
+    _upsert_current_card(
+        result,
+        _rx_main_l5_native_canary_card(observed_at),
+    )
     _upsert_current_card(
         result,
         _compact_design_status_card(observed_at),
