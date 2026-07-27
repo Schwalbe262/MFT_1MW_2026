@@ -1267,8 +1267,20 @@ def rank_candidates(
             )
             errors.append(str(exc))
         expanded_rows.append(expanded)
+    prediction_frame = pd.DataFrame(predictions)
+    stale_prediction_columns = [
+        column for column in prediction_frame if column in frame
+    ]
+    if "physics_delta_error" in frame:
+        stale_prediction_columns.append("physics_delta_error")
     ranked = pd.concat(
-        [frame.reset_index(drop=True), pd.DataFrame(predictions)],
+        [
+            frame.drop(
+                columns=stale_prediction_columns,
+                errors="ignore",
+            ).reset_index(drop=True),
+            prediction_frame,
+        ],
         axis=1,
     )
     for key in (
