@@ -99,7 +99,9 @@ DEFAULT_BUNDLE_ROOT = (
 DEFAULT_PREFLIGHT_PATH = DEFAULT_LOCAL_ROOT / "sealed_preflight.json"
 DEFAULT_DRY_RUN_PATH = DEFAULT_LOCAL_ROOT / "sealed_local_dry_run.json"
 
-SEED_START = 2_607_264_400
+SEED_FLOOR = 2_607_264_400
+SEED_CEILING = 2_607_264_999
+SEED_START = SEED_FLOOR
 SEED_COUNT = 60
 SEED_END = SEED_START + SEED_COUNT - 1
 SCHEDULER_PRIORITY = 100
@@ -129,6 +131,23 @@ FORBIDDEN_OPTIMIZER_INPUTS = (
 _ACTIVE_MODEL: dict[str, Any] | None = None
 _COORDINATOR_OFFLOAD: Any | None = None
 _BASE_SCHEDULER_PAYLOAD: Any | None = None
+
+
+def _set_seed_interval(seed_start: int, seed_count: int) -> None:
+    global SEED_COUNT, SEED_END, SEED_START
+    start = int(seed_start)
+    count = int(seed_count)
+    end = start + count - 1
+    if (
+        count < 1
+        or count > 100
+        or start < SEED_FLOOR
+        or end > SEED_CEILING
+    ):
+        raise RuntimeError("corrected seed interval is outside the sealed range")
+    SEED_START = start
+    SEED_COUNT = count
+    SEED_END = end
 
 
 def _coordinator_offload(*, configure: bool = True) -> Any:
@@ -380,7 +399,7 @@ def _build_search_profile(
         or secondary_gap_mode != scout.SECONDARY_GAP_MODE_BOUNDED
     ):
         raise RuntimeError(
-            "corrected physics NSGA requires bounded exact60 seeds 4400..4459"
+            "corrected physics NSGA seed interval or bounded gap mode drifted"
         )
     model = _active_model()
     constraints = scout._effective_constraint_profile()
@@ -389,7 +408,7 @@ def _build_search_profile(
         "profile_id": (
             "corrected-physics-delta-l900-temp110-130-130-"
             "hard-equal-hgap20-gap2p35to2p00-cw2p30to1p00-"
-            "plates20-exact60-s2607264400"
+            f"plates20-n{SEED_COUNT}-s{SEED_START}"
         ),
         "campaign_id": CAMPAIGN_ID,
         "fixed_primary_turns": scout.FIXED_PRIMARY_TURNS,
@@ -1702,6 +1721,12 @@ def _model_from_payload(path: Path) -> dict[str, Any]:
         or task.get("manufacturing_search_profile")
         or {}
     )
+    _set_seed_interval(
+        int(profile.get("authorized_seed_start", -1)),
+        int(profile.get("authorized_seed_count", -1)),
+    )
+    if profile.get("authorized_seed_end_inclusive") != SEED_END:
+        raise RuntimeError("corrected payload seed interval is inconsistent")
     gate = profile.get("physics_delta_rx_resonance_gate") or {}
     return _validate_embedded_model(gate.get("model") or {})
 
@@ -1762,6 +1787,7 @@ def _rewrite_result(path: Path) -> None:
 
 
 def prepare_command(args: argparse.Namespace) -> Path:
+    _set_seed_interval(args.seed_start, args.seed_count)
     model = _load_bound_model(args.physics_model)
     configure_runtime(model)
     delegated = argparse.Namespace(
@@ -2023,6 +2049,8 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--physics-model", type=Path, default=DEFAULT_MODEL_PATH
     )
+    prepare.add_argument("--seed-start", type=int, default=SEED_START)
+    prepare.add_argument("--seed-count", type=int, default=SEED_COUNT)
     prepare.add_argument("--output", type=Path, default=DEFAULT_BUNDLE_ROOT)
     prepare.set_defaults(handler=prepare_command)
     execute = commands.add_parser("execute")

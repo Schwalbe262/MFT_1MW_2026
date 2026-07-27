@@ -73,6 +73,19 @@ def test_profile_maps_latest_acceptance_and_separate_exact60(
     assert validated["cooling_or_TIM_contract_mutated"] is False
 
 
+def test_corrected_successor_seed_interval_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("SEED_START", "SEED_COUNT", "SEED_END"):
+        monkeypatch.setattr(lane, name, getattr(lane, name))
+    lane._set_seed_interval(2_607_264_460, 40)
+    assert lane.SEED_START == 2_607_264_460
+    assert lane.SEED_COUNT == 40
+    assert lane.SEED_END == 2_607_264_499
+    with pytest.raises(RuntimeError, match="outside the sealed range"):
+        lane._set_seed_interval(2_607_264_999, 2)
+
+
 def test_corrected_runtime_authorization_reaches_diagnostic_gate(
     model: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
