@@ -66,6 +66,9 @@ def test_profile_maps_latest_acceptance_and_separate_exact60(
     assert gate["fixed20T_turn_graded_FEA_retraining_required"] is True
     assert validated["fixed_core_plate_thickness_mm"] == 20.0
     assert validated["fixed_winding_cold_plate_thickness_mm"] == 20.0
+    assert validated["temperature_contract_sha256"] == effective[
+        "temperature_contract_sha256"
+    ]
     assert validated["cooling_or_TIM_contract_mutated"] is False
 
 

@@ -381,6 +381,9 @@ def _build_search_profile(
         "effective_constraint_profile_payload_sha256": constraints[
             "payload_sha256"
         ],
+        "temperature_contract_sha256": constraints[
+            "temperature_contract_sha256"
+        ],
         "geometry_constraint_profile": copy.deepcopy(geometry),
         "geometry_constraint_profile_sha256": geometry["sha256"],
         "winding_height_exact_equality_initialization_and_repair_required": (
@@ -451,6 +454,7 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         "fixed_winding_cold_plate_thickness_mm",
         "effective_constraint_profile",
         "effective_constraint_profile_payload_sha256",
+        "temperature_contract_sha256",
         "geometry_constraint_profile",
         "geometry_constraint_profile_sha256",
         "winding_height_exact_equality_initialization_and_repair_required",
@@ -491,6 +495,8 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         or profile.get("fixed_winding_cold_plate_thickness_mm") != 20.0
         or profile.get("effective_constraint_profile_payload_sha256")
         != constraints["payload_sha256"]
+        or profile.get("temperature_contract_sha256")
+        != constraints["temperature_contract_sha256"]
         or profile.get("geometry_constraint_profile_sha256")
         != geometry["sha256"]
         or profile.get(
