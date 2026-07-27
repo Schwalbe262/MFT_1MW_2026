@@ -1040,6 +1040,121 @@ def _install_search_profile(
     return evidence
 
 
+def _project_bounded_secondary_bank(
+    problem: Any,
+    bank: Mapping[str, Any],
+    compact_contract: Mapping[str, Any],
+    search_profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project bounded-profile bridge donors onto the cw2 hard band."""
+
+    import numpy as np
+
+    profile = _validate_search_profile(search_profile)
+    if (
+        _secondary_gap_mode_from_profile(profile)
+        == SECONDARY_GAP_MODE_FIXED
+    ):
+        return copy.deepcopy(dict(bank))
+    contract = preflight.validate_goal_compact_search_contract(
+        compact_contract,
+        fixed_primary_turns=problem.fixed_primary_turns,
+    )
+    coordinates = np.asarray(bank.get("coordinates"), dtype=float)
+    gap_index = tuple(problem.sobol_dimension_names).index("gap2")
+    projected = []
+    for index, source in enumerate(coordinates):
+        coordinate = np.asarray(source, dtype=float).copy()
+        for _attempt in range(4):
+            coordinate = np.asarray(
+                problem.repair_unit_coordinates(coordinate), dtype=float
+            )
+            frame, _shrink, valid = problem.decode_batch(
+                coordinate.reshape(1, -1)
+            )
+            if not bool(valid[0]):
+                raise RuntimeError(
+                    f"bounded secondary bank row {index} became invalid"
+                )
+            row = frame.iloc[0]
+            gap2 = float(row["gap2"])
+            cw2 = float(row["cw2"])
+            if (
+                VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
+                <= gap2
+                <= VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+                and SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM
+                <= cw2
+                <= SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+            ):
+                break
+            n2 = int(row["N2_main"]) + int(row["N2_side"])
+            gap_count = max(int(row["N2_main"]) - 1, 0) + max(
+                int(row["N2_side"]) - 1, 0
+            )
+            if cw2 > SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM:
+                required = gap2 + (
+                    (
+                        cw2
+                        - SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+                    )
+                    * n2
+                    / gap_count
+                )
+                required = (
+                    math.ceil(
+                        (
+                            required
+                            - VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM
+                            * 1e-6
+                        )
+                        / VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM
+                    )
+                    * VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM
+                )
+            else:
+                required = VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
+            if required > VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM:
+                raise RuntimeError(
+                    "bounded secondary bank needs gap2 above 2.00 mm: "
+                    f"row={index},required={required},cw2={cw2}"
+                )
+            coordinate[gap_index] = problem._unit_from_physical(
+                "gap2", required
+            )
+        else:
+            raise RuntimeError(
+                f"bounded secondary bank projection did not converge: {index}"
+            )
+        projected.append(coordinate)
+    repaired, records = preflight._goal_compact_coordinate_replay(
+        problem,
+        np.asarray(projected, dtype=float),
+        strata=contract["strata"],
+        hard_size_limits_mm=contract["hard_size_limits_mm"],
+    )
+    result = copy.deepcopy(dict(bank))
+    result["coordinates"] = repaired.tolist()
+    result["coordinate_sha256"] = canonical_sha256(repaired.tolist())
+    result["rows"] = records
+    result["membership_counts"] = {
+        name: sum(name in row["memberships"] for row in records)
+        for name in contract["strata"]
+    }
+    result["topology_counts"] = {
+        str(topology): sum(
+            row["N2_main"] == topology for row in records
+        )
+        for topology in contract["turn_split_topologies_N2_main"]
+    }
+    result.pop("sha256", None)
+    result["sha256"] = canonical_sha256(result)
+    preflight.validate_goal_compact_coordinate_bank(
+        problem, result, compact_contract=contract
+    )
+    return result
+
+
 def _aligned_bank_proof(
     problem: Any,
     bank: Mapping[str, Any],
@@ -1609,6 +1724,12 @@ def prepare(args: argparse.Namespace) -> Path:
         runner.problem,
         seed=seeds[0],
         compact_contract=compact_contract,
+    )
+    compact_bank = _project_bounded_secondary_bank(
+        runner.problem,
+        compact_bank,
+        compact_contract,
+        search_profile,
     )
     preflight.validate_goal_compact_coordinate_bank(
         runner.problem,
