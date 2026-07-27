@@ -38,7 +38,12 @@ for import_root in (REPOSITORY_ROOT, REGRESSION_ROOT, TRAINING_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from module.input_parameter_260706 import ALL_INPUT_KEYS  # noqa: E402
+from module.input_parameter_260706 import (  # noqa: E402
+    ALL_INPUT_KEYS,
+    FIXED_GEOMETRY_INPUT_KEYS,
+    TURN_GRADED_ELECTROSTATIC_INPUT_KEYS,
+    get_drawing_default_params,
+)
 from module.mft_goal_20260726_contract import (  # noqa: E402
     GOAL_G0_MODEL_TARGETS,
     GOAL_N1_MAX_TURNS,
@@ -94,6 +99,13 @@ DEFAULT_MINIMUM_SOURCE_TASKS = 4
 RECOMMENDED_NEW_ROWS = 12
 MAX_DIAGNOSTIC_SELECTION_ROWS = 12
 TARGETED_PRIMARY_TURNS = 6
+BASE_INPUT_NORMALIZATION_SCHEMA = (
+    "mft-goal-strict-al-base-input-normalization-v1"
+)
+APPEND_ONLY_BASE_INPUT_KEYS = (
+    *FIXED_GEOMETRY_INPUT_KEYS,
+    *TURN_GRADED_ELECTROSTATIC_INPUT_KEYS,
+)
 NEXT_CAMPAIGN_SEED_START = 2_607_263_000
 NEXT_CAMPAIGN_SEED_COUNT = 512
 NEXT_CAMPAIGN_SEED_END = (
@@ -1010,6 +1022,56 @@ def _target_counts(
     }
 
 
+def _normalize_append_only_base_inputs(
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Default only solver controls that were append-only after base capture.
+
+    The pinned 6,151-row base predates the center-gap and turn-graded
+    electrostatic controls.  Both contracts explicitly define missing
+    pre-extension values: zero gap and turn-graded mode off.  Add those
+    values in memory so the immutable source bytes stay unchanged.  Missing
+    Sobol/design inputs and every other solver input remain fatal.
+    """
+
+    missing = tuple(key for key in ALL_INPUT_KEYS if key not in frame.columns)
+    unsupported = sorted(set(missing) - set(APPEND_ONLY_BASE_INPUT_KEYS))
+    if unsupported:
+        raise StrictALIngestError(
+            "base dataset lacks solver inputs: " + ",".join(unsupported)
+        )
+    defaults = get_drawing_default_params()
+    appended = {
+        key: defaults[key]
+        for key in APPEND_ONLY_BASE_INPUT_KEYS
+        if key in missing
+    }
+    normalized = frame.copy() if appended else frame
+    for key, value in appended.items():
+        normalized[key] = value
+    remaining = sorted(
+        key for key in ALL_INPUT_KEYS if key not in normalized.columns
+    )
+    if remaining:
+        raise StrictALIngestError(
+            "base dataset lacks solver inputs after append-only "
+            "normalization: "
+            + ",".join(remaining)
+        )
+    return normalized, {
+        "schema_version": BASE_INPUT_NORMALIZATION_SCHEMA,
+        "performed": bool(appended),
+        "policy": (
+            "in_memory_defaults_for_append_only_fixed_run_controls_only"
+        ),
+        "append_only_allowed_keys": list(APPEND_ONLY_BASE_INPUT_KEYS),
+        "appended_defaults": appended,
+        "appended_keys": list(appended),
+        "source_dataset_mutated": False,
+        "source_bytes_rewritten": False,
+    }
+
+
 def _concat_without_implicit_all_na_dtype(
     base: pd.DataFrame, incoming: pd.DataFrame
 ) -> pd.DataFrame:
@@ -1063,13 +1125,8 @@ def _base_audit(
         raise StrictALIngestError(
             f"base row count drifted: expected {expected_rows}, got {len(frame)}"
         )
-    missing_inputs = sorted(
-        key for key in ALL_INPUT_KEYS if key not in frame.columns
-    )
-    if missing_inputs:
-        raise StrictALIngestError(
-            "base dataset lacks solver inputs: " + ",".join(missing_inputs)
-        )
+    source_column_count = len(frame.columns)
+    frame, input_normalization = _normalize_append_only_base_inputs(frame)
     audited = annotate_validity(frame, profile)
     if not audited["_strict_valid_full"].fillna(False).all():
         invalid = int((~audited["_strict_valid_full"].fillna(False)).sum())
@@ -1108,8 +1165,10 @@ def _base_audit(
         raise StrictALIngestError("base does not support all 25 target models")
     record = _file_record(base_path)
     record["row_count"] = len(audited)
-    record["column_count"] = len(frame.columns)
+    record["column_count"] = source_column_count
+    record["normalized_column_count"] = len(frame.columns)
     record["audited_column_count"] = len(audited.columns)
+    record["input_schema_normalization"] = input_normalization
     record["strict_full_row_count"] = int(
         audited["_strict_valid_full"].sum()
     )

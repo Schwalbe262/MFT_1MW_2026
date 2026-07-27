@@ -264,6 +264,60 @@ def test_build_isolated_dataset_adds_all_targets_and_preserves_base(
         )
 
 
+def test_base_audit_defaults_only_append_only_post_capture_inputs(
+    tmp_path,
+):
+    base = _base_dataset(tmp_path)
+    frame = pd.read_parquet(base)
+    missing = list(ingest.APPEND_ONLY_BASE_INPUT_KEYS)
+    frame.drop(columns=missing).to_parquet(base, index=False)
+
+    audited, record, _revision, counts = ingest._base_audit(
+        base,
+        expected_sha256=ingest._sha256_file(base),
+        expected_rows=8,
+        profile=_profile(),
+    )
+
+    normalization = record["input_schema_normalization"]
+    assert normalization["performed"] is True
+    assert normalization["appended_keys"] == missing
+    assert normalization["appended_defaults"] == {
+        "core_center_gap_mm": 0.0,
+        "cap_turn_graded_active_winding": "off",
+        "cap_turn_graded_voltage_policy": "turn_midpoint",
+        "cap_turn_graded_section_order": "auto",
+        "cap_turn_graded_reverse_sections": "none",
+        "cap_turn_graded_reverse_terminal_polarity": 0,
+        "cap_turn_graded_side_polarity": 1,
+        "cap_turn_graded_side2_polarity": 1,
+    }
+    assert normalization["source_dataset_mutated"] is False
+    assert record["column_count"] == len(frame.columns) - len(missing)
+    assert record["normalized_column_count"] == len(frame.columns)
+    assert all(key in audited.columns for key in missing)
+    assert audited["core_center_gap_mm"].eq(0.0).all()
+    assert audited["cap_turn_graded_active_winding"].eq("off").all()
+    assert len(counts) == len(GOAL_G0_MODEL_TARGETS)
+
+
+def test_base_audit_still_rejects_missing_design_input(tmp_path):
+    base = _base_dataset(tmp_path)
+    frame = pd.read_parquet(base)
+    frame.drop(columns=["cw1"]).to_parquet(base, index=False)
+
+    with pytest.raises(
+        ingest.StrictALIngestError,
+        match=r"base dataset lacks solver inputs: cw1",
+    ):
+        ingest._base_audit(
+            base,
+            expected_sha256=ingest._sha256_file(base),
+            expected_rows=8,
+            profile=_profile(),
+        )
+
+
 def test_small_valid_batch_is_not_retraining_ready(tmp_path, monkeypatch):
     _base, prepared = _prepare(tmp_path, monkeypatch, new_count=4)
 
