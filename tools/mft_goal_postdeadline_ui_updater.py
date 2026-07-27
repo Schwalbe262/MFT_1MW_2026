@@ -789,6 +789,24 @@ EXACT_N1_6_CORRECTED_CANARY_PARAMS_SHA256 = (
 EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256 = (
     "f7f6f2890be76943230e82d4e50992fac602537df17b5cf3a8556b04207e75b5"
 )
+TURN_GRADED_CAP_CARD_ID = "codex-turn-graded-cap-current25"
+TURN_GRADED_CAP_ROOT = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\turn_graded_cap_6x60_current25_v1"
+)
+TURN_GRADED_CAP_SUBMISSION_SCHEMA = (
+    "mft-goal-current25-turn-graded-cap-submission-v1"
+)
+TURN_GRADED_CAP_COLLECTION_SCHEMA = (
+    "mft-goal-current25-turn-graded-cap-collection-v1"
+)
+TURN_GRADED_CAP_CANARY_RECEIPT = "canary_submission_receipt.json"
+TURN_GRADED_CAP_ACQUISITION_RECEIPT = "acquisition_submission_receipt.json"
+TURN_GRADED_CAP_CANARY_COLLECTION = "canary_collection.json"
+TURN_GRADED_CAP_PLAN_PAYLOAD_SHA256 = (
+    "094e17deca33bd6083b101ff293f78cc11a91131830e86c4c709edb9c14d7a61"
+)
+TURN_GRADED_CAP_TASK_IDS = tuple(range(97_066, 97_116))
 HISTORICAL_AXIS_RAW_TERMINAL = 5_120
 HISTORICAL_AXIS_UNIQUE_GEOMETRY = 4_683
 NEW_AXIS_GEOMETRY_PASS_RAW = 217
@@ -1410,6 +1428,371 @@ def _validate_corrected_canary_task(
         "memory_mb": 65_536,
         "priority": 100,
         "timeout_seconds": 43_200,
+    }
+
+
+def _read_turn_graded_cap_receipt(path: Path) -> dict[str, Any]:
+    """Read one immutable, self-sealed turn-graded submission receipt."""
+
+    resolved = path.resolve()
+    try:
+        if (
+            not resolved.is_file()
+            or resolved.is_symlink()
+            or resolved.stat().st_size > MAX_RESPONSE_BYTES
+        ):
+            raise UpdaterError(f"turn-graded receipt unavailable: {resolved}")
+        value = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdaterError(
+            f"turn-graded receipt is unreadable: {resolved}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise UpdaterError("turn-graded receipt root must be an object")
+    unsigned = copy.deepcopy(value)
+    observed_sha256 = unsigned.pop("payload_sha256", None)
+    if observed_sha256 != canonical_sha256(unsigned):
+        raise UpdaterError("turn-graded receipt payload seal drifted")
+    if value.get("schema") != TURN_GRADED_CAP_SUBMISSION_SCHEMA:
+        raise UpdaterError("turn-graded submission receipt schema drifted")
+    if (
+        value.get("plan_payload_sha256")
+        != TURN_GRADED_CAP_PLAN_PAYLOAD_SHA256
+    ):
+        raise UpdaterError("turn-graded submission plan identity drifted")
+    if value.get("complete") is not True:
+        raise UpdaterError("turn-graded submission receipt is incomplete")
+    if value.get("thermal_jobs_cancelled_or_modified") is not False:
+        raise UpdaterError("turn-graded submission modified thermal jobs")
+    return value
+
+
+def _turn_graded_canary_collection(
+    path: Path,
+    *,
+    expected_submission_payload_sha256: str,
+) -> dict[str, Any]:
+    """Authenticate the exact 6/60 Tx/Rx turn-graded result pair."""
+
+    resolved = path.resolve()
+    try:
+        if (
+            not resolved.is_file()
+            or resolved.is_symlink()
+            or resolved.stat().st_size > MAX_RESPONSE_BYTES
+        ):
+            raise UpdaterError("turn-graded canary collection is unavailable")
+        value = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdaterError(
+            "turn-graded canary collection is unreadable"
+        ) from exc
+    if not isinstance(value, dict):
+        raise UpdaterError("turn-graded canary collection must be an object")
+    unsigned = copy.deepcopy(value)
+    observed_sha256 = unsigned.pop("payload_sha256", None)
+    if observed_sha256 != canonical_sha256(unsigned):
+        raise UpdaterError("turn-graded canary collection seal drifted")
+    expected = {
+        "schema": TURN_GRADED_CAP_COLLECTION_SCHEMA,
+        "selection": "canary",
+        "plan_payload_sha256": TURN_GRADED_CAP_PLAN_PAYLOAD_SHA256,
+        "submission_payload_sha256": expected_submission_payload_sha256,
+        "all_terminal": True,
+        "valid_result_count": 2,
+        "valid_pair_count": 1,
+        "fixed_Lm2mh_pair_pass_count": 1,
+        "legacy_two_net_capacitance_used": False,
+        "scheduler_mutation_performed": False,
+        "symmetric_even_potential_diagnostic": True,
+        "full_model_series_interconnect_attested": False,
+        "final_design_pass_allowed_from_cap_collection_alone": False,
+    }
+    for key, expected_value in expected.items():
+        if value.get(key) != expected_value:
+            raise UpdaterError(
+                f"turn-graded canary collection {key} drifted"
+            )
+    rows = value.get("rows")
+    pairs = value.get("pairs")
+    if not isinstance(rows, list) or len(rows) != 2:
+        raise UpdaterError("turn-graded canary result rows drifted")
+    if not isinstance(pairs, list) or len(pairs) != 1:
+        raise UpdaterError("turn-graded canary result pair drifted")
+    rows_by_winding: dict[str, Mapping[str, Any]] = {}
+    expected_task_ids = {"Tx": 97_066, "Rx": 97_067}
+    expected_inductances = {"Tx": 0.002, "Rx": 0.2}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise UpdaterError("turn-graded canary row is invalid")
+        winding = str(row.get("active_winding") or "")
+        checks = row.get("contract_checks")
+        capacitance = float(row.get("C_terminal_turn_graded_F") or 0.0)
+        frequency = float(row.get("fixed_Lm2mh_resonance_Hz") or 0.0)
+        inductance = float(
+            row.get("fixed_inductance_for_resonance_H") or 0.0
+        )
+        if (
+            winding not in expected_task_ids
+            or winding in rows_by_winding
+            or row.get("task_id") != expected_task_ids[winding]
+            or row.get("source_corrected_task_id") != 97_041
+            or row.get("candidate_index") != 0
+            or row.get("observed_geometry_sha256")
+            != EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256
+            or row.get("status") != "completed"
+            or row.get("exit_code") != 0
+            or row.get("contract_valid") is not True
+            or not isinstance(checks, dict)
+            or not checks
+            or not all(value is True for value in checks.values())
+            or not math.isfinite(capacitance)
+            or capacitance <= 0.0
+            or not math.isfinite(frequency)
+            or frequency < 15_000.0
+            or row.get("fixed_Lm2mh_resonance_pass_15kHz") is not True
+            or not math.isclose(
+                inductance,
+                expected_inductances[winding],
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise UpdaterError(
+                f"turn-graded canary {winding or 'unknown'} row drifted"
+            )
+        rows_by_winding[winding] = row
+    if set(rows_by_winding) != {"Tx", "Rx"}:
+        raise UpdaterError("turn-graded canary winding pair drifted")
+    pair = pairs[0]
+    f_tx = float(rows_by_winding["Tx"]["fixed_Lm2mh_resonance_Hz"])
+    f_rx = float(rows_by_winding["Rx"]["fixed_Lm2mh_resonance_Hz"])
+    f_min = min(f_tx, f_rx)
+    if (
+        not isinstance(pair, dict)
+        or pair.get("candidate_index") != 0
+        or pair.get("tx_task_id") != 97_066
+        or pair.get("rx_task_id") != 97_067
+        or pair.get("source_corrected_task_id") != 97_041
+        or pair.get("observed_geometry_sha256")
+        != EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256
+        or pair.get("pair_contract_valid") is not True
+        or pair.get("fixed_Lm2mh_pair_pass_15kHz") is not True
+        or not math.isclose(
+            float(pair.get("fixed_Lm2mh_fmin_Hz") or 0.0),
+            f_min,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        raise UpdaterError("turn-graded canary pair contract drifted")
+    return {
+        "payload_sha256": observed_sha256,
+        "file_sha256": _file_sha256(resolved),
+        "C_tx_F": float(
+            rows_by_winding["Tx"]["C_terminal_turn_graded_F"]
+        ),
+        "C_rx_F": float(
+            rows_by_winding["Rx"]["C_terminal_turn_graded_F"]
+        ),
+        "f_tx_Hz": f_tx,
+        "f_rx_Hz": f_rx,
+        "f_min_Hz": f_min,
+        "pair_pass_15kHz": True,
+        "symmetric_even_potential_diagnostic": True,
+        "full_model_series_interconnect_attested": False,
+        "final_design_pass_allowed": False,
+    }
+
+
+def _turn_graded_cap_submission_state(
+    root: Path = TURN_GRADED_CAP_ROOT,
+) -> dict[str, Any] | None:
+    """Authenticate the exact 6/60 canary pair and 24 acquisition pairs."""
+
+    resolved = root.resolve()
+    canary_path = resolved / TURN_GRADED_CAP_CANARY_RECEIPT
+    acquisition_path = resolved / TURN_GRADED_CAP_ACQUISITION_RECEIPT
+    if not canary_path.is_file() or not acquisition_path.is_file():
+        return None
+    receipts = (
+        _read_turn_graded_cap_receipt(canary_path),
+        _read_turn_graded_cap_receipt(acquisition_path),
+    )
+    expected_by_selection = {
+        "canary": (2, {0}),
+        "acquisition": (48, set(range(1, 25))),
+    }
+    lanes: dict[int, dict[str, Any]] = {}
+    for receipt in receipts:
+        selection = str(receipt.get("selection") or "")
+        if selection not in expected_by_selection:
+            raise UpdaterError("turn-graded submission selection drifted")
+        expected_count, expected_candidates = expected_by_selection[selection]
+        submissions = receipt.get("submissions")
+        if (
+            receipt.get("submitted_lane_count") != expected_count
+            or receipt.get("scheduler_post_or_dedupe_call_count")
+            != expected_count
+            or not isinstance(submissions, list)
+            or len(submissions) != expected_count
+        ):
+            raise UpdaterError("turn-graded submission lane count drifted")
+        observed_candidates: set[int] = set()
+        windings_by_candidate: dict[int, set[str]] = {}
+        for lane in submissions:
+            if not isinstance(lane, dict):
+                raise UpdaterError("turn-graded submission lane is invalid")
+            task_id = int(lane.get("task_id") or 0)
+            candidate_index = int(lane.get("candidate_index") or 0)
+            active_winding = str(lane.get("active_winding") or "")
+            geometry_sha256 = str(
+                lane.get("observed_geometry_sha256") or ""
+            )
+            source_task_id = int(lane.get("source_corrected_task_id") or 0)
+            if (
+                task_id in lanes
+                or active_winding not in {"Tx", "Rx"}
+                or re.fullmatch(r"[0-9a-f]{64}", geometry_sha256) is None
+                or lane.get("scheduler_mutation_performed") is not True
+                or lane.get("submission_source")
+                not in {"post_created", "dedupe_reused"}
+                or source_task_id != 97_041 + candidate_index
+            ):
+                raise UpdaterError("turn-graded submission lane identity drifted")
+            observed_candidates.add(candidate_index)
+            windings_by_candidate.setdefault(candidate_index, set()).add(
+                active_winding
+            )
+            lanes[task_id] = {
+                "task_id": task_id,
+                "candidate_index": candidate_index,
+                "active_winding": active_winding,
+                "name": str(lane.get("name") or ""),
+                "dedupe_key": str(lane.get("dedupe_key") or ""),
+                "geometry_sha256": geometry_sha256,
+                "source_task_id": source_task_id,
+                "priority": 100 if selection == "canary" else 96,
+            }
+        if observed_candidates != expected_candidates or any(
+            windings != {"Tx", "Rx"}
+            for windings in windings_by_candidate.values()
+        ):
+            raise UpdaterError("turn-graded Tx/Rx candidate pairing drifted")
+    if set(lanes) != set(TURN_GRADED_CAP_TASK_IDS):
+        raise UpdaterError("turn-graded task ID range drifted")
+    canary_geometry = {
+        lane["geometry_sha256"]
+        for lane in lanes.values()
+        if lane["candidate_index"] == 0
+    }
+    if canary_geometry != {EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256}:
+        raise UpdaterError("turn-graded exact 6/60 geometry drifted")
+    result = {
+        "root": str(resolved),
+        "lanes": lanes,
+        "plan_payload_sha256": TURN_GRADED_CAP_PLAN_PAYLOAD_SHA256,
+        "canary_receipt_payload_sha256": receipts[0]["payload_sha256"],
+        "acquisition_receipt_payload_sha256": receipts[1]["payload_sha256"],
+        "canary_receipt_file_sha256": _file_sha256(canary_path),
+        "acquisition_receipt_file_sha256": _file_sha256(acquisition_path),
+    }
+    collection_path = resolved / TURN_GRADED_CAP_CANARY_COLLECTION
+    result["canary_collection"] = (
+        _turn_graded_canary_collection(
+            collection_path,
+            expected_submission_payload_sha256=receipts[0][
+                "payload_sha256"
+            ],
+        )
+        if collection_path.is_file()
+        else None
+    )
+    return result
+
+
+def _validate_turn_graded_cap_task(
+    expected: Mapping[str, Any],
+    task: Mapping[str, Any],
+) -> dict[str, Any]:
+    task_id = int(expected["task_id"])
+    identifiers = {
+        int(value)
+        for key in ("id", "task_id")
+        if (value := task.get(key)) not in (None, "")
+    }
+    if identifiers != {task_id}:
+        raise UpdaterError(f"turn-graded task{task_id} identity drifted")
+    expected_fields = {
+        "name": expected["name"],
+        "dedupe_key": expected["dedupe_key"],
+        "project": "MFT_1MW_2026v1",
+        "required_capability": "conda:pyaedt2026v1",
+        "env_profile": "pyaedt2026v1",
+        "scheduling_profile": "fea_bursty",
+        "aedt_backend": "standalone",
+        "cpus": 8,
+        "memory_mb": 65_536,
+        "gpus": 0,
+        "priority": expected["priority"],
+        "timeout_seconds": 43_200,
+        "max_workers_per_node": 1,
+    }
+    for key, expected_value in expected_fields.items():
+        if task.get(key) != expected_value:
+            raise UpdaterError(
+                f"turn-graded task{task_id} {key} drifted"
+            )
+    state = _task_state(task)
+    actual_node = str(
+        task.get("actual_node_name") or task.get("allocation_node_name") or ""
+    )
+    if state in RUNNING_STATES and (
+        not actual_node or task.get("placement_contract_satisfied") is not True
+    ):
+        raise UpdaterError(
+            f"turn-graded task{task_id} running placement is not satisfied"
+        )
+    return {
+        **dict(expected),
+        "state": state,
+        "allocation_id": _positive_or_none(
+            task.get("allocation_id"), "allocation_id"
+        ),
+        "slurm_job_id": str(task.get("slurm_job_id") or ""),
+        "actual_node_name": actual_node,
+        "placement_contract_satisfied": task.get(
+            "placement_contract_satisfied"
+        ),
+        "created_at": task.get("created_at"),
+        "started_at": task.get("started_at"),
+        "finished_at": task.get("finished_at"),
+        "exit_code": task.get("exit_code"),
+        "failure_message": str(task.get("failure_message") or "")[:350],
+    }
+
+
+def fetch_turn_graded_cap_tasks(
+    scheduler_url: str,
+    submission_state: Mapping[str, Any],
+    *,
+    task_reader: TaskReader | None = None,
+) -> dict[int, dict[str, Any]]:
+    lanes = submission_state.get("lanes")
+    if not isinstance(lanes, dict) or set(lanes) != set(
+        TURN_GRADED_CAP_TASK_IDS
+    ):
+        raise UpdaterError("turn-graded submission state is incomplete")
+    reader = task_reader or _get_scheduler_task
+    with ThreadPoolExecutor(max_workers=min(64, len(lanes))) as executor:
+        futures = {
+            task_id: executor.submit(reader, scheduler_url, task_id)
+            for task_id in lanes
+        }
+        raw = {task_id: future.result() for task_id, future in futures.items()}
+    return {
+        task_id: _validate_turn_graded_cap_task(lanes[task_id], raw[task_id])
+        for task_id in lanes
     }
 
 
@@ -3452,8 +3835,23 @@ def _corrected_n1_6_gui_solver_stage(
     latest = dispatch_matches[-1]
     stage = latest.group(1)
     after_dispatch = stdout_tail[latest.end() :]
-    solve_started = "Solving design setup" in after_dispatch
-    solve_completed = "solved correctly" in after_dispatch
+    thermal_start = stdout_tail.rfind("Solving design setup ThermalSetup")
+    direct_thermal_running = thermal_start >= latest.end()
+    if direct_thermal_running:
+        stage = "thermal"
+        active_stage_tail = stdout_tail[thermal_start:]
+        solve_started = True
+        solve_completed = bool(
+            re.search(
+                r"(?:Design setup\s+)?ThermalSetup solved correctly",
+                active_stage_tail,
+                flags=re.IGNORECASE,
+            )
+        )
+    else:
+        active_stage_tail = after_dispatch
+        solve_started = "Solving design setup" in active_stage_tail
+        solve_completed = "solved correctly" in active_stage_tail
     completed_stages: list[str] = []
     for index, match in enumerate(dispatch_matches):
         stage_end = (
@@ -3463,6 +3861,11 @@ def _corrected_n1_6_gui_solver_stage(
         )
         if "solved correctly" in stdout_tail[match.end() : stage_end]:
             completed_stages.append(match.group(1))
+    if (
+        direct_thermal_running
+        and latest.group(1) not in completed_stages
+    ):
+        completed_stages.append(latest.group(1))
     if solve_completed:
         state = "completed"
     elif solve_started:
@@ -3475,7 +3878,8 @@ def _corrected_n1_6_gui_solver_stage(
         "completed_stages": completed_stages,
         "thermal_dispatch_observed": any(
             match.group(1) == "thermal" for match in dispatch_matches
-        ),
+        )
+        or direct_thermal_running,
         "thermal_preflight_observed": (
             "THERMAL_RX_INTERFACE_PREFLIGHT_JSON=" in stdout_tail
         ),
@@ -3634,6 +4038,154 @@ def _corrected_n1_6_gui_fea_card(
                 "observation mode=read-only / Scheduler method=GET / "
                 "solver process mutation=false"
             ),
+        ],
+    }
+
+
+def _turn_graded_cap_card(
+    tasks: Mapping[int, Mapping[str, Any]],
+    submission_state: Mapping[str, Any],
+    observed_at: str,
+) -> dict[str, Any]:
+    """Summarize the authenticated Tx/Rx graded-voltage campaign."""
+
+    if set(tasks) != set(TURN_GRADED_CAP_TASK_IDS):
+        raise UpdaterError("turn-graded live task set drifted")
+    categories = {
+        task_id: _category(str(task["state"]))
+        for task_id, task in tasks.items()
+    }
+    counts = {
+        category: sum(value == category for value in categories.values())
+        for category in ("running", "queued", "succeeded", "failed")
+    }
+    paired_success = 0
+    for candidate_index in range(25):
+        pair = [
+            task
+            for task in tasks.values()
+            if int(task["candidate_index"]) == candidate_index
+        ]
+        if len(pair) != 2 or {
+            str(task["active_winding"]) for task in pair
+        } != {"Tx", "Rx"}:
+            raise UpdaterError("turn-graded live Tx/Rx pairing drifted")
+        if all(_category(str(task["state"])) == "succeeded" for task in pair):
+            paired_success += 1
+    canary_tx = tasks[97_066]
+    canary_rx = tasks[97_067]
+    canary_collection = submission_state.get("canary_collection")
+    if canary_collection is not None and not isinstance(
+        canary_collection, dict
+    ):
+        raise UpdaterError("turn-graded canary collection state drifted")
+    active_nodes = sorted(
+        {
+            str(task["actual_node_name"])
+            for task_id, task in tasks.items()
+            if categories[task_id] == "running"
+            and str(task["actual_node_name"])
+        }
+    )
+    terminal = counts["succeeded"] + counts["failed"]
+    progress = min(95.0, 10.0 + 80.0 * terminal / len(tasks))
+    cap_result_title = (
+        f" | FMIN{canary_collection['f_min_Hz'] / 1000.0:.3f}k PASS"
+        if canary_collection is not None
+        else ""
+    )
+    result_evidence = (
+        [
+            (
+                "authenticated exact-pair result: "
+                f"Ctx={canary_collection['C_tx_F'] * 1e9:.6f}nF / "
+                f"fTx@Lm2mH={canary_collection['f_tx_Hz'] / 1000.0:.3f}kHz / "
+                f"Crx={canary_collection['C_rx_F'] * 1e9:.6f}nF / "
+                f"fRx@L2=0.2H={canary_collection['f_rx_Hz'] / 1000.0:.3f}kHz / "
+                f"fmin={canary_collection['f_min_Hz'] / 1000.0:.3f}kHz PASS"
+            ),
+            (
+                "canary collection payload SHA256="
+                f"{canary_collection['payload_sha256']} / "
+                "symmetric even-potential diagnostic=true / "
+                "full series interconnect attested=false / "
+                "final design pass from capacitance alone=false"
+            ),
+        ]
+        if canary_collection is not None
+        else [
+            (
+                "turn-graded terminal extraction=pending / "
+                "15kHz scientific resonance gate=pending / "
+                "production_eligible=false"
+            )
+        ]
+    )
+    return {
+        "id": TURN_GRADED_CAP_CARD_ID,
+        "title": (
+            "TURN-GRADED CAP | 25 GEOM/50 SOLVES | "
+            f"RUN{counts['running']} QUEUE{counts['queued']} "
+            f"OK{counts['succeeded']} FAIL{counts['failed']} | "
+            f"6/60 Tx97066 {str(canary_tx['state']).upper()} "
+            f"Rx97067 {str(canary_rx['state']).upper()}"
+            f"{cap_result_title}"
+        ),
+        "detail": (
+            "Actual per-turn midpoint-voltage electrostatic Tx and Rx solves "
+            "are running in parallel for the exact 6/60 GUI geometry plus "
+            "24 corrected acquisition geometries. These are the capacitance "
+            "truth solves required for the 15 kHz resonance gate; Scheduler "
+            "lifecycle alone is not a scientific pass."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": progress,
+        "evidence": [
+            (
+                "exact 6/60 pair: task97066 Tx "
+                f"{str(canary_tx['state']).upper()} "
+                f"{canary_tx['actual_node_name'] or 'pending'}/"
+                f"j{canary_tx['slurm_job_id'] or 'pending'} | "
+                "task97067 Rx "
+                f"{str(canary_rx['state']).upper()} "
+                f"{canary_rx['actual_node_name'] or 'pending'}/"
+                f"j{canary_rx['slurm_job_id'] or 'pending'}"
+            ),
+            (
+                "exact geometry SHA256="
+                f"{EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256} / "
+                "symmetric eighth / nonrounded / N1/N2=6/60 / "
+                "core gap=0.65mm"
+            ),
+            (
+                "turn grading=physical turns + midpoint voltage / "
+                "Tx=6 main / Rx=37 main+23 side / polarity=+1/+1 / "
+                "matrix_on=1 / loss_on=0 / thermal_on=0"
+            ),
+            (
+                f"bulk task range=97068-97115 / paired geometries=24 / "
+                f"paired terminal success={paired_success}/25 / "
+                f"active nodes={len(active_nodes)} "
+                f"({','.join(active_nodes) or 'none'})"
+            ),
+            (
+                "resources per solve=8CPU+65536MB / timeout=43200s / "
+                "canary priority=100 / acquisition priority=96 / "
+                f"active requested total={counts['running'] * 8}CPU+"
+                f"{counts['running'] * 65_536}MB"
+            ),
+            (
+                "canary receipt payload SHA256="
+                f"{submission_state['canary_receipt_payload_sha256']} / "
+                "acquisition receipt payload SHA256="
+                f"{submission_state['acquisition_receipt_payload_sha256']}"
+            ),
+            (
+                "thermal jobs cancelled or modified=false / UI updater "
+                "Scheduler method=GET only / scheduler repository modified=false"
+            ),
+            *result_evidence,
         ],
     }
 
@@ -4907,6 +5459,8 @@ def merge_status(
     lastmile_tasks: Mapping[int, Mapping[str, Any]] | None = None,
     lastmile_submission_state: Mapping[str, Any] | None = None,
     corrected_canary_task: Mapping[str, Any] | None = None,
+    turn_graded_cap_tasks: Mapping[int, Mapping[str, Any]] | None = None,
+    turn_graded_cap_submission_state: Mapping[str, Any] | None = None,
     reference_gui_root: Path | None = None,
     target_axis_collector_state_file: Path | None = None,
     postsuccess_state_file: Path | None = None,
@@ -4976,6 +5530,20 @@ def merge_status(
             corrected_canary_task=corrected_canary_task,
         ),
     )
+    if (
+        turn_graded_cap_tasks is not None
+        and turn_graded_cap_submission_state is not None
+    ):
+        _upsert_priority_current_card(
+            result,
+            _turn_graded_cap_card(
+                turn_graded_cap_tasks,
+                turn_graded_cap_submission_state,
+                observed_at,
+            ),
+        )
+    else:
+        _remove_current_card(result, TURN_GRADED_CAP_CARD_ID)
     if lastmile_tasks is not None and lastmile_submission_state is not None:
         _upsert_priority_current_card(
             result,
@@ -5482,6 +6050,25 @@ def merge_status(
             "status_without_sync_sha256": status_payload_sha256,
             "tasks": task_snapshot,
             "authoritative_tasks": auxiliary_snapshot,
+            "turn_graded_cap_tasks": (
+                [
+                    {
+                        "task_id": task_id,
+                        "candidate_index": task["candidate_index"],
+                        "active_winding": task["active_winding"],
+                        "state": task["state"],
+                        "allocation_id": task["allocation_id"],
+                        "slurm_job_id": task["slurm_job_id"],
+                        "node_name": task["actual_node_name"],
+                        "exit_code": task["exit_code"],
+                    }
+                    for task_id, task in sorted(
+                        turn_graded_cap_tasks.items()
+                    )
+                ]
+                if turn_graded_cap_tasks is not None
+                else []
+            ),
         }
     )
     return result
@@ -5550,6 +6137,19 @@ def synchronize_once(
         if task_reader is None
         else None
     )
+    turn_graded_cap_submission_state = (
+        _turn_graded_cap_submission_state()
+        if task_reader is None
+        else None
+    )
+    turn_graded_cap_tasks = (
+        fetch_turn_graded_cap_tasks(
+            scheduler_url,
+            turn_graded_cap_submission_state,
+        )
+        if turn_graded_cap_submission_state is not None
+        else None
+    )
     source = status_file.resolve().read_bytes()
     source_sha256 = hashlib.sha256(source).hexdigest()
     try:
@@ -5566,6 +6166,10 @@ def synchronize_once(
         lastmile_tasks=lastmile_tasks,
         lastmile_submission_state=lastmile_submission_state,
         corrected_canary_task=corrected_canary_task,
+        turn_graded_cap_tasks=turn_graded_cap_tasks,
+        turn_graded_cap_submission_state=(
+            turn_graded_cap_submission_state
+        ),
         reference_gui_root=(
             reference_gui_root or DEFAULT_REFERENCE_BASELINE_GUI_ROOT
         ),

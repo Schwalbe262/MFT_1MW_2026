@@ -777,6 +777,84 @@ def test_corrected_exact_n1_6_gui_card_reports_native_stage_without_thermal_clai
     )
 
 
+def test_corrected_gui_stage_recognizes_direct_thermal_analyze(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "corrected_gui_stdout.log").write_text(
+        'SOLVER_CORE_DISPATCH_JSON {"stage":"matrix"}\n'
+        "PyAEDT INFO: Solving design setup Setup1\n"
+        "PyAEDT INFO: Design setup Setup1 solved correctly in 77s\n"
+        'SOLVER_CORE_DISPATCH_JSON {"stage":"cap"}\n'
+        "PyAEDT INFO: Solving design setup Setup1\n"
+        "PyAEDT INFO: Design setup Setup1 solved correctly in 24s\n"
+        'SOLVER_CORE_DISPATCH_JSON {"stage":"loss"}\n'
+        "PyAEDT INFO: Solving design setup Setup1\n"
+        "PyAEDT INFO: Design setup Setup1 solved correctly in 120s\n"
+        'THERMAL_RX_INTERFACE_PREFLIGHT_JSON={"passed":true}\n'
+        "PyAEDT INFO: Solving design setup ThermalSetup\n",
+        encoding="utf-8",
+    )
+
+    stage = updater._corrected_n1_6_gui_solver_stage(tmp_path)
+
+    assert stage == {
+        "stage": "thermal",
+        "state": "running",
+        "completed_stages": ["matrix", "cap", "loss"],
+        "thermal_dispatch_observed": True,
+        "thermal_preflight_observed": True,
+        "stdout_available": True,
+    }
+
+
+def test_turn_graded_cap_card_reports_parallel_pair_campaign() -> None:
+    tasks = {}
+    for task_id in updater.TURN_GRADED_CAP_TASK_IDS:
+        candidate_index = (
+            0 if task_id < 97_068 else 1 + (task_id - 97_068) // 2
+        )
+        active_winding = "Tx" if task_id % 2 == 0 else "Rx"
+        state = "running" if task_id < 97_093 else "queued"
+        tasks[task_id] = {
+            "task_id": task_id,
+            "candidate_index": candidate_index,
+            "active_winding": active_winding,
+            "state": state,
+            "actual_node_name": "n109" if state == "running" else "",
+            "slurm_job_id": str(800_000 + task_id) if state == "running" else "",
+            "allocation_id": 14_700 if state == "running" else None,
+            "exit_code": None,
+        }
+    submission_state = {
+        "canary_receipt_payload_sha256": "a" * 64,
+        "acquisition_receipt_payload_sha256": "b" * 64,
+    }
+
+    card = updater._turn_graded_cap_card(tasks, submission_state, OBSERVED)
+
+    assert card["id"] == updater.TURN_GRADED_CAP_CARD_ID
+    assert len(card["title"]) <= 160
+    assert "25 GEOM/50 SOLVES" in card["title"]
+    assert "RUN27 QUEUE23 OK0 FAIL0" in card["title"]
+    assert "6/60 Tx97066 RUNNING Rx97067 RUNNING" in card["title"]
+    assert card["state"] == "in_progress"
+    assert any(
+        "task97066 Tx RUNNING" in value
+        and "task97067 Rx RUNNING" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "bulk task range=97068-97115" in value
+        and "paired geometries=24" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "Scheduler method=GET only" in value
+        and "scheduler repository modified=false" in value
+        for value in card["evidence"]
+    )
+
+
 def test_lastmile_card_reports_parallel_submission_without_production_pass(
 ) -> None:
     tasks = {}
