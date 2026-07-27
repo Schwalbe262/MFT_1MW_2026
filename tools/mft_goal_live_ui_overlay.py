@@ -244,16 +244,7 @@ def update(
     nsga_state = (
         "completed"
         if nsga_counts.get("completed", 0) == 60
-        else (
-            "attention"
-            if (
-                nsga_counts.get("failed", 0)
-                + nsga_counts.get("cancelled", 0)
-                > 0
-                and sum(nsga_counts.get(name, 0) for name in ACTIVE) == 0
-            )
-            else "in_progress"
-        )
+        else "in_progress"
     )
     nsga_detail = (
         "보정된 60-turn 물리 커패시턴스와 Lm=2 mH 공진 계약을 사용하는 "
