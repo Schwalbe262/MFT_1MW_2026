@@ -163,10 +163,11 @@ def update(
     status_file: Path,
     scheduler_url: str,
     core_rescue_plan: Path,
+    fea_prefix: str = FEA_PREFIX,
 ) -> dict[str, Any]:
     status = _read_json(status_file)
     nsga_rows = _get_tasks(scheduler_url, NSGA_PREFIX)
-    fea_rows = _get_tasks(scheduler_url, FEA_PREFIX)
+    fea_rows = _get_tasks(scheduler_url, fea_prefix)
     nsga_counts = _counts(nsga_rows)
     fea_counts = _counts(fea_rows)
     plan = _read_json(core_rescue_plan) if core_rescue_plan.is_file() else {}
@@ -279,6 +280,7 @@ def update(
         "scheduler_mutation_performed": False,
         "nsga_task_count": len(nsga_rows),
         "fea_task_count": len(fea_rows),
+        "fea_task_prefix": fea_prefix,
         "core_rescue_plan": str(core_rescue_plan),
     }
     _atomic_json(status_file, status)
@@ -292,6 +294,7 @@ def _parser() -> argparse.ArgumentParser:
         "--scheduler-url", default="http://127.0.0.1:8002"
     )
     parser.add_argument("--core-rescue-plan", type=Path, required=True)
+    parser.add_argument("--fea-prefix", default=FEA_PREFIX)
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--interval-seconds", type=float, default=15.0)
@@ -317,6 +320,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             status_file=args.status_file,
             scheduler_url=args.scheduler_url,
             core_rescue_plan=args.core_rescue_plan,
+            fea_prefix=args.fea_prefix,
         )
         if not args.watch:
             return 0
