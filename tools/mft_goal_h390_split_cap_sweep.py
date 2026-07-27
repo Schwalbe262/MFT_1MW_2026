@@ -52,7 +52,12 @@ def _builtin(value: Any) -> Any:
     return value.item() if hasattr(value, "item") else value
 
 
-def _validated(raw: dict[str, Any], split_main: int) -> tuple[dict[str, Any], dict[str, float]]:
+def _validated(
+    raw: dict[str, Any],
+    split_main: int,
+    expected_gap_mm: float,
+    expected_h1_mm: float,
+) -> tuple[dict[str, Any], dict[str, float]]:
     ok, frame, errors = validation_check(
         create_input_parameter(raw),
         strict=True,
@@ -75,11 +80,13 @@ def _validated(raw: dict[str, Any], split_main: int) -> tuple[dict[str, Any], di
         "fixed_h390_geometry": (
             int(row["n_core_group"]) == 5
             and float(row["l2"]) == 280.0
+            and float(row["l1"]) == 90.0
+            and float(row["h1"]) == expected_h1_mm
             and float(row["w1"]) == 484.0
             and float(row["nwh1"]) == 390.0
             and float(row["nwh2"]) == 390.0
             and float(row["gap2"]) == 0.85
-            and float(row["core_center_gap_mm"]) == 0.4046737
+            and float(row["core_center_gap_mm"]) == expected_gap_mm
         ),
         "fixed_foils_and_cooling": (
             float(row["cw1"]) == 5.0
@@ -124,7 +131,14 @@ def prepare(
     splits: tuple[int, ...],
     *,
     full: bool = False,
+    matrix_authority: bool = False,
+    equal_gaps_mm: tuple[float, ...] | None = None,
+    h1_values_mm: tuple[float, ...] | None = None,
 ) -> Path:
+    if full and matrix_authority:
+        raise compact.CompactSweepError(
+            "--full and --matrix-authority are mutually exclusive"
+        )
     destination = output.resolve()
     if destination.exists():
         raise compact.CompactSweepError(f"output exists: {destination}")
@@ -137,14 +151,56 @@ def prepare(
     source_params = feeder._read(SOURCE_PARAMS)
     selected_profile_path = FULL_PROFILE if full else SOURCE_PROFILE
     profile = feeder._read(selected_profile_path)
+    if matrix_authority:
+        profile = copy.deepcopy(profile)
+        profile.update(
+            {
+                "comment": (
+                    "Selected h390 35/25 authority Matrix solve: "
+                    "10 passes, one converged pass, 1.5% target"
+                ),
+                "stage": "matrix_authority_10pass",
+                "timeout_seconds": 14400,
+            }
+        )
+        profile["param_overrides"].update(
+            {
+                "matrix_on": 1,
+                "matrix_max_passes": 10,
+                "matrix_min_converged": 1,
+                "matrix_percent_error": 1.5,
+                "cap_on": 0,
+                "loss_on": 0,
+                "thermal_on": 0,
+                "keep_project": 1,
+            }
+        )
     profile_record = feeder._profile_record(
         profile,
         destination,
-        "profiles/full-physics.json" if full else "profiles/cap-screen.json",
+        (
+            "profiles/full-physics.json"
+            if full
+            else (
+                "profiles/matrix-authority.json"
+                if matrix_authority
+                else "profiles/cap-screen.json"
+            )
+        ),
+    )
+    gaps = equal_gaps_mm or (0.4046737,)
+    h1_values = h1_values_mm or (float(source_params["h1"]),)
+    specs = tuple(
+        (split, gap, h1)
+        for split in splits
+        for gap in gaps
+        for h1 in h1_values
     )
     lanes: list[dict[str, Any]] = []
     audits: list[dict[str, Any]] = []
-    for lane_index, split_main in enumerate(splits, start=1):
+    for lane_index, (split_main, equal_gap_mm, h1_mm) in enumerate(
+        specs, start=1
+    ):
         if split_main < 12 or split_main > 59:
             raise compact.CompactSweepError("split is outside 12..59")
         raw = copy.deepcopy(source_params)
@@ -152,25 +208,35 @@ def prepare(
             {
                 "N2_main": int(split_main),
                 "N2_side": int(60 - split_main),
+                "h1": float(h1_mm),
+                "core_center_gap_mm": float(equal_gap_mm),
                 "matrix_on": 1,
-                "cap_on": 1,
+                "cap_on": int(not matrix_authority),
                 "loss_on": int(full),
                 "thermal_on": int(full),
                 "round_corner": 0,
                 "full_model": 0,
-                "keep_project": int(full),
+                "keep_project": int(full or matrix_authority),
             }
         )
-        effective, dimensions = _validated(raw, split_main)
+        effective, dimensions = _validated(
+            raw, split_main, float(equal_gap_mm), float(h1_mm)
+        )
         candidate_sha = feeder._sha(effective)
-        candidate_id = f"h390-split-{split_main:02d}-{60 - split_main:02d}"
+        gap_token = f"{int(round(equal_gap_mm * 10_000_000)):08d}"
+        candidate_id = (
+            f"h390-split-{split_main:02d}-{60 - split_main:02d}-"
+            f"h1-{int(round(h1_mm)):03d}-g{gap_token}"
+        )
         params_path = feeder._write(
             destination / "params" / f"lane-{lane_index:02d}.json",
             effective,
         )
         name = (
             f"mft-h390-split-{'full' if full else 'cap'}-{lane_index:02d}-"
-            f"{split_main:02d}x{60 - split_main:02d}-{candidate_sha[:10]}"
+            f"{split_main:02d}x{60 - split_main:02d}-"
+            f"h{int(round(h1_mm)):03d}-g{gap_token}-"
+            f"{candidate_sha[:10]}"
         )
         identity = feeder.scheduler_client.verification_submission_identity(
             name,
@@ -184,6 +250,12 @@ def prepare(
                 "lane_index": lane_index,
                 "N2_main": split_main,
                 "N2_side": 60 - split_main,
+                "h1_mm": float(h1_mm),
+                "vertical_clearance_each_mm": (
+                    float(h1_mm) - float(effective["nwh1"])
+                )
+                / 2.0,
+                "equal_three_leg_gap_mm": float(equal_gap_mm),
                 "candidate_sha256": candidate_sha,
                 **dimensions,
             }
@@ -202,7 +274,11 @@ def prepare(
                 "mode": (
                     "matrix_turngraded_cap_loss_thermal"
                     if full
-                    else compact.CAP_MODE
+                    else (
+                        "matrix_only_10pass_authority"
+                        if matrix_authority
+                        else compact.CAP_MODE
+                    )
                 ),
                 "params": feeder._record(params_path, destination),
                 "params_sha256": feeder._sha(effective),
@@ -241,7 +317,11 @@ def prepare(
                 "strategy": (
                     "h390_selected_35_25_full_symmetric_validation"
                     if full
-                    else "h390_direct_split_bracket_after_32_28_FEA_bias"
+                    else (
+                        "h390_selected_35_25_matrix_10pass_authority"
+                        if matrix_authority
+                        else "h390_direct_split_bracket_after_32_28_FEA_bias"
+                    )
                 ),
                 "audits": audits,
             },
@@ -253,7 +333,12 @@ def prepare(
                 "equal_winding_height_mm": 390.0,
                 "gap2_mm": 0.85,
                 "cw2_mm": 0.3,
-                "equal_three_leg_gap_mm": 0.4046737,
+                "equal_three_leg_gap_values_mm": sorted(
+                    {float(gap) for _split, gap, _h1 in specs}
+                ),
+                "h1_values_mm": sorted(
+                    {float(h1) for _split, _gap, h1 in specs}
+                ),
                 "fixed_20T_cooling_plates": True,
                 "equal_identical_physical_gap_all_three_legs": True,
                 "nonrounded_eighth": True,
@@ -273,10 +358,24 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--split-main", action="append", type=int)
+    parser.add_argument("--equal-gap", action="append", type=float)
+    parser.add_argument("--h1", action="append", type=float)
     parser.add_argument("--full", action="store_true")
+    parser.add_argument("--matrix-authority", action="store_true")
     args = parser.parse_args(argv)
     splits = tuple(args.split_main or SPLITS)
-    print(prepare(args.output, splits, full=args.full))
+    print(
+        prepare(
+            args.output,
+            splits,
+            full=args.full,
+            matrix_authority=args.matrix_authority,
+            equal_gaps_mm=(
+                tuple(args.equal_gap) if args.equal_gap else None
+            ),
+            h1_values_mm=(tuple(args.h1) if args.h1 else None),
+        )
+    )
     return 0
 
 
