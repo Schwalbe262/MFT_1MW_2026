@@ -6258,8 +6258,8 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
     return {
         "id": FINAL_DRAWING_CARD_ID,
         "title": (
-            "CODEX | PREFERRED 5T FULL ROUNDED GUI READY | h_gap1=19.45mm | "
-            "SYMMETRIC PASS PENDING | FINAL RELEASE OFF"
+            "CODEX | CONDITIONAL—PRIMARY Z CLEARANCE DECISION PENDING | "
+            "580713 h_gap1=19.45mm | 40mm HARD GATE FAIL | FINAL RELEASE OFF"
         ),
         "detail": (
             "The existing nine-slide DRAFT PPTX and nine-page DRAFT PDF were "
@@ -6268,29 +6268,42 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
             "are superseded and specification-invalid despite passing 20 layout "
             "checks. A replacement 5.0 mm/1.6 mm, 6/60-turn, Full rounded "
             "model-only AEDT has now been generated and is open in the GUI for "
-            "geometry inspection. The prior bddff inspection candidate is no "
-            "longer preferred because its primary-to-core axial clearance was "
-            "only 8.95 mm per side. The preferred 580713 source restores that "
-            "clearance to 19.45 mm per side, uses R10/s4 winding corners, and "
-            "retains the current 0.631417 mm Lm=2mH gap estimate. No analysis was "
-            "run. Publication and final release remain disabled until the "
-            "symmetric nonrounded candidate passes the tuned-gap thermal gate."
+            "geometry inspection. It is conditional, not a selected final "
+            "design: the corrected 260707 contract sets insulation_min_mm=40, "
+            "but h_gap1 was omitted from PHYSICAL_INSULATION_COLUMNS. Candidate "
+            "580713 has h_gap1=19.45 mm per side and bddff has 8.95 mm, so both "
+            "fail the restored 40 mm hard gate. Even if primary Z clearance is "
+            "explicitly relaxed to 20 mm, 580713 still needs 0.55 mm per side "
+            "of geometry correction. No analysis was run, and symmetric "
+            "nonrounded FEA is not final-confirmed. Publication and final "
+            "release remain disabled pending the clearance decision, corrected "
+            "geometry, and symmetric FEA."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 25,
+        "progress_pct": 20,
         "evidence": [
             (
-                "replacement inspection model ready=true / cw1=5.0mm / "
+                "conditional inspection model ready=true / selected=false / "
+                "cw1=5.0mm / "
                 "gap1=1.6mm / cw2=0.9mm / turns=6/60 / full_model=true / "
                 "round_corner=true / R10/s4 / analysis_run=false / "
                 "primary_core_axial_clearance_each=19.45mm / "
                 "bbox=1181.404x999.352x750.0mm / "
-                "candidate preference changed: bddff h_gap1=8.95mm/side "
-                "superseded for drawing freeze / preferred 580713 "
-                "h_gap1=19.45mm/side / surrogate temperatures "
+                "surrogate temperatures "
                 "primary=102.182C secondary=105.032C core=119.658C / "
                 "fixed-Lm fmin=15.650kHz"
+            ),
+            (
+                "corrected 260707 contract insulation_min_mm=40 / hard-gate "
+                "audit: PHYSICAL_INSULATION_COLUMNS omitted h_gap1 / "
+                "580713 h_gap1=19.45mm/side FAIL by 20.55mm/side / "
+                "bddff h_gap1=8.95mm/side FAIL by 31.05mm/side / "
+                "neither candidate is final-feasible under 40mm / "
+                "conditional relaxation scenario only: if primary-core axial "
+                "h_gap1 is explicitly relaxed to 20mm/side, 580713 remains "
+                "0.55mm/side short and requires geometry correction / "
+                "user clearance decision pending / drawing freeze=false"
             ),
             (
                 f"replacement AEDT={CORRECTED_5T_ROUNDED_FULL_GUI_SIZE_BYTES:,}B / "
@@ -6339,12 +6352,13 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
                 f"SHA256 {ROUNDED_DRAWING_DRAFT_PDF_SHA256}"
             ),
             (
-                "Z: publication=false / final PPTX claimed=false / "
-                "final PDF claimed=false / final deliverable claimed=false"
-            ),
-            (
                 "task96340 input superseded=true / task96340 result cannot release "
-                "drawing / corrected 5T design selection and verification required"
+                "drawing / corrected 5T design selection and verification required / "
+                "Z: publication=false / final PPTX claimed=false / "
+                "final PDF claimed=false / final deliverable claimed=false / "
+                "symmetric nonrounded FEA final-confirmed=false / "
+                "thermal hard-gate PASS=false / canonical candidate=false / "
+                "rounded model is geometry-inspection and drawing-only"
             ),
             (
                 f"bounded correction contingency commit="

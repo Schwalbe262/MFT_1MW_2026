@@ -1611,14 +1611,33 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         if item["id"] == updater.FINAL_DRAWING_CARD_ID
     )
     assert drawing["title"] == (
-        "CODEX | PREFERRED 5T FULL ROUNDED GUI READY | h_gap1=19.45mm | "
-        "SYMMETRIC PASS PENDING | FINAL RELEASE OFF"
+        "CODEX | CONDITIONAL—PRIMARY Z CLEARANCE DECISION PENDING | "
+        "580713 h_gap1=19.45mm | 40mm HARD GATE FAIL | FINAL RELEASE OFF"
     )
     assert drawing["state"] == "in_progress"
-    assert drawing["progress_pct"] == 25
+    assert drawing["progress_pct"] == 20
     assert any(
-        "replacement inspection model ready=true" in value
+        "conditional inspection model ready=true" in value
+        and "selected=false" in value
         and "analysis_run=false" in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        "insulation_min_mm=40" in value
+        and "PHYSICAL_INSULATION_COLUMNS omitted h_gap1" in value
+        and "580713 h_gap1=19.45mm/side FAIL by 20.55mm/side" in value
+        and "bddff h_gap1=8.95mm/side FAIL by 31.05mm/side" in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        "relaxed to 20mm/side" in value
+        and "0.55mm/side short" in value
+        and "drawing freeze=false" in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        "symmetric nonrounded FEA final-confirmed=false" in value
+        and "canonical candidate=false" in value
         for value in drawing["evidence"]
     )
     assert any(
@@ -1982,12 +2001,16 @@ def test_merge_upserts_missing_official_task_card_before_parallel() -> None:
 
 def test_final_drawing_card_is_unique_and_before_parallel() -> None:
     card = updater._final_drawing_card(OBSERVED)
-    assert "PREFERRED 5T FULL ROUNDED GUI READY" in card["title"]
-    assert card["progress_pct"] == 25
+    assert "CONDITIONAL—PRIMARY Z CLEARANCE DECISION PENDING" in card["title"]
+    assert "40mm HARD GATE FAIL" in card["title"]
+    assert card["progress_pct"] == 20
     assert "No analysis was run" in card["detail"]
     assert "symmetric nonrounded" in card["detail"]
+    assert "It is conditional, not a selected final design" in card["detail"]
+    assert "still needs 0.55 mm per side" in card["detail"]
     assert any(
-        "replacement inspection model ready=true" in item
+        "conditional inspection model ready=true" in item
+        and "selected=false" in item
         and "cw1=5.0mm" in item
         and "turns=6/60" in item
         and "analysis_run=false" in item
