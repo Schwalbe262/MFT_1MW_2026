@@ -803,6 +803,7 @@ TURN_GRADED_CAP_COLLECTION_SCHEMA = (
 TURN_GRADED_CAP_CANARY_RECEIPT = "canary_submission_receipt.json"
 TURN_GRADED_CAP_ACQUISITION_RECEIPT = "acquisition_submission_receipt.json"
 TURN_GRADED_CAP_CANARY_COLLECTION = "canary_collection.json"
+TURN_GRADED_CAP_ACQUISITION_COLLECTION = "acquisition_collection.json"
 TURN_GRADED_CAP_PLAN_PAYLOAD_SHA256 = (
     "094e17deca33bd6083b101ff293f78cc11a91131830e86c4c709edb9c14d7a61"
 )
@@ -1605,6 +1606,184 @@ def _turn_graded_canary_collection(
     }
 
 
+def _turn_graded_acquisition_collection(
+    path: Path,
+    *,
+    expected_submission_payload_sha256: str,
+    expected_lanes: Mapping[int, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Authenticate all 24 corrected-geometry turn-graded result pairs."""
+
+    resolved = path.resolve()
+    try:
+        if (
+            not resolved.is_file()
+            or resolved.is_symlink()
+            or resolved.stat().st_size > MAX_RESPONSE_BYTES
+        ):
+            raise UpdaterError(
+                "turn-graded acquisition collection is unavailable"
+            )
+        value = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdaterError(
+            "turn-graded acquisition collection is unreadable"
+        ) from exc
+    if not isinstance(value, dict):
+        raise UpdaterError(
+            "turn-graded acquisition collection must be an object"
+        )
+    unsigned = copy.deepcopy(value)
+    observed_sha256 = unsigned.pop("payload_sha256", None)
+    if observed_sha256 != canonical_sha256(unsigned):
+        raise UpdaterError("turn-graded acquisition collection seal drifted")
+    expected = {
+        "schema": TURN_GRADED_CAP_COLLECTION_SCHEMA,
+        "selection": "acquisition",
+        "plan_payload_sha256": TURN_GRADED_CAP_PLAN_PAYLOAD_SHA256,
+        "submission_payload_sha256": expected_submission_payload_sha256,
+        "all_terminal": True,
+        "valid_result_count": 48,
+        "valid_pair_count": 24,
+        "fixed_Lm2mh_pair_pass_count": 24,
+        "legacy_two_net_capacitance_used": False,
+        "scheduler_mutation_performed": False,
+        "symmetric_even_potential_diagnostic": True,
+        "full_model_series_interconnect_attested": False,
+        "final_design_pass_allowed_from_cap_collection_alone": False,
+    }
+    for key, expected_value in expected.items():
+        if value.get(key) != expected_value:
+            raise UpdaterError(
+                f"turn-graded acquisition collection {key} drifted"
+            )
+    rows = value.get("rows")
+    pairs = value.get("pairs")
+    if not isinstance(rows, list) or len(rows) != 48:
+        raise UpdaterError("turn-graded acquisition result rows drifted")
+    if not isinstance(pairs, list) or len(pairs) != 24:
+        raise UpdaterError("turn-graded acquisition result pairs drifted")
+    expected_task_ids = set(range(97_068, 97_116))
+    if set(expected_lanes) != set(TURN_GRADED_CAP_TASK_IDS):
+        raise UpdaterError("turn-graded expected lane set drifted")
+    observed_task_ids: set[int] = set()
+    rows_by_candidate: dict[int, dict[str, Mapping[str, Any]]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise UpdaterError("turn-graded acquisition row is invalid")
+        task_id = int(row.get("task_id") or 0)
+        lane = expected_lanes.get(task_id)
+        winding = str(row.get("active_winding") or "")
+        candidate_index = int(row.get("candidate_index") or 0)
+        checks = row.get("contract_checks")
+        capacitance = float(row.get("C_terminal_turn_graded_F") or 0.0)
+        frequency = float(row.get("fixed_Lm2mh_resonance_Hz") or 0.0)
+        expected_inductance = 0.002 if winding == "Tx" else 0.2
+        if (
+            task_id not in expected_task_ids
+            or task_id in observed_task_ids
+            or lane is None
+            or winding != lane["active_winding"]
+            or candidate_index != lane["candidate_index"]
+            or row.get("source_corrected_task_id") != lane["source_task_id"]
+            or row.get("observed_geometry_sha256")
+            != lane["geometry_sha256"]
+            or row.get("status") != "completed"
+            or row.get("exit_code") != 0
+            or row.get("contract_valid") is not True
+            or not isinstance(checks, dict)
+            or not checks
+            or not all(check is True for check in checks.values())
+            or not math.isfinite(capacitance)
+            or capacitance <= 0.0
+            or not math.isfinite(frequency)
+            or frequency < 15_000.0
+            or row.get("fixed_Lm2mh_resonance_pass_15kHz") is not True
+            or not math.isclose(
+                float(
+                    row.get("fixed_inductance_for_resonance_H") or 0.0
+                ),
+                expected_inductance,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise UpdaterError(
+                f"turn-graded acquisition task{task_id} row drifted"
+            )
+        observed_task_ids.add(task_id)
+        rows_by_candidate.setdefault(candidate_index, {})[winding] = row
+    if observed_task_ids != expected_task_ids or set(
+        rows_by_candidate
+    ) != set(range(1, 25)):
+        raise UpdaterError("turn-graded acquisition coverage drifted")
+    pair_by_candidate: dict[int, Mapping[str, Any]] = {}
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            raise UpdaterError("turn-graded acquisition pair is invalid")
+        candidate_index = int(pair.get("candidate_index") or 0)
+        rows_for_candidate = rows_by_candidate.get(candidate_index)
+        if (
+            candidate_index in pair_by_candidate
+            or rows_for_candidate is None
+            or set(rows_for_candidate) != {"Tx", "Rx"}
+        ):
+            raise UpdaterError("turn-graded acquisition pair coverage drifted")
+        tx_row = rows_for_candidate["Tx"]
+        rx_row = rows_for_candidate["Rx"]
+        f_min = min(
+            float(tx_row["fixed_Lm2mh_resonance_Hz"]),
+            float(rx_row["fixed_Lm2mh_resonance_Hz"]),
+        )
+        if (
+            pair.get("tx_task_id") != tx_row["task_id"]
+            or pair.get("rx_task_id") != rx_row["task_id"]
+            or pair.get("source_corrected_task_id")
+            != tx_row["source_corrected_task_id"]
+            or pair.get("source_corrected_task_id")
+            != rx_row["source_corrected_task_id"]
+            or pair.get("observed_geometry_sha256")
+            != tx_row["observed_geometry_sha256"]
+            or pair.get("observed_geometry_sha256")
+            != rx_row["observed_geometry_sha256"]
+            or pair.get("pair_contract_valid") is not True
+            or pair.get("fixed_Lm2mh_pair_pass_15kHz") is not True
+            or not math.isclose(
+                float(pair.get("fixed_Lm2mh_fmin_Hz") or 0.0),
+                f_min,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise UpdaterError(
+                f"turn-graded acquisition pair{candidate_index} drifted"
+            )
+        pair_by_candidate[candidate_index] = pair
+    if set(pair_by_candidate) != set(range(1, 25)):
+        raise UpdaterError("turn-graded acquisition pair set drifted")
+    ranked = sorted(
+        pair_by_candidate.values(),
+        key=lambda item: float(item["fixed_Lm2mh_fmin_Hz"]),
+        reverse=True,
+    )
+    return {
+        "payload_sha256": observed_sha256,
+        "file_sha256": _file_sha256(resolved),
+        "valid_result_count": 48,
+        "valid_pair_count": 24,
+        "pair_pass_15kHz_count": 24,
+        "min_f_min_Hz": min(
+            float(pair["fixed_Lm2mh_fmin_Hz"]) for pair in ranked
+        ),
+        "max_f_min_Hz": float(ranked[0]["fixed_Lm2mh_fmin_Hz"]),
+        "best_source_task_id": int(ranked[0]["source_corrected_task_id"]),
+        "best_geometry_sha256": str(ranked[0]["observed_geometry_sha256"]),
+        "symmetric_even_potential_diagnostic": True,
+        "full_model_series_interconnect_attested": False,
+        "final_design_pass_allowed": False,
+    }
+
+
 def _turn_graded_cap_submission_state(
     root: Path = TURN_GRADED_CAP_ROOT,
 ) -> dict[str, Any] | None:
@@ -1706,6 +1885,20 @@ def _turn_graded_cap_submission_state(
             ],
         )
         if collection_path.is_file()
+        else None
+    )
+    acquisition_collection_path = (
+        resolved / TURN_GRADED_CAP_ACQUISITION_COLLECTION
+    )
+    result["acquisition_collection"] = (
+        _turn_graded_acquisition_collection(
+            acquisition_collection_path,
+            expected_submission_payload_sha256=receipts[1][
+                "payload_sha256"
+            ],
+            expected_lanes=lanes,
+        )
+        if acquisition_collection_path.is_file()
         else None
     )
     return result
@@ -4079,6 +4272,15 @@ def _turn_graded_cap_card(
         canary_collection, dict
     ):
         raise UpdaterError("turn-graded canary collection state drifted")
+    acquisition_collection = submission_state.get(
+        "acquisition_collection"
+    )
+    if acquisition_collection is not None and not isinstance(
+        acquisition_collection, dict
+    ):
+        raise UpdaterError(
+            "turn-graded acquisition collection state drifted"
+        )
     active_nodes = sorted(
         {
             str(task["actual_node_name"])
@@ -4092,6 +4294,11 @@ def _turn_graded_cap_card(
     cap_result_title = (
         f" | FMIN{canary_collection['f_min_Hz'] / 1000.0:.3f}k PASS"
         if canary_collection is not None
+        else ""
+    )
+    acquisition_result_title = (
+        " | BULK24 PASS24"
+        if acquisition_collection is not None
         else ""
     )
     result_evidence = (
@@ -4121,6 +4328,26 @@ def _turn_graded_cap_card(
             )
         ]
     )
+    acquisition_evidence = (
+        [
+            (
+                "authenticated acquisition result: valid rows=48/48 / "
+                "valid Tx/Rx pairs=24/24 / fixed-Lm2mH 15kHz PASS=24/24 / "
+                f"fmin range={acquisition_collection['min_f_min_Hz'] / 1000.0:.3f}"
+                f"-{acquisition_collection['max_f_min_Hz'] / 1000.0:.3f}kHz"
+            ),
+            (
+                "best graded-cap source thermal task="
+                f"{acquisition_collection['best_source_task_id']} / "
+                "geometry="
+                f"{acquisition_collection['best_geometry_sha256']} / "
+                "acquisition collection payload SHA256="
+                f"{acquisition_collection['payload_sha256']}"
+            ),
+        ]
+        if acquisition_collection is not None
+        else []
+    )
     return {
         "id": TURN_GRADED_CAP_CARD_ID,
         "title": (
@@ -4130,6 +4357,7 @@ def _turn_graded_cap_card(
             f"6/60 Tx97066 {str(canary_tx['state']).upper()} "
             f"Rx97067 {str(canary_rx['state']).upper()}"
             f"{cap_result_title}"
+            f"{acquisition_result_title}"
         ),
         "detail": (
             "Actual per-turn midpoint-voltage electrostatic Tx and Rx solves "
@@ -4186,6 +4414,7 @@ def _turn_graded_cap_card(
                 "Scheduler method=GET only / scheduler repository modified=false"
             ),
             *result_evidence,
+            *acquisition_evidence,
         ],
     }
 
