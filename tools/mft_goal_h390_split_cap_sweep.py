@@ -132,12 +132,14 @@ def prepare(
     *,
     full: bool = False,
     matrix_authority: bool = False,
+    cap_authority: bool = False,
     equal_gaps_mm: tuple[float, ...] | None = None,
     h1_values_mm: tuple[float, ...] | None = None,
 ) -> Path:
-    if full and matrix_authority:
+    if sum((bool(full), bool(matrix_authority), bool(cap_authority))) > 1:
         raise compact.CompactSweepError(
-            "--full and --matrix-authority are mutually exclusive"
+            "--full, --matrix-authority, and --cap-authority are "
+            "mutually exclusive"
         )
     destination = output.resolve()
     if destination.exists():
@@ -175,6 +177,32 @@ def prepare(
                 "keep_project": 1,
             }
         )
+    elif cap_authority:
+        profile = copy.deepcopy(profile)
+        profile.update(
+            {
+                "comment": (
+                    "Selected compact h390 high-accuracy turn-graded Rx "
+                    "Cap authority: 12 passes and 0.25% target"
+                ),
+                "stage": "turn_graded_rx_cap_authority_0p25pct",
+                "timeout_seconds": 14400,
+            }
+        )
+        profile["param_overrides"].update(
+            {
+                "matrix_on": 1,
+                "matrix_max_passes": 20,
+                "matrix_min_converged": 1,
+                "matrix_percent_error": 1.5,
+                "cap_on": 1,
+                "cap_max_passes": 12,
+                "cap_percent_error": 0.25,
+                "loss_on": 0,
+                "thermal_on": 0,
+                "keep_project": 1,
+            }
+        )
     profile_record = feeder._profile_record(
         profile,
         destination,
@@ -184,7 +212,11 @@ def prepare(
             else (
                 "profiles/matrix-authority.json"
                 if matrix_authority
-                else "profiles/cap-screen.json"
+                else (
+                    "profiles/cap-authority.json"
+                    if cap_authority
+                    else "profiles/cap-screen.json"
+                )
             )
         ),
     )
@@ -216,7 +248,9 @@ def prepare(
                 "thermal_on": int(full),
                 "round_corner": 0,
                 "full_model": 0,
-                "keep_project": int(full or matrix_authority),
+                "keep_project": int(
+                    full or matrix_authority or cap_authority
+                ),
             }
         )
         effective, dimensions = _validated(
@@ -233,7 +267,9 @@ def prepare(
             effective,
         )
         name = (
-            f"mft-h390-split-{'full' if full else 'cap'}-{lane_index:02d}-"
+            f"mft-h390-split-"
+            f"{'full' if full else ('capauth' if cap_authority else 'cap')}-"
+            f"{lane_index:02d}-"
             f"{split_main:02d}x{60 - split_main:02d}-"
             f"h{int(round(h1_mm)):03d}-g{gap_token}-"
             f"{candidate_sha[:10]}"
@@ -277,7 +313,11 @@ def prepare(
                     else (
                         "matrix_only_10pass_authority"
                         if matrix_authority
-                        else compact.CAP_MODE
+                        else (
+                            "matrix_turngraded_cap_high_accuracy_authority"
+                            if cap_authority
+                            else compact.CAP_MODE
+                        )
                     )
                 ),
                 "params": feeder._record(params_path, destination),
@@ -320,7 +360,13 @@ def prepare(
                     else (
                         "h390_selected_35_25_matrix_10pass_authority"
                         if matrix_authority
-                        else "h390_direct_split_bracket_after_32_28_FEA_bias"
+                        else (
+                            "h390_compact_selected_high_accuracy_cap_authority"
+                            if cap_authority
+                            else (
+                                "h390_direct_split_bracket_after_32_28_FEA_bias"
+                            )
+                        )
                     )
                 ),
                 "audits": audits,
@@ -362,6 +408,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--h1", action="append", type=float)
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--matrix-authority", action="store_true")
+    parser.add_argument("--cap-authority", action="store_true")
     args = parser.parse_args(argv)
     splits = tuple(args.split_main or SPLITS)
     print(
@@ -370,6 +417,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             splits,
             full=args.full,
             matrix_authority=args.matrix_authority,
+            cap_authority=args.cap_authority,
             equal_gaps_mm=(
                 tuple(args.equal_gap) if args.equal_gap else None
             ),
