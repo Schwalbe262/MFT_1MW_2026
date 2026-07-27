@@ -113,7 +113,11 @@ def _replace_section(
 
 def _candidate_evidence(plan: Mapping[str, Any]) -> list[str]:
     selection = plan.get("selection") or {}
-    candidates = selection.get("candidates") or []
+    candidates = (
+        selection.get("candidates")
+        or selection.get("selected_candidates")
+        or []
+    )
     if not isinstance(candidates, list):
         return []
     evidence = []
@@ -166,7 +170,7 @@ def update(
     nsga_counts = _counts(nsga_rows)
     fea_counts = _counts(fea_rows)
     plan = _read_json(core_rescue_plan) if core_rescue_plan.is_file() else {}
-    planned_lanes = len(plan.get("lanes") or [])
+    planned_lanes = max(len(plan.get("lanes") or []), len(fea_rows))
     candidates = _candidate_evidence(plan)
     now = _now()
 
@@ -198,14 +202,16 @@ def update(
         else "in_progress"
     )
     fea_detail = (
-        "4개 n_core_group=4 후보에 대해 동일 3-leg air-gap의 "
-        "0.20/0.35/0.50 mm bracket을 병렬 실행합니다. 0.35 mm lane은 "
-        "Matrix·turn-graded Rx Cap·Loss·Thermal 전체, 양쪽 lane은 Lm bracket입니다."
+        "n_core_group=4 후보와 compact n_core_group=5 후보에 대해 동일 "
+        "3-leg air-gap의 0.20/0.35/0.50 mm bracket을 병렬 실행합니다. "
+        "0.35 mm lane은 Matrix·turn-graded Rx Cap·Loss·Thermal 전체, "
+        "양쪽 lane은 Lm bracket입니다."
     )
     fea_evidence = [
         f"계획 lane={planned_lanes} / {_count_text(fea_counts)}",
         "1/8 symmetric / non-rounded / 6/60 turns",
-        "core groups=4 / core plate stacks=5 / pure core depth=90 mm",
+        "core groups=4 or 5 / core plate stacks=5 or 6",
+        "pure core depth=68..90 mm",
         "core plate=20T / winding cold plate=20T / pad=2T",
         "fan=1.5 m/s / TIM unchanged",
         "equal winding heights / cw1=5T / gap1=1.6 mm / cw2≤1T",
@@ -236,7 +242,10 @@ def update(
         current,
         {
             "id": "active-core-rescue-symmetric-fea",
-            "title": f"4그룹 core-rescue symmetric FEA | {_count_text(fea_counts)}",
+            "title": (
+                "4·5그룹 core-rescue symmetric FEA | "
+                f"{_count_text(fea_counts)}"
+            ),
             "detail": fea_detail,
             "state": fea_state,
             "updated_at": now,
@@ -257,7 +266,8 @@ def update(
     status["generated_at"] = now
     status["summary"] = (
         f"보정 NSGA exact-60: {_count_text(nsga_counts)}. "
-        f"4그룹 symmetric FEA: 계획 {planned_lanes}, {_count_text(fea_counts)}. "
+        f"4·5그룹 symmetric FEA: 계획 {planned_lanes}, "
+        f"{_count_text(fea_counts)}. "
         "후보 확정은 동일 3-leg gap의 Lm=2 mH, turn-graded C, loss/thermal "
         "직접 FEA를 통과한 뒤에만 수행합니다."
     )
