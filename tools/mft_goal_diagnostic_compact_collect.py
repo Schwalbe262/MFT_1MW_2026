@@ -319,11 +319,26 @@ def observe_tasks(
     for entry in context["entries"]:
         try:
             detail = scheduler.get_task(int(entry["task_id"]))
+            expected_scheduler_payload = entry["scheduler_payload"]
+            requested_account = expected_scheduler_payload.get("account_name")
+            if requested_account is not None:
+                expected_scheduler_payload = {
+                    key: copy.deepcopy(value)
+                    for key, value in expected_scheduler_payload.items()
+                    if key != "account_name"
+                }
             task_id, status = offload._task_authentication(
                 detail,
-                entry["scheduler_payload"],
+                expected_scheduler_payload,
                 label="diagnostic collector GET",
             )
+            if (
+                requested_account is not None
+                and detail.get("requested_account_name") != requested_account
+            ):
+                raise RuntimeError(
+                    "diagnostic retry account placement identity changed"
+                )
             raw_exit = detail.get("exit_code")
             if isinstance(raw_exit, bool):
                 raise RuntimeError("Scheduler exit_code has invalid type")
@@ -1063,6 +1078,15 @@ def collect_once(
             "plan_file_sha256": context["plan_file_sha256"],
             "receipt_path": context["receipt_path"],
             "receipt_file_sha256": context["receipt_file_sha256"],
+            **(
+                {
+                    "logical_seed_overlay": copy.deepcopy(
+                        context["logical_seed_overlay"]
+                    )
+                }
+                if context.get("logical_seed_overlay") is not None
+                else {}
+            ),
             "expected_task_count": FINAL_SUCCESS_COUNT,
             "scheduler_status_counts": dict(sorted(statuses.items())),
             "scheduler_terminal_count": terminal_count,
