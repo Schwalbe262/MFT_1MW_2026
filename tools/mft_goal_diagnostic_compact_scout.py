@@ -73,6 +73,7 @@ PROFILE_SEED_COUNT = 100
 FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM = 5.0
 FIXED_PRIMARY_INTERTURN_GAP_MM = 1.6
 FIXED_SECONDARY_TURNS = 60
+FIXED_SECONDARY_INTERTURN_GAP_MM = 0.35
 FIXED_CORE_PLATE_THICKNESS_MM = 20.0
 FIXED_WINDING_COLD_PLATE_THICKNESS_MM = 20.0
 REQUIRED_WINDING_HEIGHT_OVERLAP_RATIO = 1.0
@@ -219,7 +220,7 @@ def _build_search_profile(
         "schema_version": SEARCH_PROFILE_SCHEMA,
         "profile_id": (
             f"l900-temp110-130-130-hard-equal-hgap{clearance}-"
-            "plates20-exact100"
+            "gap2p35-plates20-exact100"
         ),
         "fixed_primary_turns": FIXED_PRIMARY_TURNS,
         "fixed_secondary_turns": FIXED_SECONDARY_TURNS,
@@ -229,6 +230,9 @@ def _build_search_profile(
         ),
         "fixed_primary_interturn_gap_mm": (
             FIXED_PRIMARY_INTERTURN_GAP_MM
+        ),
+        "fixed_secondary_interturn_gap_mm": (
+            FIXED_SECONDARY_INTERTURN_GAP_MM
         ),
         "fixed_core_plate_thickness_mm": FIXED_CORE_PLATE_THICKNESS_MM,
         "fixed_winding_cold_plate_thickness_mm": (
@@ -307,6 +311,7 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         "turns_ratio_N2_over_N1",
         "fixed_primary_conductor_thickness_mm",
         "fixed_primary_interturn_gap_mm",
+        "fixed_secondary_interturn_gap_mm",
         "fixed_core_plate_thickness_mm",
         "fixed_winding_cold_plate_thickness_mm",
         "effective_constraint_profile",
@@ -353,7 +358,7 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         or profile.get("profile_id")
         != (
             f"l900-temp110-130-130-hard-equal-hgap{clearance}-"
-            "plates20-exact100"
+            "gap2p35-plates20-exact100"
         )
         or profile.get("fixed_primary_turns") != FIXED_PRIMARY_TURNS
         or profile.get("fixed_secondary_turns") != FIXED_SECONDARY_TURNS
@@ -362,6 +367,8 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         != FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM
         or profile.get("fixed_primary_interturn_gap_mm")
         != FIXED_PRIMARY_INTERTURN_GAP_MM
+        or profile.get("fixed_secondary_interturn_gap_mm")
+        != FIXED_SECONDARY_INTERTURN_GAP_MM
         or profile.get("fixed_core_plate_thickness_mm")
         != FIXED_CORE_PLATE_THICKNESS_MM
         or profile.get("fixed_winding_cold_plate_thickness_mm")
@@ -462,11 +469,12 @@ def _install_search_profile(
             "temperature_contract_sha256"
         ]
     coordinate_names = tuple(problem.sobol_dimension_names)
-    required_coordinates = {"gap1", "core_plate_t", "wcp_t"}
+    required_coordinates = {"gap1", "gap2", "core_plate_t", "wcp_t"}
     if not required_coordinates.issubset(coordinate_names):
         raise RuntimeError("fixed manufacturing coordinate is unavailable")
     cw1_index = int(problem.cw1_coordinate_index)
     gap1_index = coordinate_names.index("gap1")
+    gap2_index = coordinate_names.index("gap2")
     core_plate_index = coordinate_names.index("core_plate_t")
     wcp_index = coordinate_names.index("wcp_t")
     cw1_coordinate = float(
@@ -477,6 +485,11 @@ def _install_search_profile(
     gap1_coordinate = float(
         problem._unit_from_physical(
             "gap1", FIXED_PRIMARY_INTERTURN_GAP_MM
+        )
+    )
+    gap2_coordinate = float(
+        problem._unit_from_physical(
+            "gap2", FIXED_SECONDARY_INTERTURN_GAP_MM
         )
     )
     core_plate_coordinate = float(
@@ -493,6 +506,8 @@ def _install_search_profile(
     problem.xu[cw1_index] = cw1_coordinate
     problem.xl[gap1_index] = gap1_coordinate
     problem.xu[gap1_index] = gap1_coordinate
+    problem.xl[gap2_index] = gap2_coordinate
+    problem.xu[gap2_index] = gap2_coordinate
     problem.xl[core_plate_index] = core_plate_coordinate
     problem.xu[core_plate_index] = core_plate_coordinate
     problem.xl[wcp_index] = wcp_coordinate
@@ -553,6 +568,12 @@ def _install_search_profile(
                     or not math.isclose(
                         float(row["gap1"]),
                         FIXED_PRIMARY_INTERTURN_GAP_MM,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    or not math.isclose(
+                        float(row["gap2"]),
+                        FIXED_SECONDARY_INTERTURN_GAP_MM,
                         rel_tol=0.0,
                         abs_tol=1e-12,
                     )
@@ -661,6 +682,8 @@ def _install_search_profile(
             "cw1_coordinate": cw1_coordinate,
             "gap1_coordinate_index": gap1_index,
             "gap1_coordinate": gap1_coordinate,
+            "gap2_coordinate_index": gap2_index,
+            "gap2_coordinate": gap2_coordinate,
             "core_plate_t_coordinate_index": core_plate_index,
             "core_plate_t_coordinate": core_plate_coordinate,
             "wcp_t_coordinate_index": wcp_index,
@@ -738,6 +761,12 @@ def _aligned_bank_proof(
                 rel_tol=0.0,
                 abs_tol=1e-12,
             )
+            or not math.isclose(
+                float(row["gap2"]),
+                FIXED_SECONDARY_INTERTURN_GAP_MM,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
             or int(row["N1_main"]) + int(row["N1_side"])
             != FIXED_PRIMARY_TURNS
             or int(row["N2_main"]) + int(row["N2_side"])
@@ -754,6 +783,7 @@ def _aligned_bank_proof(
                 f"row={index},h_gap1={h_gap1[-1]},overlap={overlap},"
                 f"height_difference={height_differences[-1]},"
                 f"cw1={float(row['cw1'])},gap1={float(row['gap1'])},"
+                f"gap2={float(row['gap2'])},"
                 f"core_plate_t={float(row['core_plate_t'])},"
                 f"wcp_t={float(row['wcp_t'])},"
                 f"N1={int(row['N1_main']) + int(row['N1_side'])},"
@@ -783,6 +813,10 @@ def _aligned_bank_proof(
             "all_rows_repair_fixed_points": True,
             "all_rows_decoder_valid": True,
             "all_rows_manufacturing_controls_attested": True,
+            "fixed_secondary_interturn_gap_mm": (
+                FIXED_SECONDARY_INTERTURN_GAP_MM
+            ),
+            "all_rows_gap2_exactly_fixed": True,
             "maximum_exterior_W_mm": max(
                 dimensions[0] for dimensions in exterior_dimensions
             ),

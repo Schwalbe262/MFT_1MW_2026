@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import pandas as pd
+import pytest
 
 from module.mft_goal_20260726_contract import canonical_sha256
 from tools import mft_goal_20260726_launch as launch
@@ -17,13 +20,14 @@ def _profile(clearance: int = 20) -> dict:
         "schema_version": scout.SEARCH_PROFILE_SCHEMA,
         "profile_id": (
             f"l900-temp110-130-130-hard-equal-hgap{clearance}-"
-            "plates20-exact100"
+            "gap2p35-plates20-exact100"
         ),
         "fixed_primary_turns": 6,
         "fixed_secondary_turns": 60,
         "turns_ratio_N2_over_N1": 10.0,
         "fixed_primary_conductor_thickness_mm": 5.0,
         "fixed_primary_interturn_gap_mm": 1.6,
+        "fixed_secondary_interturn_gap_mm": 0.35,
         "fixed_core_plate_thickness_mm": 20.0,
         "fixed_winding_cold_plate_thickness_mm": 20.0,
         "effective_constraint_profile": effective,
@@ -95,6 +99,18 @@ def test_geometry_profile_sha_and_seed_authority_are_exact() -> None:
         )
 
 
+def test_search_profile_rejects_secondary_gap_drift() -> None:
+    profile = _profile(20)
+    unsigned = {
+        key: copy.deepcopy(value)
+        for key, value in profile.items()
+        if key != "payload_sha256"
+    }
+    unsigned["fixed_secondary_interturn_gap_mm"] = 0.351
+    with pytest.raises(RuntimeError, match="search profile mismatch"):
+        scout._validate_search_profile(launch._seal(unsigned))
+
+
 def test_l900_compact_contract_is_bound_to_effective_profile() -> None:
     effective = scout._effective_constraint_profile()
     contract = (
@@ -130,13 +146,14 @@ def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None
         ]
         sobol_dimension_names = (
             "gap1",
+            "gap2",
             "f1_split",
             "core_plate_t",
             "wcp_t",
         )
-        cw1_coordinate_index = 1
-        xl = np.zeros(4)
-        xu = np.ones(4)
+        cw1_coordinate_index = 2
+        xl = np.zeros(5)
+        xu = np.ones(5)
         constraint_names = ("base",)
         constraint_index = {"base": 0}
         n_ieq_constr = 1
@@ -161,12 +178,14 @@ def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None
         def _unit_from_physical(name, value):
             expected = {
                 "gap1": 1.6,
+                "gap2": 0.35,
                 "core_plate_t": 20.0,
                 "wcp_t": 20.0,
             }
             assert value == expected[name]
             return {
                 "gap1": 0.25,
+                "gap2": 0.35,
                 "core_plate_t": 0.5,
                 "wcp_t": 0.75,
             }[name]
@@ -188,6 +207,7 @@ def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None
                 {
                     "cw1": np.full(count, 5.0),
                     "gap1": np.full(count, 1.6),
+                    "gap2": np.full(count, 0.35),
                     "core_plate_t": np.full(count, 20.0),
                     "wcp_t": np.full(count, 20.0),
                     "N1_main": np.full(count, 6),
@@ -200,9 +220,11 @@ def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None
     problem = Problem()
     evidence = scout._install_search_profile(problem, profile)
     out = {}
-    problem._evaluate(np.zeros((2, 4)), out)
+    problem._evaluate(np.zeros((2, 5)), out)
     assert evidence["raw_C_rx_rx_F_UCB_gate_installed"] is True
     assert problem.constraint_names[-1] == scout.RAW_CRX_CONSTRAINT_NAME
     assert out["G"].shape == (2, 2)
     assert np.all(out["G"][:, -1] < 0.0)
     assert np.all(problem.xl == problem.xu)
+    assert evidence["gap2_coordinate_index"] == 1
+    assert evidence["gap2_coordinate"] == 0.35
