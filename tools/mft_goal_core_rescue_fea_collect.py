@@ -498,6 +498,19 @@ def _make_record(
     )
     f_tx = _finite(result.get("f_res_tx_self_Hz"))
     f_rx_turn_graded = _finite(result.get("f_res_rx_turn_graded_Hz"))
+    rx_main_loss = _finite(result.get("P_Rx_main_group"))
+    rx_side_loss = _finite(result.get("P_Rx_side_total"))
+    winding_loss = _finite(result.get("P_winding_total"))
+    rx_loss = (
+        None
+        if rx_main_loss is None or rx_side_loss is None
+        else rx_main_loss + rx_side_loss
+    )
+    tx_loss = (
+        None
+        if winding_loss is None or rx_loss is None
+        else winding_loss - rx_loss
+    )
     resonance_pass = (
         f_tx is not None
         and f_rx_turn_graded is not None
@@ -581,8 +594,8 @@ def _make_record(
         "f_interwinding_Hz": _finite(
             result.get("f_res_interwinding_Hz")
         ),
-        "Tx_loss_W": _finite(result.get("Tx_loss")),
-        "Rx_loss_W": _finite(result.get("Rx_loss")),
+        "Tx_loss_W": tx_loss,
+        "Rx_loss_W": rx_loss,
         "core_loss_W": _finite(result.get("P_core_total")),
         "T_max_Tx_C": tx_temp,
         "T_max_Rx_main_C": rx_main_temp,
