@@ -1271,6 +1271,204 @@ def prepare_successors(
     return _write(destination / "plan.json", plan)
 
 
+def prepare_exact_gap_successors(
+    source_plan_path: Path,
+    output: Path,
+    *,
+    solver_revision: str,
+    requested_gaps: Iterable[str],
+) -> Path:
+    """Prepare full-physics successors at interpolated physical gaps."""
+    solver = str(solver_revision).strip().lower()
+    if not HEX40.fullmatch(solver):
+        raise FeederError("full 40-character solver revision required")
+    source_path = source_plan_path.resolve(strict=True)
+    source_root = source_path.parent
+    source_plan = _validate_seal(_read(source_path), SCHEMA)
+    destination = output.resolve()
+    if destination.exists():
+        raise FeederError(f"output exists: {destination}")
+
+    gap_by_candidate: dict[str, float] = {}
+    for raw in requested_gaps:
+        candidate_sha, separator, gap_text = str(raw).partition("=")
+        candidate_sha = candidate_sha.strip().lower()
+        if (
+            not separator
+            or not re.fullmatch(r"[0-9a-f]{64}", candidate_sha)
+            or candidate_sha in gap_by_candidate
+        ):
+            raise FeederError(
+                "each --gap must be a unique CANDIDATE_SHA256=GAP_MM"
+            )
+        try:
+            gap_mm = float(gap_text)
+        except ValueError as exc:
+            raise FeederError("exact physical gap is not numeric") from exc
+        if not math.isfinite(gap_mm) or not 0.0 < gap_mm < 5.0:
+            raise FeederError("exact physical gap must be in (0, 5) mm")
+        gap_by_candidate[candidate_sha] = gap_mm
+    if not gap_by_candidate:
+        raise FeederError("at least one exact candidate gap is required")
+
+    full_sources: dict[str, Mapping[str, Any]] = {}
+    for lane in source_plan["lanes"]:
+        candidate_sha = str(lane["candidate_sha256"]).lower()
+        if (
+            candidate_sha in gap_by_candidate
+            and lane["mode"] == "matrix_turngraded_cap_loss_thermal"
+        ):
+            if candidate_sha in full_sources:
+                raise FeederError(
+                    f"duplicate full source lane for {candidate_sha}"
+                )
+            full_sources[candidate_sha] = lane
+    if set(full_sources) != set(gap_by_candidate):
+        missing = sorted(set(gap_by_candidate) - set(full_sources))
+        raise FeederError(f"full source lanes are missing: {missing}")
+
+    destination.mkdir(parents=True)
+    lanes: list[dict[str, Any]] = []
+    profile_records: dict[str, dict[str, Any]] = {}
+    for lane_index, candidate_sha in enumerate(sorted(gap_by_candidate), start=1):
+        source_lane = full_sources[candidate_sha]
+        params_path = (source_root / source_lane["params"]["path"]).resolve(
+            strict=True
+        )
+        profile_path = (source_root / source_lane["profile"]["path"]).resolve(
+            strict=True
+        )
+        if (
+            _file_sha(params_path) != source_lane["params"]["sha256"]
+            or _file_sha(profile_path) != source_lane["profile"]["sha256"]
+        ):
+            raise FeederError("exact-gap source lane file SHA drifted")
+        params = _read(params_path)
+        profile = _read(profile_path)
+        gap_mm = gap_by_candidate[candidate_sha]
+        params["core_center_gap_mm"] = gap_mm
+        params["core_equal_three_leg_air_gap"] = 1
+        ok, validated = validation_check(
+            create_input_parameter(params), strict=True
+        )
+        if not ok:
+            raise FeederError("exact-gap successor params failed validation")
+        readback = validated.iloc[0]
+        if (
+            not math.isclose(
+                float(readback["core_center_gap_mm"]),
+                gap_mm,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or int(readback["core_equal_three_leg_air_gap"]) != 1
+            or int(readback["core_air_gap_gapped_leg_count"]) != 3
+            or int(readback["round_corner"]) != 0
+            or int(readback["full_model"]) != 0
+            or str(readback["thermal_symmetry"]) != "eighth"
+            or float(readback["core_plate_t"]) != 20.0
+            or float(readback["wcp_t"]) != 20.0
+            or float(readback["fan_velocity"]) != 1.5
+        ):
+            raise FeederError("exact-gap physical contract drifted")
+        effective = {
+            key: _builtin(readback[key])
+            for key in sorted(ALL_INPUT_KEYS)
+        }
+        effective_path = _write(
+            destination / "params" / f"lane-{lane_index:02d}.json",
+            effective,
+        )
+        profile_sha = _file_sha(profile_path)
+        if profile_sha not in profile_records:
+            copied_profile = _write(
+                destination / "profiles" / f"{profile_sha[:16]}.json",
+                profile,
+            )
+            profile_records[profile_sha] = _record(
+                copied_profile, destination
+            )
+        gap_token = f"{int(round(gap_mm * 1_000_000)):08d}"
+        name = (
+            f"mft-core-exact-{lane_index:02d}-full-"
+            f"g{gap_token}-{candidate_sha[:10]}"
+        )
+        workdir = (
+            f"mft_core_exact_{lane_index:02d}_full_"
+            f"g{gap_token}_{candidate_sha[:10]}"
+        )
+        identity = scheduler_client.verification_submission_identity(
+            name,
+            effective,
+            profile,
+            solver,
+            source_plan["library_revision"],
+        )
+        source_scheduler = source_lane["scheduler"]
+        lanes.append(
+            {
+                "lane_index": lane_index,
+                "candidate_index": source_lane.get("candidate_index"),
+                "candidate_sha256": candidate_sha,
+                "source_lane_index": int(source_lane["lane_index"]),
+                "source_plan_payload_sha256": source_plan["payload_sha256"],
+                "core_center_gap_mm": gap_mm,
+                "core_equal_three_leg_air_gap": 1,
+                "expected_gapped_leg_count": 3,
+                "mode": "matrix_turngraded_cap_loss_thermal",
+                "params": _record(effective_path, destination),
+                "params_sha256": _sha(effective),
+                "profile": profile_records[profile_sha],
+                "scheduler": {
+                    "project": scheduler_client.MFT_PROJECT,
+                    "name": name,
+                    "workdir": workdir,
+                    "dedupe_key": identity["dedupe_key"],
+                    "parameter_digest": identity["parameter_digest"],
+                    "effective_params_sha256": _sha(identity["merged"]),
+                    "cpus": int(source_scheduler["cpus"]),
+                    "memory_mb": int(source_scheduler["memory_mb"]),
+                    "timeout_seconds": int(profile["timeout_seconds"]),
+                    "priority": int(source_scheduler["priority"]),
+                    "max_workers_per_node": int(
+                        source_scheduler["max_workers_per_node"]
+                    ),
+                    "environment": _core_environment(solver),
+                },
+            }
+        )
+    plan = _seal(
+        {
+            "schema_version": SCHEMA,
+            "created_at_utc": _now(),
+            "source": {
+                "root": str(source_root),
+                "plan": _record(source_path, source_root),
+                "plan_payload_sha256": source_plan["payload_sha256"],
+                "selection_method": (
+                    "inverse_inductance_two_point_interpolation"
+                ),
+            },
+            "solver_revision": solver,
+            "library_revision": source_plan["library_revision"],
+            "regression_contract": {
+                "native_eighth_to_full_inductance_scale": 2.0,
+                "target_physical_Lm_mH": 2.0,
+                "equal_identical_physical_gap_all_three_legs": True,
+                "expected_gapped_leg_count": 3,
+                "full_direct_physics_at_interpolated_gap": True,
+            },
+            "lanes": lanes,
+            "parallel_execution_requested": len(lanes) > 1,
+            "scheduler_project_source_included": False,
+            "scheduler_project_modified": False,
+            "scheduler_submission_performed": False,
+            "final_promotion_allowed": False,
+        }
+    )
+    return _write(destination / "plan.json", plan)
+
+
 def submit(plan_path: Path, output: Path, *, apply: bool) -> Path:
     plan = _validate_seal(_read(plan_path), SCHEMA)
     root = plan_path.resolve(strict=True).parent
@@ -1386,6 +1584,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     successor_parser.add_argument(
         "--solver-revision", required=True
     )
+    exact_parser = sub.add_parser("prepare-exact")
+    exact_parser.add_argument("--source-plan", type=Path, required=True)
+    exact_parser.add_argument("--output", type=Path, required=True)
+    exact_parser.add_argument("--solver-revision", required=True)
+    exact_parser.add_argument(
+        "--gap",
+        action="append",
+        required=True,
+        help="repeat CANDIDATE_SHA256=GAP_MM",
+    )
     submit_parser = sub.add_parser("submit")
     submit_parser.add_argument("--plan", type=Path, required=True)
     submit_parser.add_argument("--output", type=Path, required=True)
@@ -1398,6 +1606,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     elif args.command == "prepare-successors":
         path = prepare_successors(
             args.output, solver_revision=args.solver_revision
+        )
+    elif args.command == "prepare-exact":
+        path = prepare_exact_gap_successors(
+            args.source_plan,
+            args.output,
+            solver_revision=args.solver_revision,
+            requested_gaps=args.gap,
         )
     else:
         path = submit(args.plan, args.output, apply=args.apply)
