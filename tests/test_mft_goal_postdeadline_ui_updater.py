@@ -498,14 +498,15 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
     sync = updater.validate_status_sync(merged)
     ids = [item["id"] for item in merged["current"]]
 
-    assert ids[:5] == [
+    assert ids[:6] == [
         updater.PRIMARY_5T_RECOVERY_CARD_ID,
+        updater.EXACT_N1_6_CORRECTED_GUI_FEA_CARD_ID,
         updater.EXACT_N1_6_GUI_FEA_CARD_ID,
         updater.TARGET_AXIS_CARD_ID,
         updater.REFERENCE_BASELINE_CARD_ID,
         updater.AXIS_V6_CARD_ID,
     ]
-    target = merged["current"][2]
+    target = merged["current"][3]
     assert "W1200/L1000 NSGA-II" in target["title"]
     assert "FINAL528" in target["title"]
     assert "FRESH OK0 RUN0 Q512 FAIL0" in target["title"]
@@ -525,7 +526,7 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
         value.startswith("fresh N1=") and "seeds=128" in value
         for value in target["evidence"]
     ) == 4
-    axis = merged["current"][4]
+    axis = merged["current"][5]
     assert "SUPERSEDED HISTORICAL WRONG AXIS" in axis["title"]
     assert "RUNNING 15" in axis["title"]
     assert "SUCCEEDED 1" in axis["title"]
@@ -542,7 +543,7 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
         and "generations=80" in value
         for value in axis["evidence"]
     )
-    reference = merged["current"][3]
+    reference = merged["current"][4]
     assert "THERMAL MESH RUNNING" in reference["title"]
     assert "REMOTE96415 DIRECT RUNNING n111/j840787" in reference["title"]
     assert "LOCAL" in reference["title"]
@@ -609,7 +610,7 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
     ) < 256 * 1024
 
 
-def test_exact_n1_6_gui_fea_card_preserves_truth_boundary(
+def test_old_exact_n1_6_gui_fea_card_preserves_truth_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -633,22 +634,15 @@ def test_exact_n1_6_gui_fea_card_preserves_truth_boundary(
         },
     )
 
-    card = updater._exact_n1_6_gui_fea_card(
-        OBSERVED,
-        corrected_canary_task={
-            "state": "running",
-            "actual_node_name": "n114",
-            "slurm_job_id": "844341",
-            "allocation_id": 14713,
-        },
-    )
+    card = updater._exact_n1_6_gui_fea_card(OBSERVED)
 
     assert card["id"] == updater.EXACT_N1_6_GUI_FEA_CARD_ID
     assert len(card["title"]) <= 160
     assert "DIAGNOSTIC THERMAL INVALID" in card["title"]
-    assert "EXACT 6/60" in card["title"]
+    assert "OLD LOCAL EXACT 6/60" in card["title"]
     assert "interf153/150 WALL + 5000K" in card["title"]
-    assert "CANARY97041 RUNNING n114/j844341" in card["title"]
+    assert "NOT DESIGN FAILURE" in card["title"]
+    assert "CANARY97041" not in card["title"]
     assert card["state"] == "in_progress"
     assert any(
         updater.EXACT_N1_6_GUI_GEOMETRY_SHA256 in value
@@ -670,10 +664,115 @@ def test_exact_n1_6_gui_fea_card_preserves_truth_boundary(
         and "limiter=5000 K" in value
         for value in card["evidence"]
     )
+
+
+def test_corrected_exact_n1_6_gui_card_reports_native_stage_without_thermal_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_root = tmp_path / "simulation" / "simulation1"
+    run_root.mkdir(parents=True)
+    project = run_root / "simulation1.aedt"
+    project.write_bytes(b"aedt")
+    (tmp_path / "corrected_gui_stdout.log").write_text(
+        'SOLVER_CORE_DISPATCH_JSON {"stage":"matrix"}\n'
+        "PyAEDT INFO: Solving design setup Setup1\n"
+        "PyAEDT INFO: Design setup Setup1 solved correctly in 77s\n"
+        'SOLVER_CORE_DISPATCH_JSON {"stage":"cap"}\n'
+        "PyAEDT INFO: Solving design setup Setup1\n",
+        encoding="utf-8",
+    )
+    receipt = {
+        "schema": "mft-corrected-visible-gui-launch-receipt-v1",
+        "controller_pid": updater.EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID,
+        "aedt_pid": updater.EXACT_N1_6_CORRECTED_GUI_AEDT_PID,
+        "grpc_port": updater.EXACT_N1_6_CORRECTED_GUI_GRPC_PORT,
+        "grpc_port_listen_owner_pid": (
+            updater.EXACT_N1_6_CORRECTED_GUI_AEDT_PID
+        ),
+        "project_path": str(project.resolve()),
+        "canonical_geometry_sha256": (
+            updater.EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256
+        ),
+        "model": "symmetric_eighth_nonrounded",
+        "turns_primary": 6,
+        "turns_secondary_total": 60,
+        "solver_core_contract": "default-four-core-cap-v1",
+        "solver_core_affinity_readback": 4,
+    }
+    (tmp_path / "corrected_gui_launch_receipt.json").write_text(
+        json.dumps(receipt),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        updater,
+        "_windows_process_snapshot",
+        lambda: {
+            updater.EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID: (
+                1,
+                "python.exe",
+            ),
+            updater.EXACT_N1_6_CORRECTED_GUI_AEDT_PID: (
+                updater.EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID,
+                "ansysedt.exe",
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        updater,
+        "_pid_exists",
+        lambda pid: pid
+        in {
+            updater.EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID,
+            updater.EXACT_N1_6_CORRECTED_GUI_AEDT_PID,
+        },
+    )
+
+    card = updater._corrected_n1_6_gui_fea_card(
+        OBSERVED,
+        corrected_canary_task={
+            "state": "running",
+            "actual_node_name": "n114",
+            "slurm_job_id": "844341",
+            "allocation_id": 14713,
+        },
+        root=tmp_path,
+    )
+
+    assert card["id"] == updater.EXACT_N1_6_CORRECTED_GUI_FEA_CARD_ID
+    assert len(card["title"]) <= 160
+    assert "CORRECTED VISIBLE GUI" in card["title"]
+    assert "EXACT 6/60" in card["title"]
+    assert "CAP NATIVE RUNNING" in card["title"]
+    assert "4-CORE" in card["title"]
+    assert "CANARY97041 RUNNING n114/j844341" in card["title"]
+    assert card["state"] == "in_progress"
+    assert any(
+        "receipt_verified=true" in value
+        and "gRPC port 64321" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "native solver readback=CAP RUNNING" in value
+        and "completed stages=matrix" in value
+        and "local solver cores=4" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "local thermal dispatch observed=false" in value
+        and "Rx native preflight marker observed=false" in value
+        and "temperatures=pending" in value
+        for value in card["evidence"]
+    )
     assert any(
         "task97041=RUNNING" in value
         and "node=n114" in value
         and "Slurm job=844341" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "scientific_valid=pending" in value
+        and "production_eligible=false" in value
         for value in card["evidence"]
     )
 

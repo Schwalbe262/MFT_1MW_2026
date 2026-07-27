@@ -728,6 +728,9 @@ AXIS_V6_CARD_ID = "codex-axis-v6-fixed-5t-nsga"
 TARGET_AXIS_CARD_ID = "codex-target-axis-1200x1000-nsga"
 REFERENCE_BASELINE_CARD_ID = "codex-reference-drawing-baseline"
 EXACT_N1_6_GUI_FEA_CARD_ID = "codex-exact-n1-6-gui-fea"
+EXACT_N1_6_CORRECTED_GUI_FEA_CARD_ID = (
+    "codex-exact-n1-6-corrected-gui-fea"
+)
 LASTMILE_ACQUISITION_CARD_ID = "codex-primary-temperature-lastmile-p90"
 LASTMILE_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
@@ -760,6 +763,13 @@ EXACT_N1_6_GUI_CONTROLLER_PID = 3_224
 EXACT_N1_6_GUI_AEDT_PID = 48_360
 EXACT_N1_6_GUI_INITIAL_GAP_MM = 0.65
 EXACT_N1_6_GUI_THERMAL_MESH_SECONDS = 1_075.99
+EXACT_N1_6_CORRECTED_GUI_ROOT = Path(
+    r"C:\w\mft-gui-6x60-corrected-b6-g065"
+)
+EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID = 50_132
+EXACT_N1_6_CORRECTED_GUI_AEDT_PID = 45_568
+EXACT_N1_6_CORRECTED_GUI_GRPC_PORT = 64_321
+EXACT_N1_6_CORRECTED_GUI_SOLVER_CORES = 4
 EXACT_N1_6_CORRECTED_CANARY_TASK_ID = 97_041
 EXACT_N1_6_CORRECTED_CANARY_TASK_NAME = (
     "mft-goal-rx-shared-interface-canary-v1"
@@ -3275,9 +3285,8 @@ def _descendant_processes(
 
 def _exact_n1_6_gui_fea_card(
     observed_at: str,
-    corrected_canary_task: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Expose invalid local thermal truth and its corrected canary separately."""
+    """Expose the old invalid local thermal attempt without rejecting the design."""
 
     snapshot = _windows_process_snapshot()
     controller = snapshot.get(EXACT_N1_6_GUI_CONTROLLER_PID)
@@ -3293,51 +3302,32 @@ def _exact_n1_6_gui_fea_card(
         and aedt[0] == EXACT_N1_6_GUI_CONTROLLER_PID
         and aedt[1].lower() == "ansysedt.exe"
     )
-    if corrected_canary_task is None:
-        canary_state = "submitted"
-        canary_node = "pending"
-        canary_job = "pending"
-        canary_allocation = "pending"
-    else:
-        canary_state = str(corrected_canary_task["state"])
-        canary_node = (
-            str(corrected_canary_task["actual_node_name"]) or "pending"
-        )
-        canary_job = (
-            str(corrected_canary_task["slurm_job_id"]) or "pending"
-        )
-        canary_allocation = (
-            str(corrected_canary_task["allocation_id"]) or "pending"
-        )
     return {
         "id": EXACT_N1_6_GUI_FEA_CARD_ID,
         "title": (
-            "DIAGNOSTIC THERMAL INVALID | EXACT 6/60 | "
-            "interf153/150 WALL + 5000K | "
-            f"CANARY97041 {canary_state.upper()} {canary_node}/j{canary_job}"
+            "DIAGNOSTIC THERMAL INVALID | OLD LOCAL EXACT 6/60 | "
+            "interf153/150 WALL + 5000K | NOT DESIGN FAILURE"
         ),
         "detail": (
-            "The exact 6/60 symmetric local thermal result is invalid because "
-            "Rx_main auto-pair failures left interf153/interf150 as walls and "
-            "the affected zones reached the 5000 K emergency limiter. This is "
-            "a thermal mesh/interface setup failure, not evidence that the "
-            "physical design violates its temperature limits. It is not "
-            "scientific or production truth. Corrected shared-region canary "
-            f"task97041 is {canary_state.upper()} on {canary_node}; terminal "
-            "native interface coverage and limiter-free temperatures remain "
-            "pending."
+            "The old exact 6/60 symmetric local thermal attempt is invalid "
+            "because Rx_main auto-pair failures left interf153/interf150 as "
+            "walls and the affected zones reached the 5000 K emergency "
+            "limiter. This is a thermal mesh/interface setup failure, not "
+            "evidence that the physical design violates its temperature "
+            "limits. The attempt is retained as diagnostic evidence only and "
+            "is not scientific or production truth."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 92,
+        "progress_pct": 100,
         "evidence": [
             (
-                f"local label=seed{EXACT_N1_6_GUI_SEED}/e5b4 / historical "
+                f"old local label=seed{EXACT_N1_6_GUI_SEED}/e5b4 / historical "
                 f"geometry label={EXACT_N1_6_GUI_GEOMETRY_SHA256} / "
                 f"source task={EXACT_N1_6_GUI_SOURCE_TASK_ID}"
             ),
             (
-                "local diagnostic status=DIAGNOSTIC THERMAL INVALID / "
+                "old local diagnostic status=DIAGNOSTIC THERMAL INVALID / "
                 "production_eligible=false / scientific_valid=false"
             ),
             (
@@ -3357,10 +3347,268 @@ def _exact_n1_6_gui_fea_card(
                 "round_corner=0 / N1/N2=6/60 / cw1=5.0mm / gap1=1.6mm"
             ),
             (
-                f"local controller PID{EXACT_N1_6_GUI_CONTROLLER_PID} "
+                f"old local controller PID{EXACT_N1_6_GUI_CONTROLLER_PID} "
                 f"active={str(controller_active).lower()} / "
                 f"AEDT PID{EXACT_N1_6_GUI_AEDT_PID} "
-                f"active={str(aedt_active).lower()} / no process mutation"
+                f"active={str(aedt_active).lower()} / observation only"
+            ),
+        ],
+    }
+
+
+def _bounded_log_tail(path: Path, limit: int = MAX_RESPONSE_BYTES) -> str:
+    """Read at most ``limit`` bytes from the end of a local solver log."""
+
+    try:
+        resolved = path.resolve()
+        if not resolved.is_file() or resolved.is_symlink():
+            return ""
+        size = resolved.stat().st_size
+        with resolved.open("rb") as stream:
+            if size > limit:
+                stream.seek(size - limit)
+            payload = stream.read(limit + 1)
+    except OSError:
+        return ""
+    return payload[-limit:].decode("utf-8", errors="replace")
+
+
+def _corrected_n1_6_gui_launch_receipt(
+    root: Path = EXACT_N1_6_CORRECTED_GUI_ROOT,
+) -> dict[str, Any] | None:
+    """Read and fail-close the immutable visible-GUI launch identity."""
+
+    receipt_path = root.resolve() / "corrected_gui_launch_receipt.json"
+    try:
+        if (
+            not receipt_path.is_file()
+            or receipt_path.is_symlink()
+            or receipt_path.stat().st_size > MAX_RESPONSE_BYTES
+        ):
+            return None
+        value = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    expected = {
+        "schema": "mft-corrected-visible-gui-launch-receipt-v1",
+        "controller_pid": EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID,
+        "aedt_pid": EXACT_N1_6_CORRECTED_GUI_AEDT_PID,
+        "grpc_port": EXACT_N1_6_CORRECTED_GUI_GRPC_PORT,
+        "grpc_port_listen_owner_pid": EXACT_N1_6_CORRECTED_GUI_AEDT_PID,
+        "canonical_geometry_sha256": (
+            EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256
+        ),
+        "model": "symmetric_eighth_nonrounded",
+        "turns_primary": 6,
+        "turns_secondary_total": 60,
+        "solver_core_contract": "default-four-core-cap-v1",
+        "solver_core_affinity_readback": (
+            EXACT_N1_6_CORRECTED_GUI_SOLVER_CORES
+        ),
+    }
+    if any(value.get(key) != expected_value for key, expected_value in expected.items()):
+        return None
+    expected_project = (
+        root.resolve()
+        / "simulation"
+        / "simulation1"
+        / "simulation1.aedt"
+    )
+    try:
+        receipt_project = Path(str(value.get("project_path") or "")).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if receipt_project != expected_project:
+        return None
+    return value
+
+
+def _corrected_n1_6_gui_solver_stage(
+    root: Path = EXACT_N1_6_CORRECTED_GUI_ROOT,
+) -> dict[str, Any]:
+    """Classify only stages proven by bounded native-dispatch log markers."""
+
+    stdout_tail = _bounded_log_tail(
+        root.resolve() / "corrected_gui_stdout.log"
+    )
+    dispatch_matches = list(
+        re.finditer(
+            r'SOLVER_CORE_DISPATCH_JSON\s+\{[^\r\n]*'
+            r'"stage"\s*:\s*"(matrix|cap|loss|thermal)"',
+            stdout_tail,
+        )
+    )
+    if not dispatch_matches:
+        return {
+            "stage": "modeling",
+            "state": "preparing",
+            "completed_stages": [],
+            "thermal_dispatch_observed": False,
+            "thermal_preflight_observed": False,
+            "stdout_available": bool(stdout_tail),
+        }
+    latest = dispatch_matches[-1]
+    stage = latest.group(1)
+    after_dispatch = stdout_tail[latest.end() :]
+    solve_started = "Solving design setup" in after_dispatch
+    solve_completed = "solved correctly" in after_dispatch
+    completed_stages: list[str] = []
+    for index, match in enumerate(dispatch_matches):
+        stage_end = (
+            dispatch_matches[index + 1].start()
+            if index + 1 < len(dispatch_matches)
+            else len(stdout_tail)
+        )
+        if "solved correctly" in stdout_tail[match.end() : stage_end]:
+            completed_stages.append(match.group(1))
+    if solve_completed:
+        state = "completed"
+    elif solve_started:
+        state = "running"
+    else:
+        state = "dispatching"
+    return {
+        "stage": stage,
+        "state": state,
+        "completed_stages": completed_stages,
+        "thermal_dispatch_observed": any(
+            match.group(1) == "thermal" for match in dispatch_matches
+        ),
+        "thermal_preflight_observed": (
+            "THERMAL_RX_INTERFACE_PREFLIGHT_JSON=" in stdout_tail
+        ),
+        "stdout_available": True,
+    }
+
+
+def _corrected_n1_6_gui_fea_card(
+    observed_at: str,
+    corrected_canary_task: Mapping[str, Any] | None = None,
+    *,
+    root: Path = EXACT_N1_6_CORRECTED_GUI_ROOT,
+) -> dict[str, Any]:
+    """Expose the clean corrected visible GUI without pre-claiming thermal truth."""
+
+    snapshot = _windows_process_snapshot()
+    controller = snapshot.get(EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID)
+    aedt = snapshot.get(EXACT_N1_6_CORRECTED_GUI_AEDT_PID)
+    controller_active = (
+        _pid_exists(EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID)
+        and controller is not None
+        and controller[1].lower() in {"python.exe", "pythonw.exe"}
+    )
+    aedt_active = (
+        _pid_exists(EXACT_N1_6_CORRECTED_GUI_AEDT_PID)
+        and aedt is not None
+        and aedt[0] == EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID
+        and aedt[1].lower() == "ansysedt.exe"
+    )
+    receipt = _corrected_n1_6_gui_launch_receipt(root)
+    receipt_verified = receipt is not None
+    project_path = (
+        root.resolve() / "simulation" / "simulation1" / "simulation1.aedt"
+    )
+    project_exists = project_path.is_file()
+    stage = _corrected_n1_6_gui_solver_stage(root)
+    if corrected_canary_task is None:
+        canary_state = "submitted"
+        canary_node = "pending"
+        canary_job = "pending"
+        canary_allocation = "pending"
+    else:
+        canary_state = str(corrected_canary_task["state"])
+        canary_node = (
+            str(corrected_canary_task["actual_node_name"]) or "pending"
+        )
+        canary_job = (
+            str(corrected_canary_task["slurm_job_id"]) or "pending"
+        )
+        canary_allocation = (
+            str(corrected_canary_task["allocation_id"]) or "pending"
+        )
+    stage_label = str(stage["stage"]).upper()
+    stage_state = str(stage["state"]).upper()
+    process_state = (
+        "ACTIVE"
+        if controller_active and aedt_active and receipt_verified
+        else "IDENTITY CHECK"
+    )
+    progress_by_stage = {
+        "modeling": 10,
+        "matrix": 25,
+        "cap": 40,
+        "loss": 60,
+        "thermal": 80,
+    }
+    progress = progress_by_stage.get(str(stage["stage"]), 10)
+    if stage["state"] == "completed":
+        progress += 5
+    return {
+        "id": EXACT_N1_6_CORRECTED_GUI_FEA_CARD_ID,
+        "title": (
+            "CORRECTED VISIBLE GUI | EXACT 6/60 | "
+            f"{stage_label} NATIVE {stage_state} | 4-CORE | {process_state} | "
+            f"CANARY97041 {canary_state.upper()} {canary_node}/j{canary_job}"
+        ),
+        "detail": (
+            "A fresh corrected exact 6/60 symmetric, eighth, nonrounded GUI "
+            f"full-chain run is active at the {stage_label} native "
+            f"{str(stage['state']).lower()} stage with a four-core local "
+            "solver contract. This is operational progress only. Thermal "
+            "dispatch, native Rx interface preflight, limiter-free "
+            "temperatures, and scientific validity remain pending unless "
+            "their explicit markers are shown below. Corrected Slurm canary "
+            f"task97041 is {canary_state.upper()} on {canary_node}."
+        ),
+        "state": (
+            "in_progress"
+            if controller_active and aedt_active and receipt_verified
+            else "attention"
+        ),
+        "updated_at": observed_at,
+        "progress_pct": progress,
+        "evidence": [
+            (
+                "corrected visible GUI identity: controller PID"
+                f"{EXACT_N1_6_CORRECTED_GUI_CONTROLLER_PID} "
+                f"active={str(controller_active).lower()} / AEDT PID"
+                f"{EXACT_N1_6_CORRECTED_GUI_AEDT_PID} "
+                f"active={str(aedt_active).lower()} / gRPC port "
+                f"{EXACT_N1_6_CORRECTED_GUI_GRPC_PORT} launch-receipt "
+                f"owner PID={EXACT_N1_6_CORRECTED_GUI_AEDT_PID} / "
+                f"receipt_verified={str(receipt_verified).lower()}"
+            ),
+            (
+                f"project={project_path} / exists="
+                f"{str(project_exists).lower()}"
+            ),
+            (
+                "topology=symmetric eighth / full_model=0 / round_corner=0 / "
+                "N1/N2=6/60 / cw1=5.0mm / gap1=1.6mm / "
+                "core_center_gap=0.65mm"
+            ),
+            (
+                "canonical geometry SHA256="
+                f"{EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256}"
+            ),
+            (
+                f"native solver readback={stage_label} {stage_state} / "
+                "completed stages="
+                f"{','.join(stage['completed_stages']) or 'none'} / "
+                f"local solver cores={EXACT_N1_6_CORRECTED_GUI_SOLVER_CORES}"
+            ),
+            (
+                "local thermal dispatch observed="
+                f"{str(stage['thermal_dispatch_observed']).lower()} / "
+                "Rx native preflight marker observed="
+                f"{str(stage['thermal_preflight_observed']).lower()} / "
+                "native interface coverage=pending / temperatures=pending"
+            ),
+            (
+                "fixed cooling unchanged: dual fan 1.5m/s / "
+                "core+winding TIM 2.0mm / k=0.2W/mK"
             ),
             (
                 f"corrected canary task97041={canary_state.upper()} / "
@@ -3378,12 +3626,13 @@ def _exact_n1_6_gui_fea_card(
                 f"{EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256}"
             ),
             (
-                "fixed cooling unchanged: dual fan 1.5m/s / "
-                "core+winding TIM 2.0mm / k=0.2W/mK"
+                "scientific_valid=pending / production_eligible=false / "
+                "paired native interfaces + no 4990K limiter + authenticated "
+                "temperatures are required before any PASS"
             ),
             (
-                "corrected canary terminal pending: paired native interfaces "
-                "+ no 4990K limiter + scientific_valid=true are all required"
+                "observation mode=read-only / Scheduler method=GET / "
+                "solver process mutation=false"
             ),
         ],
     }
@@ -4718,7 +4967,11 @@ def merge_status(
         _remove_current_card(result, REFERENCE_BASELINE_CARD_ID)
     _upsert_priority_current_card(
         result,
-        _exact_n1_6_gui_fea_card(
+        _exact_n1_6_gui_fea_card(observed_at),
+    )
+    _upsert_priority_current_card(
+        result,
+        _corrected_n1_6_gui_fea_card(
             observed_at,
             corrected_canary_task=corrected_canary_task,
         ),
