@@ -458,6 +458,7 @@ def _validate_terminal_table(
         "source_task_id",
         "source_bundle_id",
         "source_island_id",
+        "evaluation_spec_sha256",
         "evaluation_temperature_contract_sha256",
         "evaluation_hard_constraint_contract_sha256",
     }
@@ -503,6 +504,14 @@ def _validate_terminal_table(
         != activation["source_identity"]["dataset_sha256"]
         or identities["evaluation_model_sha256"]
         != activation["source_identity"]["evaluation_model_sha256"]
+        or identities["constraint_spec_sha256"]
+        != task["stage_spec_sha256"]
+        or identities["cooling_contract_sha256"]
+        != preflight.GOAL_FIXED_COOLING_IDENTITY_SHA256
+        or identities["operating_point_sha256"]
+        != preflight.GOAL_FIXED_OPERATING_IDENTITY_SHA256
+        or common._one_string(frame, "evaluation_spec_sha256")
+        != task["stage_spec_sha256"]
         or common._one_string(
             frame, "evaluation_temperature_contract_sha256"
         )
@@ -763,7 +772,13 @@ def terminal_population_manifest(
     """Adapt authenticated corrected collections to the global NDS contract."""
 
     ordered = sorted(
-        (copy.deepcopy(dict(record)) for record in records),
+        (
+            common._validate_sealed(
+                copy.deepcopy(dict(record)),
+                schema=COLLECTION_RECORD_SCHEMA,
+            )
+            for record in records
+        ),
         key=lambda record: int(record["seed"]),
     )
     if not ordered:

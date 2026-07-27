@@ -25,8 +25,12 @@ def identities() -> dict[str, str]:
         "dataset_sha256": _digest(101),
         "evaluation_model_sha256": _digest(102),
         "constraint_spec_sha256": _digest(103),
-        "cooling_contract_sha256": _digest(104),
-        "operating_point_sha256": _digest(105),
+        "cooling_contract_sha256": (
+            preflight.GOAL_FIXED_COOLING_IDENTITY_SHA256
+        ),
+        "operating_point_sha256": (
+            preflight.GOAL_FIXED_OPERATING_IDENTITY_SHA256
+        ),
     }
 
 
@@ -49,6 +53,7 @@ def _task(
         "seed": seed,
         "campaign_id": lane.CAMPAIGN_ID,
         "payload_sha256": _digest(1_000_000 + seed),
+        "stage_spec_sha256": identities["constraint_spec_sha256"],
         "temperature_contract_sha256": temperature,
         "hard_constraint_contract_sha256": hard,
         "manufacturing_search_profile": profile,
