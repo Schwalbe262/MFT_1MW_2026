@@ -855,7 +855,7 @@ NEW_AXIS_COMPACT_SURROGATE_MIN_WINDING_C = 302.67
 COMPACT_DESIGN_CONTRACT_COMMIT = "ccdaa7d"
 COMPACT_SEARCH_READINESS_COMMIT = "bc63ec5"
 COMPACT_SEARCH_RELATED_TEST_COUNT = 71
-COMPACT_SEARCH_AUDIT_FIX_COUNT = 2
+COMPACT_SEARCH_AUDIT_FIX_COUNT = 4
 COMPACT_OLD_GENERATION_SLICE_COUNT = 1_454
 COMPACT_OLD_GENERATION_HARD_FEASIBLE_COUNT = 0
 COMPACT_FOCUS_W_MAX_MM = 1_170.0
@@ -6328,14 +6328,17 @@ def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
         "id": COMPACT_DESIGN_STATUS_CARD_ID,
         "title": (
             "CODEX | COMPACT SEARCH | FIXED-LM PATH TEST71 PASS | "
-            "AUDIT FIX2 PENDING | FRESH512/SCOUT POST0"
+            "AUDIT FIX4 PENDING | FRESH512/SCOUT POST0"
         ),
         "detail": (
             "The fixed-primary-Lm=2mH resonance path and exact compact "
             "initialization/mutation are implemented and independently tested. "
             "An independent audit then found two execution-scope defects: the "
             "internal Runner needs an authenticated compact activation token, "
-            "and the fixed-Lm wrapper must not alter legacy/nonreserved runs. "
+            "the fixed-Lm wrapper must not alter legacy/nonreserved runs, N1=5 "
+            "must not claim an absent compact-C bridge, and downstream evidence "
+            "must give the fixed-Lm authority precedence over compatibility "
+            "half-Lm aliases. "
             "Both final fresh512 and the diagnostic scout remain submission-"
             "blocked until those defects and their negative bypass tests pass. "
             "N1=6/7/8 replay exact A/B/C plus the independent height boundary; "
@@ -6358,7 +6361,8 @@ def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
             (
                 f"independent code audit blockers="
                 f"{COMPACT_SEARCH_AUDIT_FIX_COUNT} / direct Runner activation "
-                "binding missing + legacy/nonreserved fixed-Lm scope leak / "
+                "binding missing + legacy/nonreserved fixed-Lm scope leak + "
+                "N1=5 compact-C audit overclaim + half-Lm alias precedence / "
                 "fix pending / Scheduler POST0"
             ),
             (
