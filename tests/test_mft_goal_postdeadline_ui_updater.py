@@ -855,6 +855,65 @@ def test_turn_graded_cap_card_reports_parallel_pair_campaign() -> None:
     )
 
 
+def test_clean_library_thermal_card_reports_parallel_replay() -> None:
+    tasks = {
+        task_id: {
+            "task_id": task_id,
+            "source_task_id": task_id - 74,
+            "state": "running",
+            "actual_node_name": f"n{108 + task_id % 4}",
+            "slurm_job_id": str(900_000 + task_id),
+            "allocation_id": 15_000 + task_id % 4,
+            "exit_code": None,
+        }
+        for task_id in updater.CLEAN_LIBRARY_THERMAL_TASK_IDS
+    }
+    submission_state = {
+        "submission_payload_sha256": (
+            updater.CLEAN_LIBRARY_THERMAL_SUBMISSION_PAYLOAD_SHA256
+        ),
+        "plan_payload_sha256": (
+            updater.CLEAN_LIBRARY_THERMAL_PLAN_PAYLOAD_SHA256
+        ),
+        "runtime_provenance": {
+            "payload_sha256": "a" * 64,
+            "library_hash_count": 24,
+        },
+    }
+
+    card = updater._clean_library_thermal_card(
+        tasks,
+        submission_state,
+        OBSERVED,
+    )
+
+    assert card["id"] == updater.CLEAN_LIBRARY_THERMAL_CARD_ID
+    assert len(card["title"]) <= 160
+    assert "CLEAN-LIB THERMAL24" in card["title"]
+    assert "RUN24 QUEUE0 OK0 FAIL0" in card["title"]
+    assert "PROVENANCE 24/24" in card["title"]
+    assert "SCI-VALID PENDING" in card["title"]
+    assert card["state"] == "in_progress"
+    assert any(
+        "tasks=97116-97139" in value
+        and "source geometries=97042-97065" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "active requested total=192CPU+1572864MB" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "runtime library-root/hash provenance=24/24" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "authenticated thermal rows=0" in value
+        and "production PASS=0" in value
+        for value in card["evidence"]
+    )
+
+
 def test_lastmile_card_reports_parallel_submission_without_production_pass(
 ) -> None:
     tasks = {}

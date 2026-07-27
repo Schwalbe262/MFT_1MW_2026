@@ -808,6 +808,31 @@ TURN_GRADED_CAP_PLAN_PAYLOAD_SHA256 = (
     "094e17deca33bd6083b101ff293f78cc11a91131830e86c4c709edb9c14d7a61"
 )
 TURN_GRADED_CAP_TASK_IDS = tuple(range(97_066, 97_116))
+CLEAN_LIBRARY_THERMAL_CARD_ID = "codex-clean-library-thermal24-replay"
+CLEAN_LIBRARY_THERMAL_ROOT = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\clean_library_thermal24_replay_v1"
+)
+CLEAN_LIBRARY_THERMAL_SUBMISSION_SCHEMA = (
+    "mft-goal-clean-library-thermal24-replay-submission-v1"
+)
+CLEAN_LIBRARY_THERMAL_RUNTIME_PROVENANCE_SCHEMA = (
+    "mft-goal-clean-library-thermal24-replay-runtime-provenance-v1"
+)
+CLEAN_LIBRARY_THERMAL_PLAN_PAYLOAD_SHA256 = (
+    "34de1d69b800100f4b411f2b7bd765cfa167b2d61cae4f43ba59a15877a1d18a"
+)
+CLEAN_LIBRARY_THERMAL_SUBMISSION_PAYLOAD_SHA256 = (
+    "b54f7d6e96e2e1d20478ffe0f12968b6d0837b812e6cd36a5e047498ee0fe986"
+)
+CLEAN_LIBRARY_THERMAL_SOLVER_REVISION = (
+    "c6a016c3a880acd632b12e52b02099cfe7b90fc5"
+)
+CLEAN_LIBRARY_THERMAL_LIBRARY_REVISION = (
+    "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+)
+CLEAN_LIBRARY_THERMAL_TASK_IDS = tuple(range(97_116, 97_140))
+CLEAN_LIBRARY_THERMAL_SOURCE_TASK_IDS = tuple(range(97_042, 97_066))
 HISTORICAL_AXIS_RAW_TERMINAL = 5_120
 HISTORICAL_AXIS_UNIQUE_GEOMETRY = 4_683
 NEW_AXIS_GEOMETRY_PASS_RAW = 217
@@ -1985,6 +2010,320 @@ def fetch_turn_graded_cap_tasks(
         raw = {task_id: future.result() for task_id, future in futures.items()}
     return {
         task_id: _validate_turn_graded_cap_task(lanes[task_id], raw[task_id])
+        for task_id in lanes
+    }
+
+
+def _clean_library_thermal_submission_state(
+    root: Path = CLEAN_LIBRARY_THERMAL_ROOT,
+) -> dict[str, Any] | None:
+    """Authenticate the immutable 24-lane clean-library thermal replay."""
+
+    resolved = root.resolve()
+    receipt_path = resolved / "submission_receipt.json"
+    if not receipt_path.is_file():
+        return None
+    try:
+        if (
+            receipt_path.is_symlink()
+            or receipt_path.stat().st_size > MAX_RESPONSE_BYTES
+        ):
+            raise UpdaterError(
+                "clean-library thermal submission receipt is unavailable"
+            )
+        value = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdaterError(
+            "clean-library thermal submission receipt is unreadable"
+        ) from exc
+    if not isinstance(value, dict):
+        raise UpdaterError(
+            "clean-library thermal submission receipt must be an object"
+        )
+    unsigned = copy.deepcopy(value)
+    observed_payload_sha256 = unsigned.pop("payload_sha256", None)
+    if observed_payload_sha256 != canonical_sha256(unsigned):
+        raise UpdaterError(
+            "clean-library thermal submission payload seal drifted"
+        )
+    expected = {
+        "schema": CLEAN_LIBRARY_THERMAL_SUBMISSION_SCHEMA,
+        "payload_sha256": CLEAN_LIBRARY_THERMAL_SUBMISSION_PAYLOAD_SHA256,
+        "plan_payload_sha256": CLEAN_LIBRARY_THERMAL_PLAN_PAYLOAD_SHA256,
+        "complete": True,
+        "submitted_count": 24,
+        "all_generated_commands_clean_library_preflight_passed": True,
+        "source_tasks_cancelled_or_modified": False,
+        "mft_solver_repository_modified": False,
+        "scheduler_repository_modified": False,
+    }
+    observed = {**value, "payload_sha256": observed_payload_sha256}
+    for key, expected_value in expected.items():
+        if observed.get(key) != expected_value:
+            raise UpdaterError(
+                f"clean-library thermal submission {key} drifted"
+            )
+    submissions = value.get("submissions")
+    if not isinstance(submissions, list) or len(submissions) != 24:
+        raise UpdaterError(
+            "clean-library thermal submission lane count drifted"
+        )
+    lanes: dict[int, dict[str, Any]] = {}
+    geometries: set[str] = set()
+    source_tasks: set[int] = set()
+    for lane in submissions:
+        if not isinstance(lane, dict):
+            raise UpdaterError(
+                "clean-library thermal submission lane is invalid"
+            )
+        task_id = int(lane.get("task_id") or 0)
+        source_task_id = int(lane.get("source_old_task_id") or 0)
+        lane_index = int(lane.get("lane_index") or 0)
+        geometry_sha256 = str(
+            lane.get("physical_geometry_sha256") or ""
+        )
+        preflight = lane.get("generated_command_preflight")
+        readback = lane.get("get_readback")
+        if (
+            task_id not in CLEAN_LIBRARY_THERMAL_TASK_IDS
+            or task_id in lanes
+            or source_task_id not in CLEAN_LIBRARY_THERMAL_SOURCE_TASK_IDS
+            or task_id - source_task_id != 74
+            or lane_index != task_id - CLEAN_LIBRARY_THERMAL_TASK_IDS[0] + 1
+            or re.fullmatch(r"[0-9a-f]{64}", geometry_sha256) is None
+            or geometry_sha256 in geometries
+            or source_task_id in source_tasks
+            or not isinstance(preflight, dict)
+            or preflight.get("passed") is not True
+            or preflight.get("library_export_marker_count") != 1
+            or preflight.get("library_revision")
+            != CLEAN_LIBRARY_THERMAL_LIBRARY_REVISION
+            or preflight.get(
+                "export_precedes_clone_checkout_test_and_python"
+            )
+            is not True
+            or lane.get("scheduler_mutation_performed") is not True
+            or lane.get("submission_source")
+            not in {"post_created", "dedupe_reused"}
+            or not isinstance(readback, dict)
+            or int(readback.get("task_id") or 0) != task_id
+            or int(readback.get("id") or 0) != task_id
+        ):
+            raise UpdaterError(
+                f"clean-library thermal task{task_id} lane drifted"
+            )
+        geometries.add(geometry_sha256)
+        source_tasks.add(source_task_id)
+        lanes[task_id] = {
+            "task_id": task_id,
+            "source_task_id": source_task_id,
+            "lane_index": lane_index,
+            "name": str(lane.get("name") or ""),
+            "dedupe_key": str(lane.get("dedupe_key") or ""),
+            "geometry_sha256": geometry_sha256,
+        }
+    if (
+        set(lanes) != set(CLEAN_LIBRARY_THERMAL_TASK_IDS)
+        or source_tasks != set(CLEAN_LIBRARY_THERMAL_SOURCE_TASK_IDS)
+        or len(geometries) != 24
+    ):
+        raise UpdaterError(
+            "clean-library thermal submission coverage drifted"
+        )
+    runtime_provenance: dict[str, Any] | None = None
+    provenance_path = resolved / "runtime_provenance_24of24.json"
+    if provenance_path.is_file():
+        try:
+            if (
+                provenance_path.is_symlink()
+                or provenance_path.stat().st_size > MAX_RESPONSE_BYTES
+            ):
+                raise UpdaterError(
+                    "clean-library runtime provenance is unavailable"
+                )
+            provenance = json.loads(
+                provenance_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise UpdaterError(
+                "clean-library runtime provenance is unreadable"
+            ) from exc
+        if not isinstance(provenance, dict):
+            raise UpdaterError(
+                "clean-library runtime provenance must be an object"
+            )
+        unsigned_provenance = copy.deepcopy(provenance)
+        provenance_payload_sha256 = unsigned_provenance.pop(
+            "payload_sha256", None
+        )
+        task_evidence = provenance.get("task_evidence")
+        if (
+            provenance_payload_sha256
+            != canonical_sha256(unsigned_provenance)
+            or provenance.get("schema")
+            != CLEAN_LIBRARY_THERMAL_RUNTIME_PROVENANCE_SCHEMA
+            or provenance.get("plan_payload_sha256")
+            != CLEAN_LIBRARY_THERMAL_PLAN_PAYLOAD_SHA256
+            or provenance.get("submission_payload_sha256")
+            != CLEAN_LIBRARY_THERMAL_SUBMISSION_PAYLOAD_SHA256
+            or provenance.get("expected_library_revision")
+            != CLEAN_LIBRARY_THERMAL_LIBRARY_REVISION
+            or provenance.get(
+                "runtime_library_root_marker_count_cumulative"
+            )
+            != 24
+            or provenance.get(
+                "runtime_library_hash_count_cumulative"
+            )
+            != 24
+            or provenance.get("scheduler_mutation_performed") is not False
+            or provenance.get("source_tasks_cancelled_or_modified") is not False
+            or not isinstance(task_evidence, list)
+            or len(task_evidence) != 24
+        ):
+            raise UpdaterError(
+                "clean-library runtime provenance contract drifted"
+            )
+        evidence_by_task: dict[int, Mapping[str, Any]] = {}
+        for row in task_evidence:
+            if not isinstance(row, dict):
+                raise UpdaterError(
+                    "clean-library runtime provenance row is invalid"
+                )
+            task_id = int(row.get("task_id") or 0)
+            lane = lanes.get(task_id)
+            if (
+                lane is None
+                or task_id in evidence_by_task
+                or int(row.get("source_old_task_id") or 0)
+                != lane["source_task_id"]
+                or row.get("physical_geometry_sha256")
+                != lane["geometry_sha256"]
+                or not str(row.get("runtime_library_root") or "").endswith(
+                    "/pyaedt_library"
+                )
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(row.get("root_marker_stdout_sha256") or ""),
+                )
+                is None
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(row.get("hash_marker_stdout_sha256") or ""),
+                )
+                is None
+            ):
+                raise UpdaterError(
+                    f"clean-library runtime task{task_id} provenance drifted"
+                )
+            evidence_by_task[task_id] = row
+        if set(evidence_by_task) != set(CLEAN_LIBRARY_THERMAL_TASK_IDS):
+            raise UpdaterError(
+                "clean-library runtime provenance coverage drifted"
+            )
+        runtime_provenance = {
+            "payload_sha256": provenance_payload_sha256,
+            "file_sha256": _file_sha256(provenance_path),
+            "root_marker_count": 24,
+            "library_hash_count": 24,
+        }
+    return {
+        "root": str(resolved),
+        "receipt_file_sha256": _file_sha256(receipt_path),
+        "submission_payload_sha256": observed_payload_sha256,
+        "plan_payload_sha256": CLEAN_LIBRARY_THERMAL_PLAN_PAYLOAD_SHA256,
+        "lanes": lanes,
+        "runtime_provenance": runtime_provenance,
+    }
+
+
+def _validate_clean_library_thermal_task(
+    expected: Mapping[str, Any],
+    task: Mapping[str, Any],
+) -> dict[str, Any]:
+    task_id = int(expected["task_id"])
+    identifiers = {
+        int(value)
+        for key in ("id", "task_id")
+        if (value := task.get(key)) not in (None, "")
+    }
+    if identifiers != {task_id}:
+        raise UpdaterError(
+            f"clean-library thermal task{task_id} identity drifted"
+        )
+    expected_fields = {
+        "name": expected["name"],
+        "dedupe_key": expected["dedupe_key"],
+        "project": "MFT_1MW_2026v1",
+        "required_capability": "conda:pyaedt2026v1",
+        "env_profile": "pyaedt2026v1",
+        "scheduling_profile": "fea_bursty",
+        "aedt_backend": "standalone",
+        "cpus": 8,
+        "memory_mb": 65_536,
+        "gpus": 0,
+        "priority": 99,
+        "timeout_seconds": 43_200,
+        "max_workers_per_node": 1,
+    }
+    for key, expected_value in expected_fields.items():
+        if task.get(key) != expected_value:
+            raise UpdaterError(
+                f"clean-library thermal task{task_id} {key} drifted"
+            )
+    state = _task_state(task)
+    actual_node = str(
+        task.get("actual_node_name") or task.get("allocation_node_name") or ""
+    )
+    if state in RUNNING_STATES and (
+        not actual_node or task.get("placement_contract_satisfied") is not True
+    ):
+        raise UpdaterError(
+            f"clean-library thermal task{task_id} running placement drifted"
+        )
+    return {
+        **dict(expected),
+        "state": state,
+        "allocation_id": _positive_or_none(
+            task.get("allocation_id"), "allocation_id"
+        ),
+        "slurm_job_id": str(task.get("slurm_job_id") or ""),
+        "actual_node_name": actual_node,
+        "placement_contract_satisfied": task.get(
+            "placement_contract_satisfied"
+        ),
+        "created_at": task.get("created_at"),
+        "started_at": task.get("started_at"),
+        "finished_at": task.get("finished_at"),
+        "exit_code": task.get("exit_code"),
+        "failure_message": str(task.get("failure_message") or "")[:350],
+    }
+
+
+def fetch_clean_library_thermal_tasks(
+    scheduler_url: str,
+    submission_state: Mapping[str, Any],
+    *,
+    task_reader: TaskReader | None = None,
+) -> dict[int, dict[str, Any]]:
+    lanes = submission_state.get("lanes")
+    if not isinstance(lanes, dict) or set(lanes) != set(
+        CLEAN_LIBRARY_THERMAL_TASK_IDS
+    ):
+        raise UpdaterError(
+            "clean-library thermal submission state is incomplete"
+        )
+    reader = task_reader or _get_scheduler_task
+    with ThreadPoolExecutor(max_workers=min(32, len(lanes))) as executor:
+        futures = {
+            task_id: executor.submit(reader, scheduler_url, task_id)
+            for task_id in lanes
+        }
+        raw = {task_id: future.result() for task_id, future in futures.items()}
+    return {
+        task_id: _validate_clean_library_thermal_task(
+            lanes[task_id], raw[task_id]
+        )
         for task_id in lanes
     }
 
@@ -4419,6 +4758,119 @@ def _turn_graded_cap_card(
     }
 
 
+def _clean_library_thermal_card(
+    tasks: Mapping[int, Mapping[str, Any]],
+    submission_state: Mapping[str, Any],
+    observed_at: str,
+) -> dict[str, Any]:
+    """Show the provenance-correct 24-geometry thermal replay."""
+
+    if set(tasks) != set(CLEAN_LIBRARY_THERMAL_TASK_IDS):
+        raise UpdaterError("clean-library thermal live task set drifted")
+    categories = {
+        task_id: _category(str(task["state"]))
+        for task_id, task in tasks.items()
+    }
+    counts = {
+        category: sum(value == category for value in categories.values())
+        for category in ("running", "queued", "succeeded", "failed")
+    }
+    active_nodes = sorted(
+        {
+            str(task["actual_node_name"])
+            for task_id, task in tasks.items()
+            if categories[task_id] == "running"
+            and str(task["actual_node_name"])
+        }
+    )
+    provenance = submission_state.get("runtime_provenance")
+    if provenance is not None and not isinstance(provenance, Mapping):
+        raise UpdaterError("clean-library runtime provenance state drifted")
+    provenance_count = (
+        int(provenance["library_hash_count"]) if provenance is not None else 0
+    )
+    terminal = counts["succeeded"] + counts["failed"]
+    progress = min(95.0, 15.0 + 75.0 * terminal / len(tasks))
+    return {
+        "id": CLEAN_LIBRARY_THERMAL_CARD_ID,
+        "title": (
+            "CLEAN-LIB THERMAL24 | "
+            f"RUN{counts['running']} QUEUE{counts['queued']} "
+            f"OK{counts['succeeded']} FAIL{counts['failed']} | "
+            f"PROVENANCE {provenance_count}/24 | SCI-VALID PENDING"
+        ),
+        "detail": (
+            "The same 24 resonance-passing 6/60 geometries are being replayed "
+            "with an explicitly exported, clean PyAEDT library checkout. "
+            "Only terminal results that pass solver provenance, all six "
+            "thermal interface/limiter fields, and finite 25-target checks "
+            "may enter surrogate retraining or Pareto promotion."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": progress,
+        "evidence": [
+            (
+                "tasks=97116-97139 / source geometries=97042-97065 / "
+                "unique geometry=24 / symmetric eighth / nonrounded / "
+                "N1/N2=6/60"
+            ),
+            (
+                f"live states: running={counts['running']} / "
+                f"queued={counts['queued']} / succeeded={counts['succeeded']} / "
+                f"failed={counts['failed']} / active nodes={len(active_nodes)} "
+                f"({','.join(active_nodes) or 'none'})"
+            ),
+            (
+                "resources per task=8CPU+65536MB / timeout=43200s / "
+                "priority=99 / max_workers_per_node=1 / "
+                f"active requested total={counts['running'] * 8}CPU+"
+                f"{counts['running'] * 65_536}MB"
+            ),
+            (
+                "fixed physics: dual fan 1.5m/s / TIM and pads 2mm / "
+                "k=0.2W/mK / primary 5.0T+1.6mm / rounded=false"
+            ),
+            (
+                "solver revision="
+                f"{CLEAN_LIBRARY_THERMAL_SOLVER_REVISION} / "
+                "PyAEDT library revision="
+                f"{CLEAN_LIBRARY_THERMAL_LIBRARY_REVISION}"
+            ),
+            (
+                "runtime library-root/hash provenance="
+                f"{provenance_count}/24 / "
+                + (
+                    "payload SHA256="
+                    f"{provenance['payload_sha256']}"
+                    if provenance is not None
+                    else "sealed runtime evidence pending"
+                )
+            ),
+            (
+                "submission payload SHA256="
+                f"{submission_state['submission_payload_sha256']} / "
+                "plan payload SHA256="
+                f"{submission_state['plan_payload_sha256']}"
+            ),
+            (
+                "strict scientific gate: interface contract + coverage=true + "
+                "unpaired=[] + limiter=false + limiter_max<4990K + "
+                "thermal_result_scientific_valid=true"
+            ),
+            (
+                "authenticated thermal rows=0 pending terminal collection / "
+                "retraining admission=pending >=8 unique from >=4 source tasks / "
+                "production PASS=0"
+            ),
+            (
+                "Scheduler observation method=GET only / source tasks unchanged / "
+                "scheduler repository modified=false"
+            ),
+        ],
+    }
+
+
 def _lastmile_acquisition_card(
     tasks: Mapping[int, Mapping[str, Any]],
     submission_state: Mapping[str, Any],
@@ -5690,6 +6142,8 @@ def merge_status(
     corrected_canary_task: Mapping[str, Any] | None = None,
     turn_graded_cap_tasks: Mapping[int, Mapping[str, Any]] | None = None,
     turn_graded_cap_submission_state: Mapping[str, Any] | None = None,
+    clean_library_thermal_tasks: Mapping[int, Mapping[str, Any]] | None = None,
+    clean_library_thermal_submission_state: Mapping[str, Any] | None = None,
     reference_gui_root: Path | None = None,
     target_axis_collector_state_file: Path | None = None,
     postsuccess_state_file: Path | None = None,
@@ -5773,6 +6227,20 @@ def merge_status(
         )
     else:
         _remove_current_card(result, TURN_GRADED_CAP_CARD_ID)
+    if (
+        clean_library_thermal_tasks is not None
+        and clean_library_thermal_submission_state is not None
+    ):
+        _upsert_priority_current_card(
+            result,
+            _clean_library_thermal_card(
+                clean_library_thermal_tasks,
+                clean_library_thermal_submission_state,
+                observed_at,
+            ),
+        )
+    else:
+        _remove_current_card(result, CLEAN_LIBRARY_THERMAL_CARD_ID)
     if lastmile_tasks is not None and lastmile_submission_state is not None:
         _upsert_priority_current_card(
             result,
@@ -6379,6 +6847,19 @@ def synchronize_once(
         if turn_graded_cap_submission_state is not None
         else None
     )
+    clean_library_thermal_submission_state = (
+        _clean_library_thermal_submission_state()
+        if task_reader is None
+        else None
+    )
+    clean_library_thermal_tasks = (
+        fetch_clean_library_thermal_tasks(
+            scheduler_url,
+            clean_library_thermal_submission_state,
+        )
+        if clean_library_thermal_submission_state is not None
+        else None
+    )
     source = status_file.resolve().read_bytes()
     source_sha256 = hashlib.sha256(source).hexdigest()
     try:
@@ -6398,6 +6879,10 @@ def synchronize_once(
         turn_graded_cap_tasks=turn_graded_cap_tasks,
         turn_graded_cap_submission_state=(
             turn_graded_cap_submission_state
+        ),
+        clean_library_thermal_tasks=clean_library_thermal_tasks,
+        clean_library_thermal_submission_state=(
+            clean_library_thermal_submission_state
         ),
         reference_gui_root=(
             reference_gui_root or DEFAULT_REFERENCE_BASELINE_GUI_ROOT
