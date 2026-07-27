@@ -6,9 +6,12 @@ single authenticated terminal seed is enough to publish the merged population
 NDS.  Retry collections are deduplicated by seed before populations are
 merged.
 
-The bounded-gap scout's corrected, turn-graded acquisition constraint is the
-only capacitance quantity used for eligibility or ranking.  The raw two-net
-block-capacitance metric is explicitly rejected as physical truth.
+The bounded-gap scout's legacy corrected-capacitance and half-magnetizing
+resonance constraints are authenticated as source evidence, then quarantined.
+Rerank eligibility uses every other latest hard constraint plus the calibrated
+physics-delta q90 resonance lower bound.  When that strict set is empty, a
+separately labelled multi-violation-nearest, physics-diverse FEA batch is
+prepared without claiming feasibility.
 """
 
 from __future__ import annotations
@@ -139,6 +142,10 @@ REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS = frozenset(
         "half_magnetizing_resonance_minimum",
     }
 )
+PHYSICS_RESONANCE_CONSTRAINT_NAME = (
+    "physics_delta_fRx_q90_lcb_minimum"
+)
+FALLBACK_INITIAL_COUNT = 12
 IDENTITY_COLUMNS = collector.IDENTITY_COLUMNS
 FAIL_CLOSED_FLAGS = collector.FAIL_CLOSED_FLAGS
 DIVERSITY_FEATURES = (
@@ -818,6 +825,8 @@ def _gap_stratum(gap2_mm: float) -> str:
 
 def _temperature_evidence(
     physical_g: Mapping[str, float],
+    *,
+    enforce: bool = True,
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {}
     for target, acceptance_limit in ACCEPTANCE_TEMPERATURE_LIMITS_C.items():
@@ -829,7 +838,7 @@ def _temperature_evidence(
                 f"{target} search/acceptance temperature limit drifted"
             )
         robust_temperature = active_search_limit + residual
-        if robust_temperature > acceptance_limit + 1e-12:
+        if enforce and robust_temperature > acceptance_limit + 1e-12:
             raise StratifiedSelectionError(
                 f"{target} robust temperature {robust_temperature:.9g} C "
                 f"exceeds acceptance limit {acceptance_limit:.9g} C"
@@ -914,6 +923,8 @@ def _candidate_contract(
     row: Mapping[str, Any],
     *,
     physical_constraint_columns: Sequence[str],
+    normalized_constraint_columns: Sequence[str],
+    allow_latest_hard_violations: bool = False,
 ) -> dict[str, Any]:
     for column in RECOMPUTED_BASE_TRUE_COLUMNS:
         if not _canonical_bool(row.get(column), column):
@@ -967,6 +978,28 @@ def _candidate_contract(
                 f"flattened physical constraint drifted: {name}"
             )
         physical_values[name] = value
+    normalized_g = _json_object_cell(
+        row.get("normalized_G_json"),
+        "normalized_G_json",
+    )
+    normalized_names = [
+        column.removeprefix("normalized_G:")
+        for column in normalized_constraint_columns
+    ]
+    if set(normalized_g) != set(normalized_names):
+        raise StratifiedSelectionError("normalized_G_json schema drifted")
+    normalized_values: dict[str, float] = {}
+    for name in normalized_names:
+        value = _finite(normalized_g[name], f"normalized_G_json:{name}")
+        flattened = _finite(
+            row.get(f"normalized_G:{name}"),
+            f"normalized_G:{name}",
+        )
+        if not math.isclose(value, flattened, rel_tol=0.0, abs_tol=1e-12):
+            raise StratifiedSelectionError(
+                f"flattened normalized constraint drifted: {name}"
+            )
+        normalized_values[name] = value
     violations = {
         name: value
         for name, value in physical_values.items()
@@ -975,12 +1008,15 @@ def _candidate_contract(
             and value > 1e-12
         )
     }
-    if violations:
+    if violations and not allow_latest_hard_violations:
         raise StratifiedSelectionError(
             "latest non-capacitance physical constraints are positive: "
             f"{violations}"
         )
-    temperature_evidence = _temperature_evidence(physical_values)
+    temperature_evidence = _temperature_evidence(
+        physical_values,
+        enforce=not allow_latest_hard_violations,
+    )
 
     if (
         _integer(decoded.get("N1_main"), "N1_main") != FIXED_PRIMARY_TURNS
@@ -1020,8 +1056,17 @@ def _candidate_contract(
     width, length, height = (
         _finite(value, "exterior dimension") for value in dimensions
     )
-    for axis, value in zip(("W", "L", "H"), (width, length, height)):
-        if value > ACCEPTANCE_SIZE_LIMITS_MM[axis] + 1e-9:
+    direct_geometry_violations_mm = {
+        axis: max(value - ACCEPTANCE_SIZE_LIMITS_MM[axis], 0.0)
+        for axis, value in zip(("W", "L", "H"), (width, length, height))
+    }
+    if (
+        not allow_latest_hard_violations
+        and any(value > 1e-9 for value in direct_geometry_violations_mm.values())
+    ):
+        for axis, violation in direct_geometry_violations_mm.items():
+            if violation <= 1e-9:
+                continue
             raise StratifiedSelectionError(
                 f"decoded exterior {axis} exceeds active search limit"
             )
@@ -1086,6 +1131,9 @@ def _candidate_contract(
         "fixed_identity_attestation": fixed_attestation,
         "legacy_search_feasibility_flags_not_used": legacy_feasibility_flags,
         "physical_G": physical_values,
+        "normalized_G": normalized_values,
+        "latest_hard_active_physical_violations": violations,
+        "latest_hard_active_constraints_passed": not violations,
         "replaced_legacy_capacitance_constraints": sorted(
             REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
         ),
@@ -1093,6 +1141,10 @@ def _candidate_contract(
         "acceptance_temperature_limits_passed": all(
             item["acceptance_limit_passed"]
             for item in temperature_evidence.values()
+        ),
+        "direct_geometry_violations_mm": direct_geometry_violations_mm,
+        "direct_geometry_limits_passed": not any(
+            value > 1e-9 for value in direct_geometry_violations_mm.values()
         ),
         "realized_gap2_mm": gap2,
         "gap2_grid_index": int(grid_index),
@@ -1186,6 +1238,194 @@ def _select_diverse(
     return [copy.deepcopy(pool[index]) for index in chosen]
 
 
+def _multi_violation_evidence(
+    candidate: Mapping[str, Any],
+    prediction: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a dimensionless latest-hard plus physics violation record."""
+
+    normalized = candidate.get("normalized_G")
+    if not isinstance(normalized, Mapping):
+        raise StratifiedSelectionError(
+            "candidate normalized constraint evidence is absent"
+        )
+    active_positive = {
+        str(name): max(_finite(value, f"normalized_G:{name}"), 0.0)
+        for name, value in normalized.items()
+        if (
+            name not in REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+            and _finite(value, f"normalized_G:{name}") > 1e-12
+        )
+    }
+    f_lcb = _finite(
+        prediction.get("physics_delta_fRx_q90_lcb_Hz"),
+        "physics_delta_fRx_q90_lcb_Hz",
+    )
+    if f_lcb <= 0.0:
+        raise StratifiedSelectionError(
+            "physics-delta resonance LCB must be positive"
+        )
+    physics_normalized = max(
+        physics_reranker.RESONANCE_MIN_HZ / f_lcb - 1.0,
+        0.0,
+    )
+    components = dict(active_positive)
+    if physics_normalized > 1e-12:
+        components[PHYSICS_RESONANCE_CONSTRAINT_NAME] = physics_normalized
+    values = np.asarray(list(components.values()), dtype=float)
+    return {
+        "positive_constraint_count": len(components),
+        "normalized_positive_sum": (
+            float(values.sum()) if len(values) else 0.0
+        ),
+        "normalized_positive_max": (
+            float(values.max()) if len(values) else 0.0
+        ),
+        "normalized_positive_l2": (
+            float(np.linalg.norm(values)) if len(values) else 0.0
+        ),
+        "physics_resonance_normalized_violation": physics_normalized,
+        "positive_normalized_components": components,
+        "legacy_corrected_C_and_old_resonance_excluded": True,
+    }
+
+
+def _fallback_sort_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
+    evidence = candidate["multi_violation_evidence"]
+    prediction = candidate["physics_delta_prediction"]
+    return (
+        float(evidence["normalized_positive_sum"]),
+        float(evidence["normalized_positive_max"]),
+        int(evidence["positive_constraint_count"]),
+        float(prediction["physics_delta_Crx_q90_ucb_F"]),
+        float(prediction["physics_delta_extrapolation_distance"]),
+        float(candidate["volume_L"]),
+        float(candidate["total_loss_W"]),
+        str(candidate["physical_geometry_sha256"]),
+    )
+
+
+def _select_fallback_diverse(
+    candidates: Sequence[dict[str, Any]],
+    *,
+    count: int,
+) -> list[dict[str, Any]]:
+    """Select nearest multi-violation anchor plus physics/geometry diversity."""
+
+    if count < 1 or len(candidates) < count:
+        raise StratifiedSelectionError(
+            "nearest-fallback pool is smaller than selection"
+        )
+    ordered = sorted(candidates, key=_fallback_sort_key)
+    for rank, item in enumerate(ordered, start=1):
+        item["fallback_nearest_rank_in_pool"] = rank
+    pool_size = min(len(ordered), max(32, count * 16))
+    pool = ordered[:pool_size]
+    physics_features = (
+        "physics_delta_Crx_mean_F",
+        "physics_delta_Crx_q90_ucb_F",
+        "physics_delta_extrapolation_distance",
+    )
+    matrix = np.asarray(
+        [
+            [
+                *(
+                    float(item["diversity_features"][name])
+                    for name in DIVERSITY_FEATURES
+                ),
+                *(
+                    float(item["physics_delta_prediction"][name])
+                    for name in physics_features
+                ),
+            ]
+            for item in pool
+        ],
+        dtype=float,
+    )
+    low = matrix.min(axis=0)
+    span = matrix.max(axis=0) - low
+    normalized = (matrix - low) / np.where(span > 0.0, span, 1.0)
+    normalized[:, span <= 0.0] = 0.0
+    chosen = [0]
+    pool[0]["selection_role"] = "nearest_multi_violation_anchor"
+    pool[0]["minimum_diversity_distance_at_selection"] = None
+    while len(chosen) < count:
+        remaining = [index for index in range(pool_size) if index not in chosen]
+        scored: list[tuple[Any, ...]] = []
+        for index in remaining:
+            distance = float(
+                np.linalg.norm(
+                    normalized[index] - normalized[chosen],
+                    axis=1,
+                ).min()
+            )
+            scored.append(
+                (
+                    -distance,
+                    *_fallback_sort_key(pool[index]),
+                    index,
+                    distance,
+                )
+            )
+        *_, selected_index, distance = min(scored)
+        pool[selected_index]["selection_role"] = (
+            "nearest_pool_physics_geometry_maximin"
+        )
+        pool[selected_index][
+            "minimum_diversity_distance_at_selection"
+        ] = distance
+        chosen.append(int(selected_index))
+    return [copy.deepcopy(pool[index]) for index in chosen]
+
+
+def _build_nearest_fallback_proposal(
+    candidate_pool: Sequence[dict[str, Any]],
+    *,
+    total_count: int = FALLBACK_INITIAL_COUNT,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Build an exactly balanced gap-stratified exploratory fallback."""
+
+    by_stratum = {
+        name: [
+            item for item in candidate_pool if item["gap2_stratum"] == name
+        ]
+        for name, *_ in GAP_STRATA
+    }
+    if total_count % len(GAP_STRATA):
+        raise StratifiedSelectionError(
+            "fallback count must divide evenly across gap2 strata"
+        )
+    quota = total_count // len(GAP_STRATA)
+    if any(len(pool) < quota for pool in by_stratum.values()):
+        return by_stratum, []
+    selected: list[dict[str, Any]] = []
+    for name, *_ in GAP_STRATA:
+        chosen = _select_fallback_diverse(
+            by_stratum[name],
+            count=quota,
+        )
+        for order, item in enumerate(chosen, start=1):
+            item["selection_order_in_stratum"] = order
+            item["fallback_quota_source"] = f"gap2_{name}_quota"
+        selected.extend(chosen)
+    selected = sorted(
+        selected,
+        key=lambda item: (
+            _fallback_sort_key(item),
+            item["gap2_stratum"],
+        ),
+    )
+    for order, item in enumerate(selected, start=1):
+        item["selection_order_overall"] = order
+        item["selection_authority"] = (
+            "diagnostic_nearest_multi_violation_fallback"
+        )
+        item["exploratory_nonpromotion"] = True
+        item["latest_rerank_nds_rank"] = -1
+        item["physics_delta_ucb_rank_in_stratum"] = -1
+    return by_stratum, selected
+
+
 def _build_stratified_proposal(
     eligible: Sequence[dict[str, Any]],
     *,
@@ -1275,7 +1515,12 @@ def _merge_and_rank(
     collections: Sequence[Mapping[str, Any]],
     *,
     physics_delta_model: Mapping[str, Any] | None = None,
-) -> tuple[pd.DataFrame, list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[
+    pd.DataFrame,
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
     if physics_delta_model is None:
         raise StratifiedSelectionError(
             "authenticated physics-delta model is required for rerank "
@@ -1324,6 +1569,7 @@ def _merge_and_rank(
             "merged physical deduplication/NDS failed"
         ) from exc
 
+    candidate_pool: list[dict[str, Any]] = []
     eligible: list[dict[str, Any]] = []
     eligibility = np.zeros(len(unique), dtype=bool)
     rejection: list[str] = []
@@ -1340,12 +1586,25 @@ def _merge_and_rank(
         np.nan,
         dtype=float,
     )
+    recovered_candidate_values = np.zeros(len(unique), dtype=bool)
+    latest_hard_pass_values = np.zeros(len(unique), dtype=bool)
+    multi_violation_count_values = np.full(len(unique), -1, dtype=np.int64)
+    multi_violation_sum_values = np.full(len(unique), np.nan, dtype=float)
+    multi_violation_max_values = np.full(len(unique), np.nan, dtype=float)
+    multi_violation_l2_values = np.full(len(unique), np.nan, dtype=float)
+    multi_violation_components_values = np.full(
+        len(unique),
+        "",
+        dtype=object,
+    )
     stratum_values = np.full(len(unique), "", dtype=object)
     for index, row in unique.iterrows():
         try:
             candidate = _candidate_contract(
                 row.to_dict(),
                 physical_constraint_columns=physical,
+                normalized_constraint_columns=normalized,
+                allow_latest_hard_violations=True,
             )
         except StratifiedSelectionError as exc:
             rejection.append(str(exc))
@@ -1367,6 +1626,10 @@ def _merge_and_rank(
         candidate["physics_delta_provisional_resonance_G_Hz"] = (
             provisional_resonance_g
         )
+        candidate["multi_violation_evidence"] = _multi_violation_evidence(
+            candidate,
+            prediction,
+        )
         candidate["merged_unique_row_index"] = int(index)
         candidate["source_seed"] = int(row["source_seed"])
         candidate["source_task_id"] = str(row["source_task_id"])
@@ -1378,6 +1641,31 @@ def _merge_and_rank(
         )
         candidate["canonical_physical_params_sha256"] = str(
             row["canonical_physical_params_sha256"]
+        )
+        recovered_candidate_values[index] = True
+        latest_hard_pass_values[index] = bool(
+            candidate["latest_hard_active_constraints_passed"]
+            and candidate["direct_geometry_limits_passed"]
+            and candidate["acceptance_temperature_limits_passed"]
+        )
+        violation_evidence = candidate["multi_violation_evidence"]
+        multi_violation_count_values[index] = int(
+            violation_evidence["positive_constraint_count"]
+        )
+        multi_violation_sum_values[index] = float(
+            violation_evidence["normalized_positive_sum"]
+        )
+        multi_violation_max_values[index] = float(
+            violation_evidence["normalized_positive_max"]
+        )
+        multi_violation_l2_values[index] = float(
+            violation_evidence["normalized_positive_l2"]
+        )
+        multi_violation_components_values[index] = json.dumps(
+            violation_evidence["positive_normalized_components"],
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
         )
         gap_values[index] = candidate["realized_gap2_mm"]
         cw2_values[index] = candidate["cw2_mm"]
@@ -1399,13 +1687,38 @@ def _merge_and_rank(
         ]
         physics_delta_resonance_g_values[index] = provisional_resonance_g
         stratum_values[index] = candidate["gap2_stratum"]
+        candidate_pool.append(candidate)
+        strict_failure_reasons: list[str] = []
+        if (
+            not candidate["latest_hard_active_constraints_passed"]
+            or not candidate["direct_geometry_limits_passed"]
+            or not candidate["acceptance_temperature_limits_passed"]
+        ):
+            strict_failure_reasons.append(
+                "latest_hard_nonphysics_constraints_failed"
+            )
         if provisional_resonance_g > 1e-12:
+            strict_failure_reasons.append(
+                "physics_delta_fRx_q90_lcb_below_15000Hz"
+            )
+        if strict_failure_reasons:
+            candidate["strict_latest_rerank_failure_reasons"] = (
+                strict_failure_reasons
+            )
+            candidate["strict_latest_rerank_eligible"] = False
             rejection.append(
-                "physics-delta provisional fRx q90 LCB "
-                f"{prediction['physics_delta_fRx_q90_lcb_Hz']:.9g} Hz "
-                f"is below {physics_reranker.RESONANCE_MIN_HZ:.9g} Hz"
+                "strict latest rerank failed: "
+                + ",".join(strict_failure_reasons)
+                + "; physical="
+                + str(candidate["latest_hard_active_physical_violations"])
+                + "; direct_geometry="
+                + str(candidate["direct_geometry_violations_mm"])
+                + "; physics_f_lcb_Hz="
+                + f"{prediction['physics_delta_fRx_q90_lcb_Hz']:.9g}"
             )
             continue
+        candidate["strict_latest_rerank_failure_reasons"] = []
+        candidate["strict_latest_rerank_eligible"] = True
         eligible.append(candidate)
         eligibility[index] = True
         rejection.append("")
@@ -1425,6 +1738,27 @@ def _merge_and_rank(
     unique[
         "physics_delta_provisional_resonance_G_Hz"
     ] = physics_delta_resonance_g_values
+    unique["structurally_recovered_physics_candidate"] = (
+        recovered_candidate_values
+    )
+    unique["latest_hard_nonphysics_constraints_passed"] = (
+        latest_hard_pass_values
+    )
+    unique["multi_violation_positive_constraint_count"] = (
+        multi_violation_count_values
+    )
+    unique["multi_violation_normalized_positive_sum"] = (
+        multi_violation_sum_values
+    )
+    unique["multi_violation_normalized_positive_max"] = (
+        multi_violation_max_values
+    )
+    unique["multi_violation_normalized_positive_l2"] = (
+        multi_violation_l2_values
+    )
+    unique["multi_violation_positive_components_json"] = (
+        multi_violation_components_values
+    )
     rerank_ranks = np.full(len(unique), -1, dtype=np.int64)
     if eligible:
         eligible_indices = np.array(
@@ -1453,10 +1787,21 @@ def _merge_and_rank(
         ascending=[False, True, True, True, True, True],
         kind="stable",
     ).reset_index(drop=True)
-    return unique, eligible, {
+    return unique, eligible, candidate_pool, {
         "terminal_row_count": len(merged),
         "unique_physical_candidate_count": len(unique),
         "latest_rerank_eligible_count": len(eligible),
+        "structurally_recovered_physics_candidate_count": len(
+            candidate_pool
+        ),
+        "legacy_search_physical_constraint_feasible_false_recovered_count": (
+            sum(
+                not item["legacy_search_feasibility_flags_not_used"][
+                    "physical_constraint_feasible"
+                ]
+                for item in candidate_pool
+            )
+        ),
         "objective_front0_all_count": int(
             np.count_nonzero(unique["objective_nds_rank_all"].to_numpy() == 0)
         ),
@@ -1602,7 +1947,7 @@ def prepare_selection(
     )
     destination.mkdir(parents=True)
     try:
-        ranked, eligible, nds_summary = _merge_and_rank(
+        ranked, eligible, recovered_pool, nds_summary = _merge_and_rank(
             collections,
             physics_delta_model=physics_delta_model,
         )
@@ -1620,7 +1965,33 @@ def prepare_selection(
             eligible,
             per_stratum=per_stratum,
         )
-        ready = not missing_strata
+        strict_selected = selected
+        fallback_by_stratum: dict[str, list[dict[str, Any]]] = {
+            name: [] for name, *_ in GAP_STRATA
+        }
+        selection_authority = "strict_latest_hard_plus_physics_q90"
+        if missing_strata:
+            fallback_by_stratum, selected = (
+                _build_nearest_fallback_proposal(
+                    recovered_pool,
+                    total_count=FALLBACK_INITIAL_COUNT,
+                )
+            )
+            selection_authority = (
+                "diagnostic_nearest_multi_violation_fallback"
+            )
+        else:
+            for overall_order, item in enumerate(selected, start=1):
+                item["selection_authority"] = selection_authority
+                item["selection_order_overall"] = overall_order
+                item["exploratory_nonpromotion"] = False
+                item["multi_violation_evidence"] = (
+                    _multi_violation_evidence(
+                        item,
+                        item["physics_delta_prediction"],
+                    )
+                )
+        ready = len(selected) == FALLBACK_INITIAL_COUNT
 
         profile_evidence: dict[str, Any] | None = None
         candidate_records: list[dict[str, Any]] = []
@@ -1709,15 +2080,32 @@ def prepare_selection(
                             "total_loss_W",
                             "temperature_evidence",
                             "acceptance_temperature_limits_passed",
+                            "latest_hard_active_physical_violations",
+                            "latest_hard_active_constraints_passed",
+                            "direct_geometry_violations_mm",
+                            "direct_geometry_limits_passed",
+                            "legacy_search_feasibility_flags_not_used",
+                            "strict_latest_rerank_failure_reasons",
+                            "strict_latest_rerank_eligible",
                             "fixed_identity_attestation",
                             "physics_network",
                             "physics_network_air_Ceq_F",
                             "physics_network_air_f_at_L2_0p2H_Hz",
                             "physics_delta_prediction",
                             "physics_delta_provisional_resonance_G_Hz",
+                            "multi_violation_evidence",
+                            "selection_authority",
+                            "selection_order_overall",
+                            "exploratory_nonpromotion",
                         )
                     }
                     | {
+                        "fallback_nearest_rank_in_pool": candidate.get(
+                            "fallback_nearest_rank_in_pool"
+                        ),
+                        "fallback_quota_source": candidate.get(
+                            "fallback_quota_source"
+                        ),
                         "parallel_FEA_execution_priority": priority_by_geometry[
                             candidate["physical_geometry_sha256"]
                         ],
@@ -1755,11 +2143,32 @@ def prepare_selection(
             {
                 "schema_version": SELECTION_SCHEMA,
                 "status": (
-                    "ready_for_parallel_rx_turn_graded_eighth_FEA"
+                    (
+                        "ready_for_parallel_rx_turn_graded_eighth_FEA_"
+                        + (
+                            "strict"
+                            if selection_authority
+                            == "strict_latest_hard_plus_physics_q90"
+                            else "nearest_multi_violation_fallback"
+                        )
+                    )
                     if ready
-                    else "waiting_for_authenticated_gap2_strata"
+                    else "insufficient_recovered_candidates_for_initial_FEA"
                 ),
                 "fea_handoff_ready": ready,
+                "fea_handoff_is_strict_feasible": (
+                    ready
+                    and selection_authority
+                    == "strict_latest_hard_plus_physics_q90"
+                ),
+                "selection_authority": selection_authority,
+                "exploratory_nonpromotion": (
+                    selection_authority
+                    == "diagnostic_nearest_multi_violation_fallback"
+                ),
+                "approved_dielectric_final_gate_closed": (
+                    approved_dielectric_stack is None
+                ),
                 "collector_input": {
                     **deduplication,
                     "authenticated_collection_records": [
@@ -1848,24 +2257,63 @@ def prepare_selection(
                         "authenticated_latest_rerank_candidate_count": len(
                             eligible_by_stratum[name]
                         ),
+                        "recovered_fallback_pool_count": len(
+                            fallback_by_stratum[name]
+                        ),
                         "required_selection_count": per_stratum,
                     }
                     for name, lower, upper, upper_inclusive in GAP_STRATA
                 ],
                 "missing_or_underfilled_strata": missing_strata,
                 "selection_method": {
-                    "primary_rank": (
+                    "authority": selection_authority,
+                    "strict_primary_rank": (
                         "physics_delta_Crx_q90_UCB_ascending_only"
                     ),
-                    "first_per_stratum": "minimum_physics_delta_q90_UCB",
+                    "fallback_primary_rank": (
+                        "latest_hard_plus_physics_normalized_positive_sum_"
+                        "then_max_then_count_then_physics_q90_UCB"
+                    ),
+                    "first_per_stratum": (
+                        "minimum_physics_delta_q90_UCB"
+                        if selection_authority
+                        == "strict_latest_hard_plus_physics_q90"
+                        else "nearest_multi_violation_anchor"
+                    ),
                     "remaining_per_stratum": (
-                        "farthest_normalized_geometry_and_cw2_within_top_"
-                        "physics_delta_q90_UCB_pool"
+                        "physics_geometry_maximin_within_ranked_pool"
                     ),
                     "diversity_features": list(DIVERSITY_FEATURES),
                     "per_stratum": per_stratum,
                     "raw_two_net_block_C_ranked": False,
                     "legacy_corrected_0p759701_C_ranked": False,
+                    "strict_candidate_count": len(eligible),
+                    "strict_selected_candidate_count": len(
+                        strict_selected
+                    ),
+                    "fallback_used": (
+                        selection_authority
+                        == "diagnostic_nearest_multi_violation_fallback"
+                    ),
+                    "fallback_is_not_feasibility_evidence": True,
+                    "fallback_exact_gap2_quota": {
+                        name: FALLBACK_INITIAL_COUNT // len(GAP_STRATA)
+                        for name, *_ in GAP_STRATA
+                    },
+                    "multi_violation_formula": {
+                        "active_search_component": "max(normalized_G_i,0)",
+                        "physics_component": (
+                            "max(15000/physics_delta_fRx_q90_lcb_Hz-1,0)"
+                        ),
+                        "aggregate": (
+                            "sum_positive_then_max_positive_then_count_then_"
+                            "physics_delta_Crx_q90_ucb_F"
+                        ),
+                        "excluded_source_constraints": sorted(
+                            REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+                        ),
+                        "formula_is_inside_sealed_selection_payload": True,
+                    },
                 },
                 "physics_informed_reranker": {
                     "tool": _file_record(PHYSICS_RERANKER_TOOL),
@@ -1987,6 +2435,12 @@ def prepare_selection(
                 "selected_candidates": candidate_records,
                 "selected_candidate_count": len(candidate_records),
                 "parallel_FEA_lane_count": len(candidate_records),
+                "selected_candidates_are_strict_feasible": (
+                    selection_authority
+                    == "strict_latest_hard_plus_physics_q90"
+                ),
+                "exploratory_candidates_cannot_be_promoted_without_"
+                "latest_hard_and_FEA_revalidation": True,
                 "no_exact100_wait_required": True,
                 "incremental_first_terminal_snapshot": True,
                 "screening_only": True,
@@ -2024,6 +2478,15 @@ def prepare_selection(
                 name: len(candidates)
                 for name, candidates in eligible_by_stratum.items()
             },
+            "fallback_pool_stratum_counts": {
+                name: len(candidates)
+                for name, candidates in fallback_by_stratum.items()
+            },
+            "selection_authority": selection_authority,
+            "exploratory_nonpromotion": (
+                selection_authority
+                == "diagnostic_nearest_multi_violation_fallback"
+            ),
             "selected_candidate_count": len(candidate_records),
             "scheduler_submission_performed": False,
         }
@@ -2045,7 +2508,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Authenticate first-terminal bounded-gap populations, merge/NDS "
-            "them, and prepare a corrected-C-only stratified FEA selection"
+            "them, and prepare a physics-delta strict or explicitly "
+            "exploratory nearest-fallback FEA selection"
         )
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -2062,9 +2526,10 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--physics-delta-model",
         type=Path,
+        required=True,
         help=(
-            "Optional sealed current24 log-delta model; it changes only the "
-            "parallel FEA execution priority"
+            "Required sealed current24 log-delta model used for provisional "
+            "q90 resonance eligibility and fallback ranking"
         ),
     )
     prepare.add_argument(

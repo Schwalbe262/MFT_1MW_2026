@@ -72,6 +72,54 @@ def _scientific_collection(task_id: int, seed: int) -> dict:
     }
 
 
+def _fallback_candidate(
+    token: str,
+    *,
+    stratum: str,
+    gap2: float,
+    violation: float,
+    spread: float,
+    f_lcb_hz: float = 12_000.0,
+) -> dict:
+    candidate = _diversity_candidate(
+        token,
+        physics_ucb=8.0e-10 + spread * 1.0e-12,
+        cw2=0.7 + spread * 0.001,
+        gap2=gap2,
+        spread=spread,
+    )
+    candidate.update(
+        {
+            "gap2_stratum": stratum,
+            "volume_L": 700.0 + spread,
+            "total_loss_W": 7_000.0 + spread,
+            "strict_latest_rerank_eligible": False,
+            "strict_latest_rerank_failure_reasons": [
+                "latest_hard_nonphysics_constraints_failed",
+                "physics_delta_fRx_q90_lcb_below_15000Hz",
+            ],
+            "normalized_G": {
+                "Llt_robust_band": violation,
+                selection.CORRECTED_CAP_CONSTRAINT: 1.0e6,
+                "half_magnetizing_resonance_minimum": 1.0e6,
+            },
+        }
+    )
+    candidate["physics_delta_prediction"].update(
+        {
+            "physics_delta_Crx_mean_F": 6.0e-10 + spread * 1.0e-12,
+            "physics_delta_fRx_q90_lcb_Hz": f_lcb_hz,
+        }
+    )
+    candidate["multi_violation_evidence"] = (
+        selection._multi_violation_evidence(  # noqa: SLF001
+            candidate,
+            candidate["physics_delta_prediction"],
+        )
+    )
+    return candidate
+
+
 @pytest.mark.parametrize(
     ("gap2", "expected"),
     [
@@ -238,6 +286,21 @@ def test_active_search_temperature_matches_latest_acceptance() -> None:
         selection._temperature_evidence(physical)
 
 
+def test_temperature_evidence_can_retain_exploratory_overlimit_margin() -> None:
+    physical = {
+        f"temperature_robust_limit:{target}": 0.0
+        for target in selection.ACCEPTANCE_TEMPERATURE_LIMITS_C
+    }
+    primary = next(iter(selection.PRIMARY_WINDING_TEMPERATURE_TARGETS))
+    physical[f"temperature_robust_limit:{primary}"] = 2.5
+    evidence = selection._temperature_evidence(physical, enforce=False)
+    assert evidence[primary]["realized_robust_temperature_C"] == pytest.approx(
+        112.5
+    )
+    assert evidence[primary]["acceptance_margin_C"] == pytest.approx(-2.5)
+    assert evidence[primary]["acceptance_limit_passed"] is False
+
+
 def test_legacy_cap_and_resonance_constraints_are_replaced() -> None:
     assert selection.CORRECTED_CAP_CONSTRAINT in (
         selection.REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
@@ -275,6 +338,105 @@ def test_physics_delta_resonance_constraint_uses_l2_0p2H_formula() -> None:
     assert selection._physics_delta_provisional_resonance_G(  # noqa: SLF001
         lower_capacitance
     ) < 0.0
+
+
+def test_multi_violation_formula_excludes_legacy_gates() -> None:
+    candidate = _fallback_candidate(
+        "a",
+        stratum="low",
+        gap2=0.5,
+        violation=0.1,
+        spread=0.0,
+    )
+    evidence = candidate["multi_violation_evidence"]
+    assert set(evidence["positive_normalized_components"]) == {
+        "Llt_robust_band",
+        selection.PHYSICS_RESONANCE_CONSTRAINT_NAME,
+    }
+    assert evidence["normalized_positive_sum"] == pytest.approx(
+        0.1 + (15_000.0 / 12_000.0 - 1.0)
+    )
+    assert (
+        selection.CORRECTED_CAP_CONSTRAINT
+        not in evidence["positive_normalized_components"]
+    )
+    assert (
+        "half_magnetizing_resonance_minimum"
+        not in evidence["positive_normalized_components"]
+    )
+
+
+def test_nearest_fallback_selects_exactly_four_per_gap_stratum() -> None:
+    candidates = []
+    tokens = iter("abcdefghijklmnopqr")
+    for stratum, gap2 in (("low", 0.5), ("mid", 1.1), ("high", 1.8)):
+        for index in range(6):
+            candidates.append(
+                _fallback_candidate(
+                    next(tokens),
+                    stratum=stratum,
+                    gap2=gap2 + index * 0.01,
+                    violation=0.05 + index * 0.01,
+                    spread=float(index),
+                )
+            )
+    by_stratum, selected = selection._build_nearest_fallback_proposal(  # noqa: SLF001
+        candidates
+    )
+    assert {name: len(pool) for name, pool in by_stratum.items()} == {
+        "low": 6,
+        "mid": 6,
+        "high": 6,
+    }
+    assert len(selected) == 12
+    assert {
+        name: sum(item["gap2_stratum"] == name for item in selected)
+        for name in ("low", "mid", "high")
+    } == {"low": 4, "mid": 4, "high": 4}
+    assert all(item["exploratory_nonpromotion"] is True for item in selected)
+    assert all(item["strict_latest_rerank_eligible"] is False for item in selected)
+
+
+def test_nearest_fallback_is_invariant_to_legacy_gate_values() -> None:
+    candidates = [
+        _fallback_candidate(
+            token,
+            stratum=stratum,
+            gap2=gap2,
+            violation=0.1 + index * 0.01,
+            spread=float(index),
+        )
+        for index, (token, stratum, gap2) in enumerate(
+            zip(
+                "abcdefghijkl",
+                ("low",) * 4 + ("mid",) * 4 + ("high",) * 4,
+                (0.5,) * 4 + (1.1,) * 4 + (1.8,) * 4,
+            )
+        )
+    ]
+    _, first = selection._build_nearest_fallback_proposal(  # noqa: SLF001
+        copy.deepcopy(candidates)
+    )
+    changed = copy.deepcopy(candidates)
+    for index, candidate in enumerate(changed):
+        candidate["normalized_G"][selection.CORRECTED_CAP_CONSTRAINT] = (
+            -1.0e9 + index
+        )
+        candidate["normalized_G"]["half_magnetizing_resonance_minimum"] = (
+            1.0e12 - index
+        )
+        candidate["multi_violation_evidence"] = (
+            selection._multi_violation_evidence(  # noqa: SLF001
+                candidate,
+                candidate["physics_delta_prediction"],
+            )
+        )
+    _, second = selection._build_nearest_fallback_proposal(  # noqa: SLF001
+        changed
+    )
+    assert [item["physical_geometry_sha256"] for item in first] == [
+        item["physical_geometry_sha256"] for item in second
+    ]
 
 
 def test_seed_retry_dedupe_keeps_highest_authenticated_task(
