@@ -21,7 +21,6 @@ import pandas as pd
 
 EXACT_CAP_ONLY_OVERRIDES = {
     "full_model": 1,
-    "round_corner": 0,
     # The input schema requires matrix_on when cap_on is enabled.  No magnetic
     # setup is created or analyzed by this launcher.
     "matrix_on": 1,
@@ -64,10 +63,21 @@ def _write_status(path: Path, **payload) -> None:
     os.replace(temporary, path)
 
 
-def _sealed_cap_only_parameters(parameters: dict) -> dict:
-    """Return an exact full/non-rounded, cap-only parameter payload."""
+def _sealed_cap_only_parameters(
+    parameters: dict,
+    *,
+    rounded: bool = False,
+    core_center_gap_mm: float | None = None,
+    wcp_len_x_mm: float | None = None,
+) -> dict:
+    """Return an exact full-model, cap-only parameter payload."""
     sealed = dict(parameters)
     sealed.update(EXACT_CAP_ONLY_OVERRIDES)
+    sealed["round_corner"] = int(bool(rounded))
+    if core_center_gap_mm is not None:
+        sealed["core_center_gap_mm"] = float(core_center_gap_mm)
+    if wcp_len_x_mm is not None:
+        sealed["wcp_len_x"] = float(wcp_len_x_mm)
     return sealed
 
 
@@ -97,6 +107,7 @@ def _validate_project_path_budget(
 
 
 def _status_base(args: argparse.Namespace, sim, stage: str) -> dict:
+    rounded = bool(getattr(args, "rounded", False))
     return {
         "schema": "mft-direct-full-cap-gui-status-v1",
         "stage": stage,
@@ -104,7 +115,7 @@ def _status_base(args: argparse.Namespace, sim, stage: str) -> dict:
         "project_path": getattr(sim, "project_path", ""),
         "controller_pid": os.getpid(),
         "full_model": True,
-        "rounded_winding": False,
+        "rounded_winding": rounded,
         "solver_dispatch": "cap_only",
     }
 
@@ -118,6 +129,23 @@ def parse_args(argv=None) -> argparse.Namespace:
         default="reference260706_full_nonrounded_cap_gui",
     )
     parser.add_argument("--cores", type=int, default=4)
+    parser.add_argument(
+        "--rounded",
+        action="store_true",
+        help="Build the full model with rounded/bent winding corners.",
+    )
+    parser.add_argument(
+        "--core-center-gap-mm",
+        type=float,
+        default=None,
+        help="Override the physical center-leg air gap for geometry parity.",
+    )
+    parser.add_argument(
+        "--wcp-len-x-mm",
+        type=float,
+        default=None,
+        help="Override the winding cooling plate length for rounded geometry.",
+    )
     parser.add_argument(
         "--prior-ltx-uh",
         type=float,
@@ -160,7 +188,10 @@ def run_direct_cap_gui(args: argparse.Namespace, runner) -> int:
     exit_code = 1
     try:
         parameters = _sealed_cap_only_parameters(
-            _load_parameters(args.params.resolve())
+            _load_parameters(args.params.resolve()),
+            rounded=bool(getattr(args, "rounded", False)),
+            core_center_gap_mm=getattr(args, "core_center_gap_mm", None),
+            wcp_len_x_mm=getattr(args, "wcp_len_x_mm", None),
         )
         input_df, physics_revision = runner._load_fixed_input_parameter(
             parameters
@@ -228,7 +259,9 @@ def run_direct_cap_gui(args: argparse.Namespace, runner) -> int:
                 {
                     "schema": "mft-direct-full-cap-result-v1",
                     "full_model": True,
-                    "rounded_winding": False,
+                    "rounded_winding": bool(
+                        getattr(args, "rounded", False)
+                    ),
                     "capacitance_model": "two_net_screening",
                     "solver_stage": "maxwell_cap",
                     "elapsed_s": float(elapsed),

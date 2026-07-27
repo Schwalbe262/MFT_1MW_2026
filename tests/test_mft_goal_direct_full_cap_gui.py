@@ -182,6 +182,31 @@ def test_write_status_atomically_replaces_document(tmp_path):
     assert not status_path.with_suffix(".json.tmp").exists()
 
 
+def test_rounded_geometry_overrides_are_sealed_without_enabling_other_solves():
+    sealed = MODULE._sealed_cap_only_parameters(
+        {
+            "full_model": 0,
+            "round_corner": 0,
+            "core_center_gap_mm": 0.0,
+            "wcp_len_x": 392.8,
+            "loss_on": 1,
+            "thermal_on": 1,
+        },
+        rounded=True,
+        core_center_gap_mm=0.631417,
+        wcp_len_x_mm=381.7,
+    )
+
+    assert sealed["full_model"] == 1
+    assert sealed["round_corner"] == 1
+    assert sealed["core_center_gap_mm"] == pytest.approx(0.631417)
+    assert sealed["wcp_len_x"] == pytest.approx(381.7)
+    assert sealed["cap_on"] == 1
+    assert sealed["matrix_on"] == 1
+    assert sealed["loss_on"] == 0
+    assert sealed["thermal_on"] == 0
+
+
 def test_windows_aedt_path_budget_rejects_long_result_tree(tmp_path):
     MODULE._validate_project_path_budget(
         Path(r"C:\w\rc5\project\rc5"),
