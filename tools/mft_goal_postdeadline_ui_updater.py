@@ -1116,6 +1116,19 @@ CORRECTED_5T_ROUNDED_FULL_GUI_SIZE_BYTES = 10_980_217
 CORRECTED_5T_ROUNDED_FULL_GUI_GEOMETRY = (
     "58071313a32e81aeaa5bc3febdddb0bfd230a2bec633940a4c180ba8b838c508"
 )
+CORRECTED_5T_FULL_RAW_CAP_AEDT_PATH = (
+    r"C:\w\m580cap1\project"
+    r"\simulation_job_5807135t_full_curved_cap_v1"
+    r"\simulation_job_5807135t_full_curved_cap_v1.aedt"
+)
+CORRECTED_5T_FULL_RAW_CAP_AEDT_SHA256 = (
+    "49c0fbb6900bc7b23fcaf53d93c8050009df0ed3f05adaddd99e6841493c6fe7"
+)
+CORRECTED_5T_FULL_RAW_CAP_RESULT_PATH = r"C:\w\m580cap1\direct_cap_result.json"
+CORRECTED_5T_FULL_RAW_CAP_CRX_NF = 0.635780
+CORRECTED_5T_FULL_RAW_CAP_LIMIT_NF = 0.555365785
+CORRECTED_5T_FULL_RAW_CAP_FMIN_KHZ = 14.0193
+CORRECTED_5T_FULL_RAW_CAP_SOLVE_SECONDS = 142.5687
 ROUNDED_SNAPSHOT_MANIFEST_SHA256 = (
     "09bb2b714843ff7bff25ec1c6ae73849f307beab8dab01d95704cfde91fdeb82"
 )
@@ -6262,22 +6275,17 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
             "580713 h_gap1=19.45mm | 40mm HARD GATE FAIL | FINAL RELEASE OFF"
         ),
         "detail": (
-            "The existing nine-slide DRAFT PPTX and nine-page DRAFT PDF were "
-            "generated from candidate #5 with primary cw1=1.13 mm/gap1=4.6 mm. "
-            "The authoritative reference requires 5.0 mm/1.6 mm, so the files "
-            "are superseded and specification-invalid despite passing 20 layout "
-            "checks. A replacement 5.0 mm/1.6 mm, 6/60-turn, Full rounded "
-            "model-only AEDT has now been generated and is open in the GUI for "
-            "geometry inspection. It is conditional, not a selected final "
-            "design: the corrected 260707 contract sets insulation_min_mm=40, "
-            "but h_gap1 was omitted from PHYSICAL_INSULATION_COLUMNS. Candidate "
-            "580713 has h_gap1=19.45 mm per side and bddff has 8.95 mm, so both "
-            "fail the restored 40 mm hard gate. Even if primary Z clearance is "
-            "explicitly relaxed to 20 mm, 580713 still needs 0.55 mm per side "
-            "of geometry correction. No analysis was run, and symmetric "
-            "nonrounded FEA is not final-confirmed. Publication and final "
-            "release remain disabled pending the clearance decision, corrected "
-            "geometry, and symmetric FEA."
+            "The existing DRAFT drawing used candidate #5 with primary "
+            "cw1/gap1=1.13/4.6 mm; it is superseded because the reference "
+            "requires 5.0/1.6 mm. A replacement 6/60-turn Full rounded "
+            "model-only AEDT is open for inspection. It is conditional, not a "
+            "selected final design. Its h_gap1=19.45 mm/side fails the restored 40 mm "
+            "gate and still needs 0.55 mm per side under the diagnostic 20 mm case. "
+            "No analysis was run in the original inspection project. An "
+            "isolated matching full-rounded capacitance replica was solved: "
+            "raw two-net Crx=0.635780 nF gives 14.0193 kHz at Lm=2 mH and "
+            "1:10 turns, failing 15 kHz. Magnetic/thermal and symmetric "
+            "nonrounded FEA remain unconfirmed; publication is disabled."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
@@ -6286,13 +6294,16 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
             (
                 "conditional inspection model ready=true / selected=false / "
                 "cw1=5.0mm / "
-                "gap1=1.6mm / cw2=0.9mm / turns=6/60 / full_model=true / "
-                "round_corner=true / R10/s4 / analysis_run=false / "
+                "gap1=1.6mm / turns=6/60 / analysis_run=false / "
                 "primary_core_axial_clearance_each=19.45mm / "
                 "bbox=1181.404x999.352x750.0mm / "
                 "surrogate temperatures "
                 "primary=102.182C secondary=105.032C core=119.658C / "
-                "fixed-Lm fmin=15.650kHz"
+                "actual raw-CapMatrix fixed-Lm fmin=14.0193kHz FAIL / "
+                f"Crx={CORRECTED_5T_FULL_RAW_CAP_CRX_NF:.6f}nF / "
+                f"limit={CORRECTED_5T_FULL_RAW_CAP_LIMIT_NF:.9f}nF / "
+                "excess=14.48% / required reduction=12.65% / "
+                "raw two-net CapMatrix / cap dispatch=1 / magnetic=0"
             ),
             (
                 "corrected 260707 contract insulation_min_mm=40 / hard-gate "
