@@ -217,6 +217,7 @@ def update(
     scheduler_url: str,
     core_rescue_plan: Path,
     nsga_receipt: Path | None = None,
+    nsga_prefix: str = NSGA_PREFIX,
     fea_prefix: str = FEA_PREFIX,
     extra_fea_prefixes: Iterable[str] = (),
     local_gui_status: Path | None = None,
@@ -226,7 +227,11 @@ def update(
     receipt_sha256: str | None = None
     if nsga_receipt is not None:
         receipt_ids, receipt_sha256 = _receipt_inventory(nsga_receipt)
-    nsga_rows = _get_tasks(scheduler_url, NSGA_PREFIX, project=None)
+    if not nsga_prefix.startswith(NSGA_PREFIX):
+        raise RuntimeError(
+            "NSGA task prefix must remain inside the corrected-physics lane"
+        )
+    nsga_rows = _get_tasks(scheduler_url, nsga_prefix, project=None)
     if receipt_ids is not None:
         nsga_rows = [row for row in nsga_rows if int(row["id"]) in receipt_ids]
     fea_rows_by_id: dict[int, dict[str, Any]] = {}
@@ -267,6 +272,8 @@ def update(
         )
         nsga_evidence.insert(2, f"receipt={nsga_receipt}")
         nsga_evidence.insert(3, f"receipt SHA256={receipt_sha256}")
+    else:
+        nsga_evidence.insert(1, f"active task prefix={nsga_prefix}")
     if not nsga_rows:
         nsga_evidence.insert(0, "상태=sealed prepare/stage/POST 진행 중")
 
@@ -352,6 +359,7 @@ def update(
         "nsga_task_count": len(nsga_rows),
         "nsga_receipt": str(nsga_receipt) if nsga_receipt else None,
         "nsga_receipt_sha256": receipt_sha256,
+        "nsga_task_prefix": nsga_prefix,
         "nsga_task_id_first": min(receipt_ids) if receipt_ids else None,
         "nsga_task_id_last": max(receipt_ids) if receipt_ids else None,
         "fea_task_count": len(fea_rows),
@@ -372,6 +380,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--scheduler-url", default="http://127.0.0.1:8002")
     parser.add_argument("--core-rescue-plan", type=Path, required=True)
     parser.add_argument("--nsga-receipt", type=Path)
+    parser.add_argument("--nsga-prefix", default=NSGA_PREFIX)
     parser.add_argument("--fea-prefix", default=FEA_PREFIX)
     parser.add_argument("--extra-fea-prefix", action="append", default=[])
     parser.add_argument("--local-gui-status", type=Path)
@@ -401,6 +410,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             scheduler_url=args.scheduler_url,
             core_rescue_plan=args.core_rescue_plan,
             nsga_receipt=args.nsga_receipt,
+            nsga_prefix=args.nsga_prefix,
             fea_prefix=args.fea_prefix,
             extra_fea_prefixes=args.extra_fea_prefix,
             local_gui_status=args.local_gui_status,
