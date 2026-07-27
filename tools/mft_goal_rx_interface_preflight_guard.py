@@ -20,9 +20,9 @@ MARKER_PREFIX = "THERMAL_RX_INTERFACE_PREFLIGHT_JSON="
 EXPECTED_SCHEMA = "thermal-rx-interface-predispatch-v1"
 EXPECTED_INTERFACE_CONTRACT = "thermal-rx-block-interface-coverage-v1"
 EXPECTED_MESH_POLICY = (
-    "b6-rx-block-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+    "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
 )
-EXPECTED_MESH_PLAN_CONTRACT = "thermal-mesh-plan-v7"
+EXPECTED_MESH_PLAN_CONTRACT = "thermal-mesh-plan-v8"
 EXPECTED_RX_MAIN_OBJECTS = ["Rx_main_block_xn", "Rx_main_block_yp"]
 EXPECTED_FIXED_COOLING_SCHEMA = "mft-fixed-thermal-boundary-v1"
 EXPECTED_PROJECT = "MFT_1MW_2026v1"

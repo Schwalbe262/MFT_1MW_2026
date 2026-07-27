@@ -2,6 +2,7 @@ import copy
 from unittest import mock
 
 from tools import mft_goal_rx_interface_preflight_guard as guard
+from tools import mft_goal_rx_interface_replacement_cutover as cutover
 
 
 def _marker() -> dict:
@@ -12,9 +13,9 @@ def _marker() -> dict:
             "thermal-rx-block-interface-coverage-v1"
         ),
         "mesh_policy": (
-            "b6-rx-block-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+            "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
         ),
-        "mesh_plan_contract_version": "thermal-mesh-plan-v7",
+        "mesh_plan_contract_version": "thermal-mesh-plan-v8",
         "rx_main_objects": ["Rx_main_block_xn", "Rx_main_block_yp"],
         "rx_block_shared_pack_count": 1,
         "rx_main_shared_operations": [
@@ -51,6 +52,18 @@ def test_accepts_exact_corrected_predispatch_marker() -> None:
     assert guard._validate_marker(_marker()) == []
 
 
+def test_b7_v8_contract_is_propagated_to_replacement_cutover() -> None:
+    assert cutover.EXPECTED_MESH_POLICY == guard.EXPECTED_MESH_POLICY
+    assert (
+        cutover.EXPECTED_MESH_PLAN_CONTRACT
+        == guard.EXPECTED_MESH_PLAN_CONTRACT
+    )
+    assert (
+        cutover.SOLVER_REVISION
+        == "04a5b190329dd8601c863b7dfce1b97fe5356b28"
+    )
+
+
 def test_accepts_exact_canary_scheduler_readback() -> None:
     task = {
         "project": "MFT_1MW_2026v1",
@@ -78,6 +91,19 @@ def test_rejects_old_separate_objects_topology() -> None:
         "rx_main_shared_operation_native_separate_objects_mismatch" in reasons
     )
     assert "shared_intent_and_native_readback_passed_mismatch" in reasons
+
+
+def test_rejects_superseded_b6_v7_mesh_contract() -> None:
+    value = copy.deepcopy(_marker())
+    value["mesh_policy"] = (
+        "b6-rx-block-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+    )
+    value["mesh_plan_contract_version"] = "thermal-mesh-plan-v7"
+
+    reasons = guard._validate_marker(value)
+
+    assert "mesh_policy_mismatch" in reasons
+    assert "mesh_plan_contract_version_mismatch" in reasons
 
 
 def test_rejects_fixed_cooling_identity_drift() -> None:

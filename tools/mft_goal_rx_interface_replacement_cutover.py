@@ -32,7 +32,7 @@ RUNTIME_ROOT = Path(
 )
 DEFAULT_OUTPUT = RUNTIME_ROOT / "rx_interface_corrected24_cutover_v1"
 SCHEDULER = "http://127.0.0.1:8002"
-SOLVER_REVISION = "c6a016c3a880acd632b12e52b02099cfe7b90fc5"
+SOLVER_REVISION = "04a5b190329dd8601c863b7dfce1b97fe5356b28"
 LIBRARY_REVISION = "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
 CANARY_TASK_ID = 97041
 CANARY_NAME = "mft-goal-rx-shared-interface-canary-v1"
@@ -51,6 +51,10 @@ AUTHORIZATION_PHRASE = (
     "AUTHORIZE EXACT CORRECTED RX INTERFACE 24-LANE CUTOVER"
 )
 PREFLIGHT_PREFIX = "THERMAL_RX_INTERFACE_PREFLIGHT_JSON="
+EXPECTED_MESH_POLICY = (
+    "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+)
+EXPECTED_MESH_PLAN_CONTRACT = "thermal-mesh-plan-v8"
 
 CAMPAIGNS = (
     {
@@ -239,9 +243,9 @@ def validate_canary() -> dict[str, Any]:
         or marker.get("passed") is not True
         or marker.get("thermal_rx_block_interface_contract_version")
         != "thermal-rx-block-interface-coverage-v1"
-        or marker.get("mesh_policy")
-        != "b6-rx-block-shared-region-wcp-pad-symmetry-contact-clipped-v1"
-        or marker.get("mesh_plan_contract_version") != "thermal-mesh-plan-v7"
+        or marker.get("mesh_policy") != EXPECTED_MESH_POLICY
+        or marker.get("mesh_plan_contract_version")
+        != EXPECTED_MESH_PLAN_CONTRACT
         or marker.get("rx_main_objects")
         != ["Rx_main_block_xn", "Rx_main_block_yp"]
         or marker.get("shared_intent_and_native_readback_passed") is not True
