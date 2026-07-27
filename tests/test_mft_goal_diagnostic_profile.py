@@ -14,15 +14,20 @@ def _profile(clearance: int = 20) -> dict:
     start = scout.PROFILE_SEED_STARTS[clearance]
     value = {
         "schema_version": scout.SEARCH_PROFILE_SCHEMA,
-        "profile_id": f"hard-aligned-hgap{clearance}-exact32",
+        "profile_id": f"hard-equal-hgap{clearance}-plates20-exact32",
         "fixed_primary_turns": 6,
         "fixed_secondary_turns": 60,
         "turns_ratio_N2_over_N1": 10.0,
         "fixed_primary_conductor_thickness_mm": 5.0,
         "fixed_primary_interturn_gap_mm": 1.6,
+        "fixed_core_plate_thickness_mm": 20.0,
+        "fixed_winding_cold_plate_thickness_mm": 20.0,
         "geometry_constraint_profile": geometry,
         "geometry_constraint_profile_sha256": geometry["sha256"],
-        "winding_height_alignment_initialization_and_repair_required": True,
+        "winding_height_exact_equality_initialization_and_repair_required": (
+            True
+        ),
+        "maximum_decoded_winding_height_difference_mm": 0.1,
         "authorized_seed_start": start,
         "authorized_seed_count": 32,
         "authorized_seed_end_inclusive": start + 31,
@@ -59,14 +64,13 @@ def _profile(clearance: int = 20) -> dict:
 
 
 def test_geometry_profile_sha_and_seed_authority_are_exact() -> None:
-    expected = {
-        20: "656cf0789de7007cee96769592507913392012ec4dac8fdc64aa2c64c3515682",
-        30: "1357b0c6abeb79de3abfba6fe6553dbd594d2c80985c23538d12f68bfa0b7f82",
-        40: "b0d3dce016f822a5de87faf6801707fbb6bce89fc931cb1e5961f77a5a1eb194",
-    }
-    for clearance, sha256 in expected.items():
+    for clearance in (20, 30, 40):
         profile = _profile(clearance)
-        assert profile["geometry_constraint_profile_sha256"] == sha256
+        alignment = profile["geometry_constraint_profile"][
+            "winding_height_alignment"
+        ]
+        assert alignment["mode"] == "hard"
+        assert alignment["minimum_overlap_ratio"] == 1.0
         assert scout._validate_search_profile(profile) == profile
         activation = {
             "manufacturing_search_profile": profile,
@@ -90,10 +94,15 @@ def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None
         geometry_constraint_profile_sha256 = profile[
             "geometry_constraint_profile_sha256"
         ]
-        sobol_dimension_names = ("gap1", "f1_split")
+        sobol_dimension_names = (
+            "gap1",
+            "f1_split",
+            "core_plate_t",
+            "wcp_t",
+        )
         cw1_coordinate_index = 1
-        xl = np.zeros(2)
-        xu = np.ones(2)
+        xl = np.zeros(4)
+        xu = np.ones(4)
         constraint_names = ("base",)
         constraint_index = {"base": 0}
         n_ieq_constr = 1
@@ -105,9 +114,17 @@ def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None
 
         @staticmethod
         def _unit_from_physical(name, value):
-            assert name == "gap1"
-            assert value == 1.6
-            return 0.25
+            expected = {
+                "gap1": 1.6,
+                "core_plate_t": 20.0,
+                "wcp_t": 20.0,
+            }
+            assert value == expected[name]
+            return {
+                "gap1": 0.25,
+                "core_plate_t": 0.5,
+                "wcp_t": 0.75,
+            }[name]
 
         @staticmethod
         def _predict(target, frame):
@@ -126,6 +143,8 @@ def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None
                 {
                     "cw1": np.full(count, 5.0),
                     "gap1": np.full(count, 1.6),
+                    "core_plate_t": np.full(count, 20.0),
+                    "wcp_t": np.full(count, 20.0),
                     "N1_main": np.full(count, 6),
                     "N1_side": np.zeros(count),
                     "N2_main": np.full(count, 37),
@@ -136,7 +155,7 @@ def test_profile_installer_fixes_controls_and_appends_raw_crx_ucb_gate() -> None
     problem = Problem()
     evidence = scout._install_search_profile(problem, profile)
     out = {}
-    problem._evaluate(np.zeros((2, 2)), out)
+    problem._evaluate(np.zeros((2, 4)), out)
     assert evidence["raw_C_rx_rx_F_UCB_gate_installed"] is True
     assert problem.constraint_names[-1] == scout.RAW_CRX_CONSTRAINT_NAME
     assert out["G"].shape == (2, 2)

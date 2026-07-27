@@ -68,7 +68,10 @@ PROFILE_SEED_COUNT = 32
 FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM = 5.0
 FIXED_PRIMARY_INTERTURN_GAP_MM = 1.6
 FIXED_SECONDARY_TURNS = 60
-MINIMUM_WINDING_HEIGHT_OVERLAP_RATIO = 0.9
+FIXED_CORE_PLATE_THICKNESS_MM = 20.0
+FIXED_WINDING_COLD_PLATE_THICKNESS_MM = 20.0
+REQUIRED_WINDING_HEIGHT_OVERLAP_RATIO = 1.0
+MAXIMUM_DECODED_WINDING_HEIGHT_DIFFERENCE_MM = 0.1
 
 
 def _profile_clearance_mm(value: Any) -> int:
@@ -90,7 +93,7 @@ def _geometry_profile(clearance_mm: Any) -> dict[str, Any]:
         primary_axial_clearance_min_mm=float(clearance),
         winding_height_alignment_mode="hard",
         winding_height_minimum_overlap_ratio=(
-            MINIMUM_WINDING_HEIGHT_OVERLAP_RATIO
+            REQUIRED_WINDING_HEIGHT_OVERLAP_RATIO
         ),
         diagnostic_override=clearance < 40,
     )
@@ -126,7 +129,9 @@ def _build_search_profile(
         raise RuntimeError("raw C_rx_rx_F calibration cohort is incomplete")
     value = {
         "schema_version": SEARCH_PROFILE_SCHEMA,
-        "profile_id": f"hard-aligned-hgap{clearance}-exact32",
+        "profile_id": (
+            f"hard-equal-hgap{clearance}-plates20-exact32"
+        ),
         "fixed_primary_turns": FIXED_PRIMARY_TURNS,
         "fixed_secondary_turns": FIXED_SECONDARY_TURNS,
         "turns_ratio_N2_over_N1": 10.0,
@@ -136,9 +141,18 @@ def _build_search_profile(
         "fixed_primary_interturn_gap_mm": (
             FIXED_PRIMARY_INTERTURN_GAP_MM
         ),
+        "fixed_core_plate_thickness_mm": FIXED_CORE_PLATE_THICKNESS_MM,
+        "fixed_winding_cold_plate_thickness_mm": (
+            FIXED_WINDING_COLD_PLATE_THICKNESS_MM
+        ),
         "geometry_constraint_profile": copy.deepcopy(geometry),
         "geometry_constraint_profile_sha256": geometry["sha256"],
-        "winding_height_alignment_initialization_and_repair_required": True,
+        "winding_height_exact_equality_initialization_and_repair_required": (
+            True
+        ),
+        "maximum_decoded_winding_height_difference_mm": (
+            MAXIMUM_DECODED_WINDING_HEIGHT_DIFFERENCE_MM
+        ),
         "authorized_seed_start": PROFILE_SEED_STARTS[clearance],
         "authorized_seed_count": PROFILE_SEED_COUNT,
         "authorized_seed_end_inclusive": (
@@ -195,9 +209,12 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         "turns_ratio_N2_over_N1",
         "fixed_primary_conductor_thickness_mm",
         "fixed_primary_interturn_gap_mm",
+        "fixed_core_plate_thickness_mm",
+        "fixed_winding_cold_plate_thickness_mm",
         "geometry_constraint_profile",
         "geometry_constraint_profile_sha256",
-        "winding_height_alignment_initialization_and_repair_required",
+        "winding_height_exact_equality_initialization_and_repair_required",
+        "maximum_decoded_winding_height_difference_mm",
         "authorized_seed_start",
         "authorized_seed_count",
         "authorized_seed_end_inclusive",
@@ -234,7 +251,7 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
     if (
         set(profile) != expected_keys
         or profile.get("profile_id")
-        != f"hard-aligned-hgap{clearance}-exact32"
+        != f"hard-equal-hgap{clearance}-plates20-exact32"
         or profile.get("fixed_primary_turns") != FIXED_PRIMARY_TURNS
         or profile.get("fixed_secondary_turns") != FIXED_SECONDARY_TURNS
         or profile.get("turns_ratio_N2_over_N1") != 10.0
@@ -242,12 +259,18 @@ def _validate_search_profile(value: Mapping[str, Any]) -> dict[str, Any]:
         != FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM
         or profile.get("fixed_primary_interturn_gap_mm")
         != FIXED_PRIMARY_INTERTURN_GAP_MM
+        or profile.get("fixed_core_plate_thickness_mm")
+        != FIXED_CORE_PLATE_THICKNESS_MM
+        or profile.get("fixed_winding_cold_plate_thickness_mm")
+        != FIXED_WINDING_COLD_PLATE_THICKNESS_MM
         or profile.get("geometry_constraint_profile_sha256")
         != geometry["sha256"]
         or profile.get(
-            "winding_height_alignment_initialization_and_repair_required"
+            "winding_height_exact_equality_initialization_and_repair_required"
         )
         is not True
+        or profile.get("maximum_decoded_winding_height_difference_mm")
+        != MAXIMUM_DECODED_WINDING_HEIGHT_DIFFERENCE_MM
         or profile.get("authorized_seed_start")
         != PROFILE_SEED_STARTS[clearance]
         or profile.get("authorized_seed_count") != PROFILE_SEED_COUNT
@@ -307,10 +330,13 @@ def _install_search_profile(
     ]:
         raise RuntimeError("diagnostic geometry profile was not installed")
     coordinate_names = tuple(problem.sobol_dimension_names)
-    if "gap1" not in coordinate_names:
-        raise RuntimeError("primary gap coordinate is unavailable")
+    required_coordinates = {"gap1", "core_plate_t", "wcp_t"}
+    if not required_coordinates.issubset(coordinate_names):
+        raise RuntimeError("fixed manufacturing coordinate is unavailable")
     cw1_index = int(problem.cw1_coordinate_index)
     gap1_index = coordinate_names.index("gap1")
+    core_plate_index = coordinate_names.index("core_plate_t")
+    wcp_index = coordinate_names.index("wcp_t")
     cw1_coordinate = float(
         preflight.cw1_unit_coordinate(
             FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM
@@ -321,10 +347,24 @@ def _install_search_profile(
             "gap1", FIXED_PRIMARY_INTERTURN_GAP_MM
         )
     )
+    core_plate_coordinate = float(
+        problem._unit_from_physical(
+            "core_plate_t", FIXED_CORE_PLATE_THICKNESS_MM
+        )
+    )
+    wcp_coordinate = float(
+        problem._unit_from_physical(
+            "wcp_t", FIXED_WINDING_COLD_PLATE_THICKNESS_MM
+        )
+    )
     problem.xl[cw1_index] = cw1_coordinate
     problem.xu[cw1_index] = cw1_coordinate
     problem.xl[gap1_index] = gap1_coordinate
     problem.xu[gap1_index] = gap1_coordinate
+    problem.xl[core_plate_index] = core_plate_coordinate
+    problem.xu[core_plate_index] = core_plate_coordinate
+    problem.xl[wcp_index] = wcp_coordinate
+    problem.xu[wcp_index] = wcp_coordinate
 
     base_evaluate = problem._evaluate
     base_names = tuple(problem.constraint_names)
@@ -381,6 +421,18 @@ def _install_search_profile(
                     or not math.isclose(
                         float(row["gap1"]),
                         FIXED_PRIMARY_INTERTURN_GAP_MM,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    or not math.isclose(
+                        float(row["core_plate_t"]),
+                        FIXED_CORE_PLATE_THICKNESS_MM,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    or not math.isclose(
+                        float(row["wcp_t"]),
+                        FIXED_WINDING_COLD_PLATE_THICKNESS_MM,
                         rel_tol=0.0,
                         abs_tol=1e-12,
                     )
@@ -453,6 +505,10 @@ def _install_search_profile(
             "cw1_coordinate": cw1_coordinate,
             "gap1_coordinate_index": gap1_index,
             "gap1_coordinate": gap1_coordinate,
+            "core_plate_t_coordinate_index": core_plate_index,
+            "core_plate_t_coordinate": core_plate_coordinate,
+            "wcp_t_coordinate_index": wcp_index,
+            "wcp_t_coordinate": wcp_coordinate,
             "fixed_primary_turns": FIXED_PRIMARY_TURNS,
             "fixed_secondary_turns": FIXED_SECONDARY_TURNS,
             "raw_C_rx_rx_F_UCB_gate_installed": True,
@@ -485,6 +541,7 @@ def _aligned_bank_proof(
         ]
     )
     overlaps: list[float] = []
+    height_differences: list[float] = []
     h_gap1: list[float] = []
     for index in range(len(frame)):
         row = frame.iloc[index]
@@ -492,13 +549,27 @@ def _aligned_bank_proof(
         nwh2 = float(row["nwh2"])
         overlap = min(nwh1, nwh2) / max(nwh1, nwh2)
         overlaps.append(overlap)
+        height_differences.append(abs(nwh1 - nwh2))
         h_gap1.append(float(row["h_gap1"]))
         if (
-            overlap < MINIMUM_WINDING_HEIGHT_OVERLAP_RATIO
-            or h_gap1[-1] < clearance
+            height_differences[-1]
+            > MAXIMUM_DECODED_WINDING_HEIGHT_DIFFERENCE_MM
+            or h_gap1[-1] + 1e-9 < clearance
             or not math.isclose(
                 float(row["cw1"]),
                 FIXED_PRIMARY_CONDUCTOR_THICKNESS_MM,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                float(row["core_plate_t"]),
+                FIXED_CORE_PLATE_THICKNESS_MM,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                float(row["wcp_t"]),
+                FIXED_WINDING_COLD_PLATE_THICKNESS_MM,
                 rel_tol=0.0,
                 abs_tol=1e-12,
             )
@@ -513,7 +584,16 @@ def _aligned_bank_proof(
             or int(row["N2_main"]) + int(row["N2_side"])
             != FIXED_SECONDARY_TURNS
         ):
-            raise RuntimeError("aligned compact bank profile proof failed")
+            raise RuntimeError(
+                "aligned compact bank profile proof failed: "
+                f"row={index},h_gap1={h_gap1[-1]},overlap={overlap},"
+                f"height_difference={height_differences[-1]},"
+                f"cw1={float(row['cw1'])},gap1={float(row['gap1'])},"
+                f"core_plate_t={float(row['core_plate_t'])},"
+                f"wcp_t={float(row['wcp_t'])},"
+                f"N1={int(row['N1_main']) + int(row['N1_side'])},"
+                f"N2={int(row['N2_main']) + int(row['N2_side'])}"
+            )
     return goal_launch._seal(
         {
             "schema_version": ALIGNED_BANK_PROOF_SCHEMA,
@@ -527,12 +607,18 @@ def _aligned_bank_proof(
             "required_h_gap1_mm": clearance,
             "minimum_winding_height_overlap_ratio": min(overlaps),
             "required_winding_height_overlap_ratio": (
-                MINIMUM_WINDING_HEIGHT_OVERLAP_RATIO
+                REQUIRED_WINDING_HEIGHT_OVERLAP_RATIO
+            ),
+            "maximum_decoded_winding_height_difference_mm": max(
+                height_differences
+            ),
+            "allowed_decoded_winding_height_difference_mm": (
+                MAXIMUM_DECODED_WINDING_HEIGHT_DIFFERENCE_MM
             ),
             "all_rows_repair_fixed_points": True,
             "all_rows_decoder_valid": True,
             "all_rows_manufacturing_controls_attested": True,
-            "aligned_initialization_and_repair_verified": True,
+            "exact_equal_initialization_and_repair_verified": True,
         }
     )
 

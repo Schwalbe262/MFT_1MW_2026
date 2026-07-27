@@ -767,7 +767,15 @@ def build_plan(
                     "geometry_constraint_profile_sha256": common[
                         "geometry_constraint_profile_sha256"
                     ],
-                    "aligned_initialization_and_repair_required": True,
+                    "exact_equal_winding_height_initialization_and_repair_required": (
+                        True
+                    ),
+                    "fixed_core_plate_thickness_mm": (
+                        scout.FIXED_CORE_PLATE_THICKNESS_MM
+                    ),
+                    "fixed_winding_cold_plate_thickness_mm": (
+                        scout.FIXED_WINDING_COLD_PLATE_THICKNESS_MM
+                    ),
                     "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
                 }
             ),
@@ -871,7 +879,15 @@ def _validate_deployment_inventory(
                 "geometry_constraint_profile_sha256": plan[
                     "geometry_constraint_profile_sha256"
                 ],
-                "aligned_initialization_and_repair_required": True,
+                "exact_equal_winding_height_initialization_and_repair_required": (
+                    True
+                ),
+                "fixed_core_plate_thickness_mm": (
+                    scout.FIXED_CORE_PLATE_THICKNESS_MM
+                ),
+                "fixed_winding_cold_plate_thickness_mm": (
+                    scout.FIXED_WINDING_COLD_PLATE_THICKNESS_MM
+                ),
                 "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
             }
         )
