@@ -1103,6 +1103,19 @@ ROUNDED_SNAPSHOT_SHA256 = (
     "c71a94a8b23a9cf8fd4ab9a98083df45f350cf7586b2f1e449deca30380cd426"
 )
 ROUNDED_SNAPSHOT_SIZE_BYTES = 33_204_563
+CORRECTED_5T_ROUNDED_FULL_GUI_PATH = (
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\local_bddff5t_full_curved_gui_v3\simulation"
+    r"\simulation_job_bddff5t_full_curved_model_v3_20260727"
+    r"\simulation_job_bddff5t_full_curved_model_v3_20260727.aedt"
+)
+CORRECTED_5T_ROUNDED_FULL_GUI_SHA256 = (
+    "65a2c36565e6f91c3f5cb5c917c213b3c5a8ead40690c91177e402384e7d7cfa"
+)
+CORRECTED_5T_ROUNDED_FULL_GUI_SIZE_BYTES = 10_982_090
+CORRECTED_5T_ROUNDED_FULL_GUI_GEOMETRY = (
+    "bddff419f1efb912820d51cdb725e18482d0b09fbb2958b68c4e460d488c44d6"
+)
 ROUNDED_SNAPSHOT_MANIFEST_SHA256 = (
     "09bb2b714843ff7bff25ec1c6ae73849f307beab8dab01d95704cfde91fdeb82"
 )
@@ -6245,21 +6258,42 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
     return {
         "id": FINAL_DRAWING_CARD_ID,
         "title": (
-            "CODEX | DRAWING INVALID | PRIMARY 5T MISMATCH | "
-            "DRAFT SUPERSEDED | FINAL RELEASE OFF"
+            "CODEX | 5T FULL ROUNDED GUI READY | DRAFT STILL SUPERSEDED | "
+            "SYMMETRIC PASS PENDING | FINAL RELEASE OFF"
         ),
         "detail": (
             "The existing nine-slide DRAFT PPTX and nine-page DRAFT PDF were "
             "generated from candidate #5 with primary cw1=1.13 mm/gap1=4.6 mm. "
             "The authoritative reference requires 5.0 mm/1.6 mm, so the files "
             "are superseded and specification-invalid despite passing 20 layout "
-            "checks. Publication and final release are disabled until a corrected "
-            "5T design is selected, modeled, and verified."
+            "checks. A replacement 5.0 mm/1.6 mm, 6/60-turn, Full rounded "
+            "model-only AEDT has now been generated and is open in the GUI for "
+            "geometry inspection. It uses the compact bddff source candidate, "
+            "R10/s4 winding corners, and the current 0.631417 mm Lm=2mH gap "
+            "estimate. No analysis was run. Publication and final release remain "
+            "disabled until the symmetric nonrounded candidate passes the tuned-"
+            "gap thermal gate."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 0,
+        "progress_pct": 25,
         "evidence": [
+            (
+                "replacement inspection model ready=true / cw1=5.0mm / "
+                "gap1=1.6mm / cw2=0.9mm / turns=6/60 / full_model=true / "
+                "round_corner=true / R10/s4 / analysis_run=false"
+            ),
+            (
+                f"replacement AEDT={CORRECTED_5T_ROUNDED_FULL_GUI_SIZE_BYTES:,}B / "
+                f"SHA256 {CORRECTED_5T_ROUNDED_FULL_GUI_SHA256} / "
+                f"source geometry={CORRECTED_5T_ROUNDED_FULL_GUI_GEOMETRY[:12]} / "
+                f"path={CORRECTED_5T_ROUNDED_FULL_GUI_PATH}"
+            ),
+            (
+                "rounded Full bounded conversion: wcp_len_x "
+                "399.9->388.9mm to retain <=80% straight-contact readback / "
+                "fan=1.5m/s / TIM and pads=2mm,k=0.2W/mK unchanged"
+            ),
             (
                 "drawing validity=false / superseded=true / "
                 "primary reference=5.0/1.6mm / draft model=1.13/4.6mm / "
@@ -6277,19 +6311,10 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
                 "straight spans + concentric corner arcs / circular coil=false"
             ),
             (
-                f"rounded AEDT file fallback={ROUNDED_SNAPSHOT_SIZE_BYTES:,}B / "
-                f"SHA256 {ROUNDED_SNAPSHOT_SHA256} / scientific model=false"
-            ),
-            (
                 f"drawing views exported={ROUNDED_DRAWING_VIEW_COUNT} PNG / "
                 f"primary manifest SHA256 {ROUNDED_DRAWING_VIEWS_MANIFEST_SHA256} / "
                 "supplemental manifest SHA256 "
                 f"{ROUNDED_DRAWING_SUPPLEMENTAL_MANIFEST_SHA256}"
-            ),
-            (
-                "source project save=false / solver invoked=false / "
-                f"corrected DRAFT PPTX slides={ROUNDED_DRAWING_DRAFT_SLIDES} / "
-                f"corrected DRAFT PDF pages={ROUNDED_DRAWING_DRAFT_SLIDES}"
             ),
             (
                 f"drawing readiness QA={ROUNDED_DRAWING_QA_PASSED}/"
@@ -6316,10 +6341,6 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
                 f"bounded correction contingency commit="
                 f"{ROUNDED_BOUNDED_CORRECTION_COMMIT} / prepared=true / "
                 "Scheduler POST0 / submitted=false / 5T eligible=false"
-            ),
-            (
-                "audit root=C:\\Users\\peets\\slurm_scheduler_runtime\\"
-                "mft_goal_20260726\\drawing_reference_audit_v1"
             ),
         ],
     }
