@@ -8885,23 +8885,44 @@ def _active_truth_ui_cards(
         {
             "id": "codex-active-contract-20260727",
             "title": (
-                "ACTIVE HARD CONTRACT | 1200x900x750 UPPER BOUND | "
+                "ACTIVE HARD CONTRACT | 1200x1000 UPPER BOUND | "
                 "gap2 0.35-2.00 | cw2 0.30-1.00"
             ),
             "detail": (
-                "1200 mm is an upper bound, not a target. The replacement "
-                "profile varies gap2 over 0.35..2.00 mm and hard-bounds cw2 "
-                "to 0.30..1.00 mm. Existing fixed-gap lanes are collect-only."
+                "1200x1000 mm is an upper bound, not a target. The current "
+                "exact100 envelope is W<=1200, L<=900, H<=750 mm and its "
+                "terminal result is pending. The replacement profile varies "
+                "gap2 over 0.35..2.00 mm and hard-bounds cw2 to 0.30..1.00 mm. "
+                "Existing fixed-gap lanes are collect-only."
             ),
             "state": "in_progress",
             "updated_at": observed_at,
             "progress_pct": 35,
             "evidence": [
-                "envelope_mm: W<=1200 / L<=900 / H<=750",
+                "1200x1000 is an upper bound, not a target or candidate",
+                (
+                    "current exact100 envelope_mm: W<=1200 / L<=900 / H<=750 "
+                    "/ terminal=pending"
+                ),
                 "secondary interturn gap2 variable range=0.350..2.000mm",
                 "secondary conductor thickness cw2 hard range=0.300..1.000mm",
-                "smaller surrogate points exist near 1040x899.86x695 and 983x899.24x695mm",
-                "smaller points are not feasible and not FEA-validated",
+                (
+                    "authenticated old smaller surrogate="
+                    "1040.000x899.860x695.000mm / INVALID/unvalidated / "
+                    "current hard-feasible=false"
+                ),
+                (
+                    "old surrogate turns=6/60 / cw1/gap1=5/1.6mm / "
+                    "cw2/gap2=2.313/0.350mm"
+                ),
+                (
+                    "old surrogate temperatures="
+                    "Tx227.681C/Rx257.329C/core252.220C"
+                ),
+                (
+                    "old surrogate B1.67177T / f16.053kHz / "
+                    "no symmetric FEA (symmetric FEA=none)"
+                ),
                 "temperature_C: primary<=110 / secondary<=130 / core<=130",
                 "core cooling plate thickness=20.0mm exactly",
                 "winding cold-plate thickness=20.0mm exactly",
@@ -9307,11 +9328,15 @@ def merge_status(
             "submitted" if exact100_submitted == 100 else "preparing"
         )
         result["summary"] = (
-            "Active replacement contract: W<=1200, L<=900, H<=750 mm "
-            "(upper bounds, not size targets); gap2=0.35..2.00 mm; "
-            "cw2=0.30..1.00 mm. Smaller surrogate points near "
-            "1040x899.86x695 and 983x899.24x695 mm exist but are not "
-            "feasible or FEA-validated. The old fixed-gap exact100 lane is "
+            "The 1200x1000 mm envelope is an upper bound, not a target or "
+            "candidate. The current exact100 envelope is W<=1200, L<=900, "
+            "H<=750 mm and its terminal result is pending; gap2=0.35..2.00 mm; "
+            "cw2=0.30..1.00 mm. The authenticated old smaller surrogate "
+            "1040.000x899.860x695.000 mm is INVALID/unvalidated: turns 6/60, "
+            "cw1/gap1=5/1.6 mm, cw2/gap2=2.313/0.350 mm, "
+            "Tx227.681C/Rx257.329C/core252.220C, B1.67177T, f16.053kHz, "
+            "no symmetric FEA, and current hard-feasible=false. The old "
+            "fixed-gap exact100 lane is "
             f"{exact100_phase} with authenticated submitted count "
             f"{exact100_submitted}/100 and is collect-only. The replacement "
             "seed2607264300..4399 priority100 lane is preparing with POST0."
@@ -9333,8 +9358,14 @@ def merge_status(
                 "replacement profile uses "
                 "gap2=0.35..2.00 mm, cw2=0.30..1.00 mm, seeds "
                 "2607264300..4399 at priority100, and is preparing with "
-                "Scheduler POST0. Smaller surrogate points exist below "
-                "1200 mm width but are not feasible or FEA-validated. "
+                "Scheduler POST0. The 1200x1000 mm envelope is an upper "
+                "bound, not a target or candidate; the current exact100 "
+                "envelope is W<=1200, L<=900, H<=750 mm and its terminal "
+                "result is pending. The authenticated old smaller surrogate "
+                "1040.000x899.860x695.000 mm is INVALID/unvalidated: turns "
+                "6/60, cw1/gap1=5/1.6 mm, cw2/gap2=2.313/0.350 mm, "
+                "Tx227.681C/Rx257.329C/core252.220C, B1.67177T, f16.053kHz, "
+                "no symmetric FEA, and current hard-feasible=false. "
                 "Equal physical air gaps on all three core legs still require "
                 "symmetric FEA; final promotion remains false."
             )

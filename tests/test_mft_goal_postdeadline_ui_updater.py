@@ -3866,7 +3866,11 @@ def test_active_truth_replaces_fixed_gap_contract_without_false_post_claim() -> 
     contract_truth = " | ".join(
         [contract["title"], contract["detail"], *contract["evidence"]]
     )
-    assert "1200x900x750 UPPER BOUND" in contract_truth
+    assert "1200x1000 UPPER BOUND" in contract_truth
+    assert "current exact100 envelope_mm: W<=1200 / L<=900 / H<=750" in (
+        contract_truth
+    )
+    assert "terminal=pending" in contract_truth
     assert "gap2 variable range=0.350..2.000mm" in contract_truth
     assert "cw2 hard range=0.300..1.000mm" in contract_truth
     assert "lower=upper=0.350" not in contract_truth
@@ -3907,6 +3911,45 @@ def test_active_truth_shows_smaller_points_as_unvalidated_not_passes() -> None:
         if card["id"] == "codex-active-contract-20260727"
     )
     value = " | ".join([contract["detail"], *contract["evidence"]])
-    assert "1040x899.86x695" in value
-    assert "983x899.24x695" in value
-    assert "not feasible and not FEA-validated" in value
+    assert "1040.000x899.860x695.000mm" in value
+    assert "INVALID/unvalidated" in value
+    assert "current hard-feasible=false" in value
+    assert "turns=6/60" in value
+    assert "cw1/gap1=5/1.6mm" in value
+    assert "cw2/gap2=2.313/0.350mm" in value
+    assert "Tx227.681C/Rx257.329C/core252.220C" in value
+    assert "B1.67177T" in value
+    assert "f16.053kHz" in value
+    assert "no symmetric FEA" in value
+    assert "983x899.24x695" not in value
+
+
+def test_compact_summary_uses_only_authenticated_smaller_surrogate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        updater,
+        "_active_exact100_post_state",
+        lambda: {"submitted_count": 0, "receipt_path": None},
+    )
+
+    merged = updater.merge_status(
+        _status(),
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+        compact_active_truth_ui=True,
+    )
+
+    summary = merged["summary"]
+    assert "1200x1000 mm envelope is an upper bound" in summary
+    assert "current exact100 envelope is W<=1200, L<=900, H<=750 mm" in summary
+    assert "terminal result is pending" in summary
+    assert "1040.000x899.860x695.000 mm is INVALID/unvalidated" in summary
+    assert "cw1/gap1=5/1.6 mm" in summary
+    assert "cw2/gap2=2.313/0.350 mm" in summary
+    assert "Tx227.681C/Rx257.329C/core252.220C" in summary
+    assert "B1.67177T" in summary
+    assert "f16.053kHz" in summary
+    assert "no symmetric FEA" in summary
+    assert "current hard-feasible=false" in summary
+    assert "983x899.24x695" not in summary
