@@ -440,45 +440,57 @@ def cycle(
             or int(payload.get("memory_mb", -1)) != 65_536
         ):
             raise RuntimeError("reserve payload thread/resource contract drifted")
-    used_seeds = {int(row["seed"]) for row in replacement_entries}
-    available = sorted(
-        (
-            payload
-            for payload in expected.values()
-            if int(payload["payload_json"]["seed"]) not in used_seeds
-        ),
-        key=lambda payload: int(payload["payload_json"]["seed"]),
-    )
-    if deficit > len(available):
-        raise RuntimeError(
-            f"reserve exhausted: deficit={deficit}, available={len(available)}"
-        )
     inventory = offload._scheduler_inventory(
         scheduler=scheduler,
         name_prefix=offload._task_name_prefix(plan),
         expected=expected,
     )
     submitted: list[dict[str, Any]] = []
-    for payload in available[:deficit]:
-        row, inventory = _submit_one(
-            offload=offload,
-            scheduler=scheduler,
-            plan=plan,
-            tasks=tasks,
-            expected=expected,
-            inventory=inventory,
-            payload=payload,
+    observed_after = observed_before
+    while True:
+        active_current = sum(
+            row["status"] in ACTIVE for row in observed_after
         )
-        replacement_entries.append(row)
-        submitted.append(row)
-        ledger = dict(ledger)
-        ledger["replacement_entries"] = replacement_entries
-        ledger = _save_ledger(state_root, ledger)
+        current_deficit = max(0, TARGET_ACTIVE - active_current)
+        if current_deficit == 0:
+            break
+        used_seeds = {int(row["seed"]) for row in replacement_entries}
+        available = sorted(
+            (
+                payload
+                for payload in expected.values()
+                if int(payload["payload_json"]["seed"]) not in used_seeds
+            ),
+            key=lambda payload: int(payload["payload_json"]["seed"]),
+        )
+        if current_deficit > len(available):
+            raise RuntimeError(
+                "reserve exhausted: "
+                f"deficit={current_deficit}, available={len(available)}"
+            )
+        for payload in available[:current_deficit]:
+            row, inventory = _submit_one(
+                offload=offload,
+                scheduler=scheduler,
+                plan=plan,
+                tasks=tasks,
+                expected=expected,
+                inventory=inventory,
+                payload=payload,
+            )
+            replacement_entries.append(row)
+            submitted.append(row)
+            ledger = dict(ledger)
+            ledger["replacement_entries"] = replacement_entries
+            ledger = _save_ledger(state_root, ledger)
+        # Original tasks can finish while a large refill batch is being
+        # submitted.  Re-observe and top up that newly opened deficit in the
+        # same cycle instead of claiming the first snapshot still equals 100.
+        observed_after = _observe(
+            scheduler=scheduler,
+            entries=[*base_entries, *replacement_entries],
+        )
 
-    observed_after = _observe(
-        scheduler=scheduler,
-        entries=[*base_entries, *replacement_entries],
-    )
     active_after = sum(row["status"] in ACTIVE for row in observed_after)
     counts: dict[str, int] = {}
     for row in observed_after:
@@ -502,7 +514,7 @@ def cycle(
             "status_counts_after": dict(sorted(counts.items())),
             "base_task_count": len(base_entries),
             "replacement_task_count": len(replacement_entries),
-            "reserve_remaining": len(available) - len(submitted),
+            "reserve_remaining": len(expected) - len(replacement_entries),
             "authentication_sha256": authentication["sha256"],
             "reserve_ready": ready,
             "ledger_payload_sha256": ledger["payload_sha256"],
@@ -524,7 +536,7 @@ def cycle(
             "active_count": active_after,
             "status_counts": dict(sorted(counts.items())),
             "replacement_task_count": len(replacement_entries),
-            "reserve_remaining": len(available) - len(submitted),
+            "reserve_remaining": len(expected) - len(replacement_entries),
             "last_cycle": _file_record(cycle_path),
             "watch_active": True,
             "scheduler_project_modified": False,
