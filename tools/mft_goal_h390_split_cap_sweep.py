@@ -133,6 +133,7 @@ def prepare(
     full: bool = False,
     matrix_authority: bool = False,
     cap_authority: bool = False,
+    cap_active_winding: str = "Rx",
     cap_authority_max_passes: int = 12,
     cap_authority_percent_error: float = 0.25,
     equal_gaps_mm: tuple[float, ...] | None = None,
@@ -149,6 +150,10 @@ def prepare(
     ):
         raise compact.CompactSweepError(
             "Cap authority requires at least 12 passes and positive error"
+        )
+    if cap_active_winding not in {"Tx", "Rx"}:
+        raise compact.CompactSweepError(
+            "cap_active_winding must be exactly Tx or Rx"
         )
     destination = output.resolve()
     if destination.exists():
@@ -254,6 +259,14 @@ def prepare(
                 "N2_side": int(60 - split_main),
                 "h1": float(h1_mm),
                 "core_center_gap_mm": float(equal_gap_mm),
+                "cap_turn_graded_active_winding": cap_active_winding,
+                "cap_turn_graded_section_order": (
+                    "auto" if cap_active_winding == "Tx" else "main,side"
+                ),
+                "cap_turn_graded_reverse_sections": "none",
+                "cap_turn_graded_reverse_terminal_polarity": 0,
+                "cap_turn_graded_side_polarity": 1,
+                "cap_turn_graded_side2_polarity": 1,
                 "matrix_on": 1,
                 "cap_on": int(not matrix_authority),
                 "loss_on": int(full),
@@ -271,7 +284,8 @@ def prepare(
         candidate_sha = feeder._sha(effective)
         gap_token = f"{int(round(equal_gap_mm * 10_000_000)):08d}"
         candidate_id = (
-            f"h390-split-{split_main:02d}-{60 - split_main:02d}-"
+            f"h390-split-{cap_active_winding.lower()}-"
+            f"{split_main:02d}-{60 - split_main:02d}-"
             f"h1-{int(round(h1_mm)):03d}-g{gap_token}"
         )
         params_path = feeder._write(
@@ -281,6 +295,7 @@ def prepare(
         name = (
             f"mft-h390-split-"
             f"{'full' if full else ('capauth' if cap_authority else 'cap')}-"
+            f"{cap_active_winding.lower()}-"
             f"{lane_index:02d}-"
             f"{split_main:02d}x{60 - split_main:02d}-"
             f"h{int(round(h1_mm)):03d}-g{gap_token}-"
@@ -388,6 +403,7 @@ def prepare(
                 "secondary_splits": [
                     f"{value}/{60 - value}" for value in splits
                 ],
+                "cap_turn_graded_active_winding": cap_active_winding,
                 "equal_winding_height_mm": 390.0,
                 "gap2_mm": 0.85,
                 "cw2_mm": 0.3,
@@ -422,6 +438,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--matrix-authority", action="store_true")
     parser.add_argument("--cap-authority", action="store_true")
     parser.add_argument(
+        "--cap-active-winding",
+        choices=("Tx", "Rx"),
+        default="Rx",
+    )
+    parser.add_argument(
         "--cap-authority-max-passes", type=int, default=12
     )
     parser.add_argument(
@@ -436,6 +457,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             full=args.full,
             matrix_authority=args.matrix_authority,
             cap_authority=args.cap_authority,
+            cap_active_winding=args.cap_active_winding,
             cap_authority_max_passes=args.cap_authority_max_passes,
             cap_authority_percent_error=args.cap_authority_percent_error,
             equal_gaps_mm=(
