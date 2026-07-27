@@ -35,6 +35,7 @@ from regression_260707.optimization.geometry_metrics import (  # noqa: E402
 
 
 SCHEMA = "mft-goal-core-rescue-geometry-sweep-v1"
+GAP2_MIN_MM = 0.35
 ANCHOR_SHA = (
     "86778c97c5d6e48fb9e76f53a75cf1e4e59d163a3600ce8a59d4c151d0695be3"
 )
@@ -45,7 +46,7 @@ GRID = {
     "l1_mm": list(range(70, 101, 5)),
     "l2_mm": [356.0, 357.0, 359.0],
     "cw2_mm": [0.45, 0.55, 0.65, 0.75, 0.85],
-    "gap2_mm": [0.3, 0.5, 0.7, 0.9, 1.1],
+    "gap2_mm": [GAP2_MIN_MM, 0.5, 0.7, 0.9, 1.1],
     "N2_main": list(range(24, 47)),
 }
 
@@ -242,6 +243,12 @@ def _decode(anchor: dict[str, Any], algebraic: tuple) -> dict | None:
         )
         / (6.0 * ANCHOR_AE_M2),
         "exact_training_support_count": 0,
+        "gap2_contract_min_mm": GAP2_MIN_MM,
+        "gap2_contract_pass": float(decoded["gap2"]) >= GAP2_MIN_MM,
+        "air_gap_stage": "ungapped_pre_gap_acquisition_only",
+        "physical_Lm_2mH_verified": False,
+        "final_design_claim_allowed": False,
+        "required_downstream_equal_three_leg_gap_FEA": True,
         "extrapolation_status": (
             "fixed20_compact_5T_1p6_exact_support_absent_FEA_required"
         ),
@@ -319,6 +326,19 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "full_model": 0,
             },
             "limits": {"W_mm": 1200.0, "L_mm": 900.0, "H_mm": 750.0},
+            "gap2_contract": {
+                "minimum_mm": GAP2_MIN_MM,
+                "variable_above_minimum": True,
+                "subminimum_rows_allowed": False,
+            },
+            "air_gap_contract": {
+                "stage": "ungapped_pre_gap_acquisition_only",
+                "physical_Lm_2mH_verified": False,
+                "final_design_claim_allowed": False,
+                "required_downstream_equal_three_leg_gap_FEA": True,
+                "required_core_equal_three_leg_air_gap": 1,
+                "required_gapped_leg_count": 3,
+            },
             "support": {
                 "strict6151_exact_compact_fixed20_5T_1p6_rows": 0,
                 "authority": "geometry_only_FEA_required",
@@ -334,6 +354,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                         "H_mm",
                         "volume_L",
                         "N_times_Ae_multiplier_vs_anchor",
+                        "gap2_contract_pass",
+                        "air_gap_stage",
+                        "physical_Lm_2mH_verified",
+                        "final_design_claim_allowed",
+                        "required_downstream_equal_three_leg_gap_FEA",
                         "full_decoded_params_json",
                     )
                 }
