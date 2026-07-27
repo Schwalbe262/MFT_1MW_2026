@@ -18,7 +18,6 @@ import json
 import os
 from pathlib import Path
 import tempfile
-import time
 from typing import Any, Mapping
 import urllib.parse
 import urllib.request
