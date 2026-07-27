@@ -198,10 +198,17 @@ def authenticate_overlay_context(
         or set(selected_ids).intersection(ignored_attempt_ids)
     ):
         raise RuntimeError("logical exact100 physical-attempt selection is invalid")
+    authority_created_at = retry_receipt["observed_at"]
+    if authority_path.is_file():
+        existing_authority = collector._validate_sealed(
+            collector._read_json(authority_path),
+            schema=OVERLAY_SCHEMA,
+        )
+        authority_created_at = existing_authority["created_at"]
     authority = collector._sealed(
         {
             "schema_version": OVERLAY_SCHEMA,
-            "created_at": collector._now(),
+            "created_at": authority_created_at,
             "base_plan": {
                 "path": str(plan_path.resolve(strict=True)),
                 "sha256": collector._sha256_file(
