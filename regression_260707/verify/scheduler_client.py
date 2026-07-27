@@ -1658,6 +1658,11 @@ def _submit_verification_locked(
                   f"[ -d {quoted_library}/src ] && "
                   f"printf 'MFT_LIBRARY_GIT_HASH {library_revision}\\n' && ")
     retained_export = _retained_aedt_export_command(retained)
+    library_import_env = (
+        'export MFT_PYAEDT_LIBRARY_ROOT="$MFT_WORKDIR/pyaedt_library"; '
+        "printf 'MFT_PYAEDT_LIBRARY_ROOT %s\\n' "
+        '"$MFT_PYAEDT_LIBRARY_ROOT"; '
+    )
     retain_failed_mesh_canary = (
         profile.get("schema_version")
         == (
@@ -1706,6 +1711,7 @@ def _submit_verification_locked(
         BASE
         + f"( {task_root_setup}{select_workdir}{workdir_assertion}"
         + f"{post_workdir_env_exports}"
+        + library_import_env
         + f"cleanup() {{ rm -rf -- {cleanup_workdirs} 2>/dev/null; }}; "
         + "trap cleanup EXIT; trap 'exit 143' TERM INT; "
         + run_group

@@ -890,6 +890,20 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertIn("MFT_WORKDIR=$MFT_GPFS_WORKDIR", command)
         self.assertIn("MFT_WORKDIR %s", command)
         self.assertIn(
+            'export MFT_PYAEDT_LIBRARY_ROOT="$MFT_WORKDIR/pyaedt_library"',
+            command,
+        )
+        self.assertLess(
+            command.index("MFT_WORKDIR %s"),
+            command.index("export MFT_PYAEDT_LIBRARY_ROOT"),
+        )
+        self.assertLess(
+            command.index("export MFT_PYAEDT_LIBRARY_ROOT"),
+            command.index(
+                'git -C "${MFT_WORKDIR}/pyaedt_library" fetch -q origin'
+            ),
+        )
+        self.assertIn(
             "git -C \"${MFT_WORKDIR}/pyaedt_library\" fetch -q origin "
             f"{TEST_LIBRARY_REVISION}", command)
         self.assertIn(
