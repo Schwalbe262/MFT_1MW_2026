@@ -17,6 +17,7 @@ from tools import tier1_corrected_generation_adapter as adapter
 from tools import tier1_corrected_generation_preflight as preflight
 from tools import tier1_final1000_multiseed_consumer as consumer
 from tools import mft_goal_20260726_launch as launch
+from tools import mft_goal_diagnostic_compact_scout as diagnostic_scout
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -465,6 +466,31 @@ def test_n1_6_compact_bank_bridges_exact_A_B_C_and_independent_H():
         and 960.0 <= record["L_mm"] <= 975.0
         for record in bank["rows"]
     )
+    rng = np.random.default_rng(2_607_263_106)
+    coordinates = np.asarray(bank["coordinates"], dtype=float)
+    for stratum in contract["active_strata_for_this_N1"]:
+        donors = coordinates[
+            [
+                index
+                for index, record in enumerate(bank["rows"])
+                if stratum in record["memberships"]
+            ]
+        ]
+        mutant, evidence = preflight._goal_compact_joint_mutant(
+            problem,
+            donors,
+            stratum=stratum,
+            compact_contract=contract,
+            random_state=rng,
+        )
+        _replayed, records = preflight._goal_compact_coordinate_replay(
+            problem,
+            mutant.reshape(1, -1),
+            strata=contract["strata"],
+        )
+        assert stratum in records[0]["memberships"]
+        assert evidence["joint_coordinates_changed_after_repair"] >= 3
+        assert evidence["near_band_fallback_used"] is False
 
 
 def test_cw1_grid_has_exact_endpoints_and_no_independent_f1_split():
@@ -973,6 +999,116 @@ def test_reserved_fresh512_dry_run_manifest_seals_compact_activation_without_pos
     )
     launch.validate_task_payload(tasks[0])
     launch.validate_task_payload(tasks[-1])
+
+
+def test_diagnostic_n1_6_compact_contract_is_separate_screening_only():
+    with pytest.raises(RuntimeError, match="reserved fresh512"):
+        diagnostic_scout._seed_interval(
+            launch.FRESH_AL_SEED_START,
+            1,
+        )
+    assert diagnostic_scout._seed_interval(
+        diagnostic_scout.DEFAULT_SEED_START,
+        4,
+    ) == list(
+        range(
+            diagnostic_scout.DEFAULT_SEED_START,
+            diagnostic_scout.DEFAULT_SEED_START + 4,
+        )
+    )
+    contract = preflight.goal_compact_search_contract(6)
+    bank = _synthetic_compact_activation_bank(6, contract)
+    source_identity = {
+        "train_report_sha256": "1" * 64,
+        "candidate_sha256": "2" * 64,
+        "quality_status_sha256": "3" * 64,
+        "dataset_sha256": "4" * 64,
+        "profile_sha256": "5" * 64,
+        "evaluation_model_sha256": "6" * 64,
+        "code_revision": "7" * 40,
+    }
+    activation = launch._seal(
+        {
+            "schema_version": diagnostic_scout.ACTIVATION_SCHEMA,
+            "campaign_id": diagnostic_scout.CAMPAIGN_ID,
+            "fixed_primary_turns": 6,
+            "source_identity": source_identity,
+            "source_quality_passed": False,
+            "source_quality_blockers": ["quality_not_passed"],
+            "quality_thresholds_lowered_or_bypassed": False,
+            "screening_only": True,
+            "production_eligible": False,
+            "final_design_claim_allowed": False,
+            "fresh512_activation_evidence": False,
+            "reserved_fresh512_seed_interval_used": False,
+            "symmetric_FEA_validation_still_required": True,
+            "fixed_lm2mh_resonance_contract": (
+                preflight.goal_fixed_lm2mh_resonance_contract()
+            ),
+            "fixed_lm2mh_resonance_contract_sha256": (
+                preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
+            ),
+            "fixed_lm2mh_resonance_installation": {},
+            "effective_hard_constraint_contract_sha256": "8" * 64,
+            "compact_search_contract": contract,
+            "compact_search_contract_sha256": contract["sha256"],
+            "compact_coordinate_bank": bank,
+            "compact_coordinate_bank_sha256": bank["sha256"],
+            "invalid_or_near_band_fallback_allowed": False,
+            "core_center_gap_mm_symmetric_FEA_synthesis_required": True,
+            "physical_Lm_2mH_verified": False,
+            "scheduler_write_performed": False,
+            "scheduler_submission_performed": False,
+        }
+    )
+    assert (
+        diagnostic_scout._validate_activation(activation)["screening_only"]
+        is True
+    )
+    task = launch._seal(
+        {
+            "schema_version": diagnostic_scout.TASK_SCHEMA,
+            "campaign_id": diagnostic_scout.CAMPAIGN_ID,
+            "task_name": "diagnostic-fixture",
+            "ordinal": 0,
+            "seed": diagnostic_scout.DEFAULT_SEED_START,
+            "fixed_primary_turns": 6,
+            "population": diagnostic_scout.POPULATION,
+            "generations": diagnostic_scout.GENERATIONS,
+            "inference_threads": diagnostic_scout.INFERENCE_THREADS,
+            "stage_spec": copy.deepcopy(goal.GOAL_STAGE_SPEC),
+            "stage_spec_sha256": goal.GOAL_STAGE_SPEC_SHA256,
+            "temperature_contract_sha256": (
+                goal.GOAL_TEMPERATURE_CONTRACT_SHA256
+            ),
+            "hard_constraint_contract_sha256": "8" * 64,
+            "source": {
+                "generation": "generation",
+                "candidate": "candidate",
+                "quality_status": "quality",
+                "code_root": "code",
+                "dataset": "dataset",
+                "profile": "profile",
+                "expected_code_revision": "7" * 40,
+            },
+            "source_identity": source_identity,
+            "code_manifest_payload_sha256": "9" * 64,
+            "code_inventory_sha256": "a" * 64,
+            "activation": activation,
+            "screening_only": True,
+            "production_eligible": False,
+            "final_design_claim_allowed": False,
+            "fresh512_activation_evidence": False,
+            "symmetric_FEA_validation_still_required": True,
+        }
+    )
+    assert diagnostic_scout._validate_task(task) == task
+    forged = copy.deepcopy(task)
+    forged.pop("payload_sha256")
+    forged["production_eligible"] = True
+    forged = launch._seal(forged)
+    with pytest.raises(RuntimeError, match="task contract"):
+        diagnostic_scout._validate_task(forged)
 
 
 def test_failed_g0_quality_is_sealed_as_search_only_without_lowering_thresholds():

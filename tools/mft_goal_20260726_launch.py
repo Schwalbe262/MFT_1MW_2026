@@ -68,6 +68,7 @@ RUNTIME_SOURCE_ROLES = (
 )
 GOAL_RUNTIME_TOOL_FILES = (
     "tools/mft_goal_20260726_launch.py",
+    "tools/mft_goal_diagnostic_compact_scout.py",
     "tools/tier1_corrected_generation_adapter.py",
     "tools/tier1_corrected_generation_preflight.py",
     "tools/tier1_semlock_safe_inference_smoke.py",
