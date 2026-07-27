@@ -6450,7 +6450,7 @@ def _core_thermal_material_for_piece(piece_name):
     """Map one segmented core name to its wound-ribbon material orientation."""
     name = str(piece_name)
     if re.fullmatch(
-        r"core_\d+_leg_(?:left|right|center(?:_(?:bottom|top))?)",
+        r"core_\d+_leg_(?:left|right|center)(?:_(?:bottom|top))?",
         name,
     ):
         return _CORE_THERMAL_MATERIAL_LEG
