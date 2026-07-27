@@ -458,6 +458,7 @@ def _decoded_row(**updates):
         "w1c_w2s_gap_x_actual": 40.0,
         "w1s_cs_space_x": 40.0,
         "cs_w1s_space_y": 40.0,
+        "h_gap1": 40.0,
         "h_gap2": 40.0,
         "w2s_w1s_space_x": 40.0,
         "w1s_w2s_space_y": 40.0,
@@ -472,6 +473,8 @@ def _decoded_row(**updates):
         "wcp_len_pct": 55.0,
         "core_plate_pad_t": 2.0,
         "wcp_pad_t": 2.0,
+        "nwh1": 500.0,
+        "nwh2": 500.0,
         "bbox_x": 1200.0,
         "bbox_y": 1200.0,
         "bbox_z": 750.0,
@@ -484,12 +487,19 @@ def test_full_realized_insulation_and_side_temperature_are_fail_closed():
     frame = pd.DataFrame([
         _decoded_row(w1c_w2s_gap_x_actual=39.0),
         _decoded_row(N1_side=1, w2s_w1s_space_x=38.0),
+        _decoded_row(h_gap1=39.0),
     ])
     assert preflight.minimum_physical_insulation_violation(frame, 40.0).tolist() == [
         1.0,
         2.0,
+        1.0,
     ]
-    missing = frame.drop(columns=["h_gap2"])
+    assert preflight.minimum_physical_insulation_violation(
+        pd.DataFrame([_decoded_row(h_gap1=20.0)]),
+        40.0,
+        primary_axial_minimum_mm=20.0,
+    ).tolist() == [0.0]
+    missing = frame.drop(columns=["h_gap1"])
     assert np.all(
         preflight.minimum_physical_insulation_violation(missing, 40.0)
         == preflight.BIG

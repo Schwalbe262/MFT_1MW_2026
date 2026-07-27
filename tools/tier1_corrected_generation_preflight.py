@@ -230,6 +230,16 @@ GOAL_ADDITIVE_HARD_CONSTRAINT_PREFIX_NAMES = (
     "minimum_physical_insulation",
     "core_group_dynamic_validity",
 )
+WINDING_HEIGHT_ALIGNMENT_CONSTRAINT = (
+    "primary_secondary_winding_height_overlap_minimum"
+)
+GOAL_GEOMETRY_CONSTRAINT_PROFILE_SCHEMA = (
+    "mft-goal-20260726-geometry-constraint-profile-v1"
+)
+GOAL_OFFICIAL_PRIMARY_AXIAL_CLEARANCE_MM = 40.0
+GOAL_DIAGNOSTIC_PRIMARY_AXIAL_CLEARANCE_MM = (20.0, 30.0, 40.0)
+GOAL_ALIGNED_LANE_MINIMUM_OVERLAP_RATIO = 0.9
+GOAL_WINDING_HEIGHT_ALIGNMENT_MODES = ("off", "diagnostic", "hard")
 RESONANCE_MINIMUM_CONSTRAINT = "half_magnetizing_resonance_minimum"
 RESONANCE_MAXIMUM_CONSTRAINT = "half_magnetizing_resonance_maximum"
 SIZE_CONSTRAINT_NAMES = (
@@ -348,6 +358,161 @@ def _stage_positive_number(value: Any, label: str) -> float:
     return number
 
 
+def goal_geometry_constraint_profile(
+    *,
+    primary_axial_clearance_min_mm: float = (
+        GOAL_OFFICIAL_PRIMARY_AXIAL_CLEARANCE_MM
+    ),
+    winding_height_alignment_mode: str = "off",
+    winding_height_minimum_overlap_ratio: float | None = None,
+    diagnostic_override: bool = False,
+) -> dict[str, Any]:
+    """Seal one explicit goal geometry policy.
+
+    The official campaign remains a 40 mm primary axial-clearance search.
+    The 20/30 mm profiles are diagnostic-only and cannot be constructed
+    without an explicit ``diagnostic_override=True`` acknowledgement.
+    """
+
+    clearance = _stage_positive_number(
+        primary_axial_clearance_min_mm,
+        "primary axial clearance minimum",
+    )
+    if not any(
+        math.isclose(clearance, allowed, rel_tol=0.0, abs_tol=1e-12)
+        for allowed in GOAL_DIAGNOSTIC_PRIMARY_AXIAL_CLEARANCE_MM
+    ):
+        raise RuntimeError(
+            "primary axial clearance profile must be one of 20, 30 or 40 mm"
+        )
+    if not isinstance(diagnostic_override, bool):
+        raise RuntimeError("geometry diagnostic override must be boolean")
+    if (
+        clearance < GOAL_OFFICIAL_PRIMARY_AXIAL_CLEARANCE_MM
+        and not diagnostic_override
+    ):
+        raise RuntimeError(
+            "20/30 mm primary axial clearance is diagnostic-only and requires "
+            "an explicit override"
+        )
+    mode = str(winding_height_alignment_mode)
+    if mode not in GOAL_WINDING_HEIGHT_ALIGNMENT_MODES:
+        raise RuntimeError(
+            "winding height alignment mode must be off, diagnostic or hard"
+        )
+    if mode == "off":
+        if winding_height_minimum_overlap_ratio is not None:
+            raise RuntimeError(
+                "alignment overlap ratio must be omitted when alignment is off"
+            )
+        overlap = None
+    else:
+        overlap = _stage_positive_number(
+            (
+                GOAL_ALIGNED_LANE_MINIMUM_OVERLAP_RATIO
+                if winding_height_minimum_overlap_ratio is None
+                else winding_height_minimum_overlap_ratio
+            ),
+            "winding height minimum overlap ratio",
+        )
+        if not GOAL_ALIGNED_LANE_MINIMUM_OVERLAP_RATIO <= overlap <= 1.0:
+            raise RuntimeError(
+                "aligned lanes require a winding height overlap ratio from "
+                "0.9 through 1.0"
+            )
+        if mode == "diagnostic" and not diagnostic_override:
+            raise RuntimeError(
+                "diagnostic winding-height evaluation requires an explicit "
+                "override"
+            )
+    role = "diagnostic" if diagnostic_override else "official"
+    value = {
+        "schema_version": GOAL_GEOMETRY_CONSTRAINT_PROFILE_SCHEMA,
+        "profile_role": role,
+        "primary_axial_clearance": {
+            "column": "h_gap1",
+            "minimum_mm": clearance,
+            "official_minimum_mm": (
+                GOAL_OFFICIAL_PRIMARY_AXIAL_CLEARANCE_MM
+            ),
+            "diagnostic_override": diagnostic_override,
+        },
+        "other_physical_insulation": {
+            "minimum_mm": GOAL_OFFICIAL_PRIMARY_AXIAL_CLEARANCE_MM,
+            "override_allowed": False,
+        },
+        "winding_height_alignment": {
+            "metric": "min(nwh1,nwh2)/max(nwh1,nwh2)",
+            "mode": mode,
+            "minimum_overlap_ratio": overlap,
+            "hard_constraint_name": (
+                WINDING_HEIGHT_ALIGNMENT_CONSTRAINT
+                if mode == "hard"
+                else None
+            ),
+        },
+        "production_or_final_design_claim_allowed": bool(
+            not diagnostic_override
+            and math.isclose(
+                clearance,
+                GOAL_OFFICIAL_PRIMARY_AXIAL_CLEARANCE_MM,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            and mode != "diagnostic"
+        ),
+        "temperature_contract_mutated": False,
+        "cooling_contract_mutated": False,
+    }
+    value["sha256"] = canonical_sha256(value)
+    return value
+
+
+def validate_goal_geometry_constraint_profile(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate an exact geometry profile or fail closed."""
+
+    if not isinstance(value, Mapping):
+        raise RuntimeError("goal geometry constraint profile must be an object")
+    supplied = copy.deepcopy(dict(value))
+    axial = supplied.get("primary_axial_clearance") or {}
+    alignment = supplied.get("winding_height_alignment") or {}
+    expected = goal_geometry_constraint_profile(
+        primary_axial_clearance_min_mm=axial.get("minimum_mm"),
+        winding_height_alignment_mode=alignment.get("mode"),
+        winding_height_minimum_overlap_ratio=alignment.get(
+            "minimum_overlap_ratio"
+        ),
+        diagnostic_override=axial.get("diagnostic_override"),
+    )
+    if supplied != expected:
+        raise RuntimeError("goal geometry constraint profile authentication failed")
+    return expected
+
+
+GOAL_OFFICIAL_GEOMETRY_CONSTRAINT_PROFILE = (
+    goal_geometry_constraint_profile()
+)
+
+
+def _resolve_geometry_constraint_profile(
+    spec: Mapping[str, Any],
+    geometry_constraint_profile: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if is_goal_stage_spec(spec):
+        return validate_goal_geometry_constraint_profile(
+            GOAL_OFFICIAL_GEOMETRY_CONSTRAINT_PROFILE
+            if geometry_constraint_profile is None
+            else geometry_constraint_profile
+        )
+    if geometry_constraint_profile is not None:
+        raise RuntimeError(
+            "goal geometry constraint profiles cannot be applied to current7"
+        )
+    return None
+
+
 def validate_stage_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
     """Return a canonical staged hard spec or fail closed.
 
@@ -394,15 +559,29 @@ def validate_stage_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def stage_constraint_names(spec: Mapping[str, Any]) -> tuple[str, ...]:
+def stage_constraint_names(
+    spec: Mapping[str, Any],
+    geometry_constraint_profile: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
     normalized = validate_stage_spec(spec)
     if is_goal_stage_spec(normalized):
+        profile = _resolve_geometry_constraint_profile(
+            normalized, geometry_constraint_profile
+        )
+        alignment = profile["winding_height_alignment"]
+        alignment_names = (
+            (WINDING_HEIGHT_ALIGNMENT_CONSTRAINT,)
+            if alignment["mode"] == "hard"
+            else ()
+        )
         return (
             GOAL_BASE_CONSTRAINT_NAMES
             + GOAL_ADDITIVE_HARD_CONSTRAINT_PREFIX_NAMES
             + (RESONANCE_MINIMUM_CONSTRAINT,)
             + SIZE_CONSTRAINT_NAMES
+            + alignment_names
         )
+    _resolve_geometry_constraint_profile(normalized, geometry_constraint_profile)
     resonance = []
     if normalized["resonance_min_Hz"] is not None:
         resonance.append(RESONANCE_MINIMUM_CONSTRAINT)
@@ -488,11 +667,17 @@ def stage_temperature_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
     return contract
 
 
-def stage_hard_constraint_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
+def stage_hard_constraint_contract(
+    spec: Mapping[str, Any],
+    geometry_constraint_profile: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     normalized = validate_stage_spec(spec)
     if is_goal_stage_spec(normalized):
+        profile = _resolve_geometry_constraint_profile(
+            normalized, geometry_constraint_profile
+        )
         return {
-            "schema_version": "mft-goal-20260726-hard-constraint-contract-v1",
+            "schema_version": "mft-goal-20260726-hard-constraint-contract-v2",
             "stage": "mft-goal-20260726",
             "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
             "stage_spec_sha256": GOAL_STAGE_SPEC_SHA256,
@@ -525,7 +710,11 @@ def stage_hard_constraint_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
             "fixed_cooling_identity": copy.deepcopy(
                 normalized["fixed_cooling_identity"]
             ),
-            "constraint_names": list(stage_constraint_names(normalized)),
+            "geometry_constraint_profile": copy.deepcopy(profile),
+            "geometry_constraint_profile_sha256": profile["sha256"],
+            "constraint_names": list(
+                stage_constraint_names(normalized, profile)
+            ),
             "portability": {
                 "mode": "goal-g0-authenticated-bundle-v1",
                 "campaign_id": "mft-goal-20260726",
@@ -535,7 +724,11 @@ def stage_hard_constraint_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
             "legacy_scalar_temperature_limit_allowed": False,
             "legacy_fixed_cw1_allowed": False,
             "legacy_core_group_ceiling_four_allowed": False,
+            "primary_axial_clearance_is_explicit": True,
+            "primary_axial_clearance_column": "h_gap1",
+            "non_primary_insulation_override_allowed": False,
         }
+    _resolve_geometry_constraint_profile(normalized, geometry_constraint_profile)
     if normalized == validate_stage_spec(CURRENT_STAGE_SPEC):
         return copy.deepcopy(CURRENT_STAGE_HARD_CONTRACT)
     minimum = normalized["resonance_min_Hz"]
@@ -611,6 +804,7 @@ PHYSICAL_INSULATION_COLUMNS = (
     "w1c_w2s_gap_x_actual",
     "w1s_cs_space_x",
     "cs_w1s_space_y",
+    "h_gap1",
     "h_gap2",
 )
 SIDE_PHYSICAL_INSULATION_COLUMNS = (
@@ -638,6 +832,8 @@ DECODED_GEOMETRY_IDENTITY_COLUMNS = (
     "gap2",
     "nwh1",
     "nwh2",
+    "h_gap1",
+    "h_gap2",
     "cc_w2c_space_x",
     "cc_w2c_space_y",
     "w2c_w1c_space_x",
@@ -687,34 +883,90 @@ def minimum_physical_insulation_violation(
     frame: Any,
     minimum_mm: float,
     *,
+    primary_axial_minimum_mm: float | None = None,
     invalid_value: float = BIG,
 ) -> Any:
-    """Evaluate every realized clearance, including conditional side gaps."""
+    """Evaluate every realized clearance, including both axial winding gaps."""
 
     import numpy as np
 
     minimum = _positive_number(minimum_mm, "minimum physical insulation")
+    primary_axial_minimum = (
+        minimum
+        if primary_axial_minimum_mm is None
+        else _positive_number(
+            primary_axial_minimum_mm,
+            "primary axial clearance minimum",
+        )
+    )
     invalid = _positive_number(invalid_value, "invalid constraint value")
     result = np.full(len(frame), invalid, dtype=float)
     for index in range(len(frame)):
         row = _frame_row(frame, index)
         try:
-            observed = [
-                _finite_number(_row_value(row, name), name)
+            violations = [
+                (
+                    primary_axial_minimum
+                    if name == "h_gap1"
+                    else minimum
+                )
+                - _finite_number(_row_value(row, name), name)
                 for name in PHYSICAL_INSULATION_COLUMNS
             ]
             n1_side = _finite_number(_row_value(row, "N1_side"), "N1_side")
             if n1_side < 0.0:
                 raise RuntimeError("N1_side must be non-negative")
             if n1_side > 0.0:
-                observed.extend(
-                    _finite_number(_row_value(row, name), name)
+                violations.extend(
+                    minimum - _finite_number(_row_value(row, name), name)
                     for name in SIDE_PHYSICAL_INSULATION_COLUMNS
                 )
-            result[index] = max(minimum - value for value in observed)
+            result[index] = max(violations)
         except RuntimeError:
             result[index] = invalid
     return result
+
+
+def winding_height_overlap_ratio(frame: Any) -> Any:
+    """Return centered primary/secondary pack-height overlap ratios."""
+
+    import numpy as np
+
+    result = np.full(len(frame), np.nan, dtype=float)
+    for index in range(len(frame)):
+        row = _frame_row(frame, index)
+        try:
+            primary = _positive_number(_row_value(row, "nwh1"), "nwh1")
+            secondary = _positive_number(_row_value(row, "nwh2"), "nwh2")
+            result[index] = min(primary, secondary) / max(primary, secondary)
+        except RuntimeError:
+            continue
+    return result
+
+
+def winding_height_alignment_violation(
+    frame: Any,
+    minimum_overlap_ratio: float,
+    *,
+    invalid_value: float = BIG,
+) -> Any:
+    """Return ``G <= 0`` for the configured winding-height overlap ratio."""
+
+    import numpy as np
+
+    minimum = _positive_number(
+        minimum_overlap_ratio,
+        "winding height minimum overlap ratio",
+    )
+    if minimum > 1.0:
+        raise RuntimeError("winding height minimum overlap ratio must be <= 1")
+    invalid = _positive_number(invalid_value, "invalid constraint value")
+    ratios = winding_height_overlap_ratio(frame)
+    return np.where(
+        np.isfinite(ratios),
+        minimum - ratios,
+        invalid,
+    )
 
 
 def apply_current7_side_temperature_condition(
@@ -3699,12 +3951,23 @@ def create_current7_problem_class(
             density_gate: Any = None,
             fixed_overrides: Mapping[str, Any] | None = None,
             fixed_primary_turns: int | None = None,
+            geometry_constraint_profile: Mapping[str, Any] | None = None,
         ) -> None:
             effective_spec = validate_stage_spec(spec or CURRENT_STAGE_SPEC)
             goal_campaign = is_goal_stage_spec(effective_spec)
-            constraint_names = stage_constraint_names(effective_spec)
+            effective_geometry_profile = _resolve_geometry_constraint_profile(
+                effective_spec,
+                geometry_constraint_profile,
+            )
+            constraint_names = stage_constraint_names(
+                effective_spec,
+                effective_geometry_profile,
+            )
             temperature_contract = stage_temperature_contract(effective_spec)
-            hard_constraint_contract = stage_hard_constraint_contract(effective_spec)
+            hard_constraint_contract = stage_hard_constraint_contract(
+                effective_spec,
+                effective_geometry_profile,
+            )
 
             overrides = dict(fixed_overrides or {})
             for name in VARIABLE_COOLING_DIMENSIONS:
@@ -3844,6 +4107,12 @@ def create_current7_problem_class(
             self.base_constraint_names = expected_base_constraint_names
             self.stage_spec = effective_spec
             self.stage_spec_sha256 = canonical_sha256(effective_spec)
+            self.geometry_constraint_profile = effective_geometry_profile
+            self.geometry_constraint_profile_sha256 = (
+                None
+                if effective_geometry_profile is None
+                else effective_geometry_profile["sha256"]
+            )
             self.temperature_contract = temperature_contract
             self.temperature_contract_sha256 = canonical_sha256(temperature_contract)
             self.hard_constraint_contract = hard_constraint_contract
@@ -4181,7 +4450,30 @@ def create_current7_problem_class(
                 h1 = round(get("total_height")) - 2.0 * projected_l1
                 if h1 > 0.0:
                     wh2_limit = 1.0 - 2.0 * self.spec["insulation_min_mm"] / h1
-                    put("wh2", min(get("wh2"), wh2_limit))
+                    if self.geometry_constraint_profile is None:
+                        put("wh2", min(get("wh2"), wh2_limit))
+                    else:
+                        axial_minimum = self.geometry_constraint_profile[
+                            "primary_axial_clearance"
+                        ]["minimum_mm"]
+                        wh1_limit = 1.0 - 2.0 * axial_minimum / h1
+                        wh1 = min(get("wh1"), wh1_limit)
+                        alignment = self.geometry_constraint_profile[
+                            "winding_height_alignment"
+                        ]
+                        if alignment["mode"] == "hard":
+                            overlap = alignment["minimum_overlap_ratio"]
+                            wh1 = min(wh1, wh2_limit / overlap)
+                            wh2_lower = overlap * wh1
+                            wh2_upper = min(wh2_limit, wh1 / overlap)
+                            put("wh1", wh1)
+                            put(
+                                "wh2",
+                                np.clip(get("wh2"), wh2_lower, wh2_upper),
+                            )
+                        else:
+                            put("wh1", wh1)
+                            put("wh2", min(get("wh2"), wh2_limit))
 
             project_budget()
             rounded_w1 = round(get("w1"))
@@ -4338,7 +4630,31 @@ def create_current7_problem_class(
             insulation = minimum_physical_insulation_violation(
                 frame,
                 self.spec["insulation_min_mm"],
+                primary_axial_minimum_mm=(
+                    None
+                    if self.geometry_constraint_profile is None
+                    else self.geometry_constraint_profile[
+                        "primary_axial_clearance"
+                    ]["minimum_mm"]
+                ),
                 invalid_value=BIG,
+            )
+            alignment_profile = (
+                None
+                if self.geometry_constraint_profile is None
+                else self.geometry_constraint_profile[
+                    "winding_height_alignment"
+                ]
+            )
+            alignment = (
+                np.full(len(repaired), np.nan, dtype=float)
+                if alignment_profile is None
+                or alignment_profile["mode"] == "off"
+                else winding_height_alignment_violation(
+                    frame,
+                    alignment_profile["minimum_overlap_ratio"],
+                    invalid_value=BIG,
+                )
             )
             count = len(repaired)
             groups = np.zeros(count, dtype=bool)
@@ -4407,6 +4723,13 @@ def create_current7_problem_class(
                 "winding_budget_identity": budgets,
                 "fixed_primary_turns": turns,
             }
+            if (
+                alignment_profile is not None
+                and alignment_profile["mode"] == "hard"
+            ):
+                masks[WINDING_HEIGHT_ALIGNMENT_CONSTRAINT] = (
+                    np.isfinite(alignment) & (alignment <= 1e-9)
+                )
             joint = np.logical_and.reduce(tuple(masks.values()))
             unique = {
                 identities[index]
@@ -4428,6 +4751,18 @@ def create_current7_problem_class(
                 "repaired_coordinates": repaired,
                 "shrink": shrink,
                 "insulation_violation": insulation,
+                "geometry_constraint_profile": copy.deepcopy(
+                    self.geometry_constraint_profile
+                ),
+                "winding_height_alignment_G": alignment,
+                "winding_height_alignment_is_hard": bool(
+                    alignment_profile is not None
+                    and alignment_profile["mode"] == "hard"
+                ),
+                "winding_height_alignment_is_diagnostic": bool(
+                    alignment_profile is not None
+                    and alignment_profile["mode"] == "diagnostic"
+                ),
             }
 
         def filter_warm_start_coordinates(
@@ -4627,9 +4962,34 @@ def create_current7_problem_class(
                         minimum_physical_insulation_violation(
                             sub,
                             self.spec["insulation_min_mm"],
+                            primary_axial_minimum_mm=(
+                                None
+                                if self.geometry_constraint_profile is None
+                                else self.geometry_constraint_profile[
+                                    "primary_axial_clearance"
+                                ]["minimum_mm"]
+                            ),
                             invalid_value=BIG,
                         )
                     )
+                    if (
+                        self.geometry_constraint_profile is not None
+                        and self.geometry_constraint_profile[
+                            "winding_height_alignment"
+                        ]["mode"] == "hard"
+                    ):
+                        constraints[
+                            indices,
+                            self.constraint_index[
+                                WINDING_HEIGHT_ALIGNMENT_CONSTRAINT
+                            ],
+                        ] = winding_height_alignment_violation(
+                            sub,
+                            self.geometry_constraint_profile[
+                                "winding_height_alignment"
+                            ]["minimum_overlap_ratio"],
+                            invalid_value=BIG,
+                        )
 
                     for local_index, global_index in enumerate(indices):
                         row = _frame_row(sub, local_index)
@@ -6817,6 +7177,7 @@ def build_authenticated_runner(
     expected_code_revision: str,
     fixed_primary_turns: int,
     stage_spec: Mapping[str, Any] | None = None,
+    geometry_constraint_profile: Mapping[str, Any] | None = None,
     inference_threads: int = 1,
     dataset_path_override: Path | None = None,
     profile_path_override: Path | None = None,
@@ -6838,6 +7199,10 @@ def build_authenticated_runner(
 
     normalized_stage_spec = validate_stage_spec(stage_spec or CURRENT_STAGE_SPEC)
     goal_campaign = is_goal_stage_spec(normalized_stage_spec)
+    normalized_geometry_profile = _resolve_geometry_constraint_profile(
+        normalized_stage_spec,
+        geometry_constraint_profile,
+    )
     expected_required_targets = (
         GOAL_REQUIRED_MODEL_TARGETS
         if goal_campaign
@@ -6894,10 +7259,20 @@ def build_authenticated_runner(
             "temperature_contract": copy.deepcopy(GOAL_TEMPERATURE_CONTRACT),
             "temperature_contract_sha256": GOAL_TEMPERATURE_CONTRACT_SHA256,
             "hard_constraint_contract": stage_hard_constraint_contract(
-                normalized_stage_spec
+                normalized_stage_spec,
+                normalized_geometry_profile,
             ),
             "hard_constraint_contract_sha256": canonical_sha256(
-                stage_hard_constraint_contract(normalized_stage_spec)
+                stage_hard_constraint_contract(
+                    normalized_stage_spec,
+                    normalized_geometry_profile,
+                )
+            ),
+            "geometry_constraint_profile": copy.deepcopy(
+                normalized_geometry_profile
+            ),
+            "geometry_constraint_profile_sha256": (
+                normalized_geometry_profile["sha256"]
             ),
             "stage_spec": copy.deepcopy(normalized_stage_spec),
             "stage_spec_sha256": canonical_sha256(normalized_stage_spec),
@@ -6949,9 +7324,14 @@ def build_authenticated_runner(
         spec=normalized_stage_spec,
         density_gate=density_gate,
         fixed_primary_turns=fixed_primary_turns,
+        geometry_constraint_profile=normalized_geometry_profile,
     )
     if (
-        tuple(problem.constraint_names) != stage_constraint_names(problem.stage_spec)
+        tuple(problem.constraint_names)
+        != stage_constraint_names(
+            problem.stage_spec,
+            problem.geometry_constraint_profile,
+        )
         or int(problem.n_ieq_constr) != len(problem.constraint_names)
         or problem.offspring_physics_repair is not True
         or problem.launch_eligible is not True
@@ -6988,6 +7368,7 @@ def runner_for_fixed_primary_turns(
         spec=runner.problem.stage_spec,
         density_gate=runner.density_gate,
         fixed_primary_turns=int(fixed_primary_turns),
+        geometry_constraint_profile=runner.problem.geometry_constraint_profile,
     )
     if (
         problem.fixed_primary_turns != int(fixed_primary_turns)
@@ -7230,12 +7611,17 @@ def build_relocated_authenticated_runner(
     fixed_primary_turns: int,
     inference_threads: int,
     stage_spec: Mapping[str, Any],
+    geometry_constraint_profile: Mapping[str, Any] | None = None,
 ) -> Current7Tier1Runner:
     """Load one relocated generation once and construct one fixed-N1 runner."""
 
     modules = load_current7_modules(code_root)
     normalized_stage_spec = validate_stage_spec(stage_spec)
     goal_campaign = is_goal_stage_spec(normalized_stage_spec)
+    normalized_geometry_profile = _resolve_geometry_constraint_profile(
+        normalized_stage_spec,
+        geometry_constraint_profile,
+    )
     expected_required_targets = (
         GOAL_REQUIRED_MODEL_TARGETS
         if goal_campaign
@@ -7284,6 +7670,7 @@ def build_relocated_authenticated_runner(
         spec=normalized_stage_spec,
         density_gate=density_gate,
         fixed_primary_turns=fixed_primary_turns,
+        geometry_constraint_profile=normalized_geometry_profile,
     )
     code_identity = dict(adapter_evidence["code"])
     code_identity["runtime_relocated_path"] = str(code_root.resolve(strict=True))
@@ -8016,6 +8403,12 @@ def _candidate_records(
                 "hard_constraint_contract_sha256": (
                     runner.problem.hard_constraint_contract_sha256
                 ),
+                "geometry_constraint_profile": copy.deepcopy(
+                    runner.problem.geometry_constraint_profile
+                ),
+                "geometry_constraint_profile_sha256": (
+                    runner.problem.geometry_constraint_profile_sha256
+                ),
                 "constraint_version": (
                     runner.problem.hard_constraint_contract["stage"]
                 ),
@@ -8256,6 +8649,13 @@ def _candidate_records(
             "analytical_B_T": analytical_b,
             "B_design_analytic_T": analytical_b,
             "minimum_realized_insulation_mm": (_minimum_realized_insulation_mm(row)),
+            "primary_axial_clearance_mm": _finite_number(
+                _row_value(row, "h_gap1"),
+                "h_gap1",
+            ),
+            "winding_height_overlap_ratio": float(
+                winding_height_overlap_ratio([row])[0]
+            ),
             "pred_C_tx_tx_F": means["C_tx_tx_F"],
             "pred_C_rx_rx_F": means["C_rx_rx_F"],
             "pred_C_tx_rx_F": means["C_tx_rx_F"],
@@ -9057,6 +9457,9 @@ def build_smoke_receipt(
         raise RuntimeError("smoke inventory does not cover every campaign N1 stratum")
     first = runners[expected_keys[0]]
     stage_spec = validate_stage_spec(first.problem.stage_spec)
+    geometry_constraint_profile = copy.deepcopy(
+        first.problem.geometry_constraint_profile
+    )
     constraint_names = tuple(first.problem.constraint_names)
     temperature_contract = first.problem.temperature_contract
     hard_constraint_contract = first.problem.hard_constraint_contract
@@ -9093,6 +9496,8 @@ def build_smoke_receipt(
             or runner.authenticated is not first.authenticated
             or runner.problem.fixed_primary_turns != turns
             or runner.problem.stage_spec != stage_spec
+            or runner.problem.geometry_constraint_profile
+            != geometry_constraint_profile
             or tuple(runner.problem.constraint_names) != constraint_names
             or not runner.launch_eligible
             or not runner.problem.launch_eligible
@@ -9267,6 +9672,12 @@ def build_smoke_receipt(
         "temperature_contract_sha256": canonical_sha256(temperature_contract),
         "hard_constraint_contract": hard_constraint_contract,
         "hard_constraint_contract_sha256": canonical_sha256(hard_constraint_contract),
+        "geometry_constraint_profile": geometry_constraint_profile,
+        "geometry_constraint_profile_sha256": (
+            None
+            if geometry_constraint_profile is None
+            else geometry_constraint_profile["sha256"]
+        ),
         "constraint_names": list(constraint_names),
         "constraint_count": len(constraint_names),
         "base_constraint_count": len(base_constraint_names),
@@ -9275,6 +9686,14 @@ def build_smoke_receipt(
         ),
         "base_secondary_vertical_insulation_retained": True,
         "minimum_physical_insulation_is_authoritative_superset": True,
+        "primary_axial_clearance_h_gap1_included": True,
+        "winding_height_alignment_mode": (
+            "off"
+            if geometry_constraint_profile is None
+            else geometry_constraint_profile[
+                "winding_height_alignment"
+            ]["mode"]
+        ),
         "variable_cooling_dimensions": list(VARIABLE_COOLING_DIMENSIONS),
         "fixed_cooling_pads_mm": FIXED_COOLING_PADS_MM,
         "simple_base_20mm_plate_clamp_superseded": True,
@@ -9375,9 +9794,25 @@ def validate_smoke_receipt(
         raise RuntimeError(
             "corrected-generation smoke receipt contract mismatch"
         ) from exc
-    expected_constraint_names = stage_constraint_names(stage_spec)
+    geometry_constraint_profile = problem.get("geometry_constraint_profile")
+    try:
+        normalized_geometry_profile = _resolve_geometry_constraint_profile(
+            stage_spec,
+            geometry_constraint_profile,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "corrected-generation smoke receipt geometry profile mismatch"
+        ) from exc
+    expected_constraint_names = stage_constraint_names(
+        stage_spec,
+        normalized_geometry_profile,
+    )
     expected_temperature_contract = stage_temperature_contract(stage_spec)
-    expected_hard_contract = stage_hard_constraint_contract(stage_spec)
+    expected_hard_contract = stage_hard_constraint_contract(
+        stage_spec,
+        normalized_geometry_profile,
+    )
     goal_campaign = is_goal_stage_spec(stage_spec)
     supported_turns = (
         GOAL_SUPPORTED_PRIMARY_TURNS
@@ -9447,10 +9882,27 @@ def validate_smoke_receipt(
         or problem.get("hard_constraint_contract") != expected_hard_contract
         or problem.get("hard_constraint_contract_sha256")
         != canonical_sha256(expected_hard_contract)
+        or problem.get("geometry_constraint_profile")
+        != normalized_geometry_profile
+        or problem.get("geometry_constraint_profile_sha256")
+        != (
+            None
+            if normalized_geometry_profile is None
+            else normalized_geometry_profile["sha256"]
+        )
         or problem.get("constraint_names") != list(expected_constraint_names)
         or problem.get("constraint_count") != len(expected_constraint_names)
         or problem.get("minimum_physical_insulation_is_authoritative_superset")
         is not True
+        or problem.get("primary_axial_clearance_h_gap1_included") is not True
+        or problem.get("winding_height_alignment_mode")
+        != (
+            "off"
+            if normalized_geometry_profile is None
+            else normalized_geometry_profile[
+                "winding_height_alignment"
+            ]["mode"]
+        )
         or problem.get("simple_base_20mm_plate_clamp_superseded") is not True
         or problem.get("primary_conductor_enforcement")
         != "fixed_cw1_consumed_inside_decoder_winding_budget"

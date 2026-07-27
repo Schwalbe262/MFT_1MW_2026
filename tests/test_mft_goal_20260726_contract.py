@@ -299,7 +299,7 @@ def _models():
     return {target: _Predictor(value) for target, value in values.items()}
 
 
-def _goal_problem(primary_turns=5):
+def _goal_problem(primary_turns=5, *, geometry_constraint_profile=None):
     modules = preflight.load_current7_modules(REPO)
     problem_class = preflight.create_current7_problem_class(
         base_problem_class=modules.nsga2_problem.MFTProblem,
@@ -317,6 +317,7 @@ def _goal_problem(primary_turns=5):
         spec=goal.GOAL_STAGE_SPEC,
         density_gate=lambda frame: np.full(len(frame), -1.0),
         fixed_primary_turns=primary_turns,
+        geometry_constraint_profile=geometry_constraint_profile,
     )
 
 
@@ -367,6 +368,116 @@ def test_goal_contract_is_exact_and_forbids_legacy_scalar_fields():
         mutated[legacy] = 100.0
         with pytest.raises(goal.GoalContractError, match="legacy fields"):
             goal.validate_goal_stage_spec(mutated)
+
+
+def test_goal_geometry_profile_requires_explicit_diagnostic_clearance_override():
+    official = preflight.GOAL_OFFICIAL_GEOMETRY_CONSTRAINT_PROFILE
+    assert official["profile_role"] == "official"
+    assert official["primary_axial_clearance"] == {
+        "column": "h_gap1",
+        "minimum_mm": 40.0,
+        "official_minimum_mm": 40.0,
+        "diagnostic_override": False,
+    }
+    assert official["winding_height_alignment"]["mode"] == "off"
+    assert official["production_or_final_design_claim_allowed"] is True
+    assert official["temperature_contract_mutated"] is False
+    assert official["cooling_contract_mutated"] is False
+    assert preflight.validate_goal_geometry_constraint_profile(
+        official
+    ) == official
+
+    for clearance in (20.0, 30.0):
+        with pytest.raises(RuntimeError, match="diagnostic-only"):
+            preflight.goal_geometry_constraint_profile(
+                primary_axial_clearance_min_mm=clearance,
+            )
+    with pytest.raises(RuntimeError, match="explicit override"):
+        preflight.goal_geometry_constraint_profile(
+            winding_height_alignment_mode="diagnostic",
+        )
+    tampered = copy.deepcopy(official)
+    tampered["primary_axial_clearance"]["minimum_mm"] = 20.0
+    with pytest.raises(RuntimeError):
+        preflight.validate_goal_geometry_constraint_profile(tampered)
+
+
+@pytest.mark.parametrize("primary_axial_minimum_mm", [20.0, 30.0, 40.0])
+def test_aligned_goal_lane_repairs_to_decoded_clearance_overlap_and_size(
+    primary_axial_minimum_mm,
+):
+    profile = preflight.goal_geometry_constraint_profile(
+        primary_axial_clearance_min_mm=primary_axial_minimum_mm,
+        winding_height_alignment_mode="hard",
+        diagnostic_override=(primary_axial_minimum_mm < 40.0),
+    )
+    problem = _goal_problem(
+        6,
+        geometry_constraint_profile=profile,
+    )
+    sobol_dims = preflight.load_current7_modules(
+        REPO
+    ).input_parameter._SOBOL_DIMS
+    dimensions = {
+        name: index
+        for index, (name, _lower, _upper) in enumerate(
+            sobol_dims
+        )
+    }
+    coordinate = np.full((1, problem.n_var), 0.5)
+    coordinate[0, dimensions["wh1"]] = 1.0
+    coordinate[0, dimensions["wh2"]] = 0.0
+    repaired = problem.repair_unit_coordinates(coordinate)
+    assert np.array_equal(
+        problem.repair_unit_coordinates(repaired),
+        repaired,
+    )
+    output = {}
+    problem._evaluate(repaired, output)
+    assert output["decoder_valid"].tolist() == [True]
+    row = output["frame"].iloc[0]
+    overlap = min(row["nwh1"], row["nwh2"]) / max(
+        row["nwh1"], row["nwh2"]
+    )
+    _volume, (width, length, height) = problem._goal_bounding_box_lit(row)
+    assert row["h_gap1"] >= primary_axial_minimum_mm
+    assert row["h_gap2"] >= 40.0
+    assert overlap >= 0.9
+    assert width <= goal.GOAL_SIZE_LIMITS_MM["W"]
+    assert length <= goal.GOAL_SIZE_LIMITS_MM["L"]
+    assert height <= goal.GOAL_SIZE_LIMITS_MM["H"]
+    constraints = dict(zip(problem.constraint_names, output["G"][0]))
+    assert constraints["minimum_physical_insulation"] <= 0.0
+    assert (
+        constraints[preflight.WINDING_HEIGHT_ALIGNMENT_CONSTRAINT]
+        <= 0.0
+    )
+    assert (
+        problem.geometry_constraint_profile_sha256
+        == profile["sha256"]
+    )
+    assert (
+        problem.hard_constraint_contract["geometry_constraint_profile_sha256"]
+        == profile["sha256"]
+    )
+
+
+def test_diagnostic_alignment_reports_without_mutating_hard_constraint_schema():
+    profile = preflight.goal_geometry_constraint_profile(
+        primary_axial_clearance_min_mm=30.0,
+        winding_height_alignment_mode="diagnostic",
+        diagnostic_override=True,
+    )
+    problem = _goal_problem(6, geometry_constraint_profile=profile)
+    assert preflight.WINDING_HEIGHT_ALIGNMENT_CONSTRAINT not in (
+        problem.constraint_names
+    )
+    audit = problem.hard_geometry_audit(
+        np.full((1, problem.n_var), 0.5)
+    )
+    assert audit["winding_height_alignment_is_diagnostic"] is True
+    assert audit["winding_height_alignment_is_hard"] is False
+    assert np.isfinite(audit["winding_height_alignment_G"]).all()
 
 
 def test_fixed_lm2mh_resonance_uses_leakage_and_reflected_turn_ratio():
