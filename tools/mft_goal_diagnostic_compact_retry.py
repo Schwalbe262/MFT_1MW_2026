@@ -253,7 +253,7 @@ def _retry_payload(
     base = offload.scheduler_payload(
         plan=base_plan,
         task=task,
-        priority=offload.SCHEDULER_PRIORITY,
+        priority=None,
     )
     command = str(base["command"])
     marker = "exec python "
@@ -307,7 +307,7 @@ def _base_context(
             offload.scheduler_payload(
                 plan=plan,
                 task=task,
-                priority=offload.SCHEDULER_PRIORITY,
+                priority=None,
             )
             for task in tasks
         )
