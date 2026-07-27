@@ -74,14 +74,27 @@ def test_profile_maps_latest_acceptance_and_separate_exact60(
 
 
 def test_corrected_successor_seed_interval_is_bounded(
+    model: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for name in ("SEED_START", "SEED_COUNT", "SEED_END"):
         monkeypatch.setattr(lane, name, getattr(lane, name))
+    monkeypatch.setattr(lane, "_ACTIVE_MODEL", lane._ACTIVE_MODEL)
     lane._set_seed_interval(2_607_264_460, 40)
     assert lane.SEED_START == 2_607_264_460
     assert lane.SEED_COUNT == 40
     assert lane.SEED_END == 2_607_264_499
+    lane._set_active_model(model)
+    profile = lane._build_search_profile(
+        object(),
+        geometry_profile=scout._geometry_profile(20.0),
+        authorized_seed_start=lane.SEED_START,
+        secondary_gap_mode=scout.SECONDARY_GAP_MODE_BOUNDED,
+    )
+    validated = lane._validate_search_profile(profile)
+    assert validated["authorized_seed_start"] == 2_607_264_460
+    assert validated["authorized_seed_count"] == 40
+    assert validated["authorized_seed_end_inclusive"] == 2_607_264_499
     with pytest.raises(RuntimeError, match="outside the sealed range"):
         lane._set_seed_interval(2_607_264_999, 2)
 

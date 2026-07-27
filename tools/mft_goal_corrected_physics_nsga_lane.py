@@ -390,12 +390,12 @@ def _build_search_profile(
     clearance = scout._profile_clearance_mm(
         geometry["primary_axial_clearance"]["minimum_mm"]
     )
-    seed_start = scout._authorized_profile_seed_start(
-        clearance,
-        SEED_START if authorized_seed_start is None else authorized_seed_start,
+    seed_start = (
+        SEED_START if authorized_seed_start is None else int(authorized_seed_start)
     )
     if (
-        seed_start != SEED_START
+        clearance != 20
+        or seed_start != SEED_START
         or secondary_gap_mode != scout.SECONDARY_GAP_MODE_BOUNDED
     ):
         raise RuntimeError(
