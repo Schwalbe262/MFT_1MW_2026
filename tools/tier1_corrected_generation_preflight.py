@@ -6647,12 +6647,57 @@ class Current7Tier1Runner:
         topologies = tuple(
             int(value) for value in topology_contract["turn_split_sub_islands_N2_main"]
         )
-        terminal_topology_counts = {
-            str(topology): sum(
-                int(_finite_number(value, "N2_main")) == topology
+        selected_physical_topologies = np.asarray(
+            [
+                int(_finite_number(value, "N2_main"))
                 for value in terminal_frame["N2_main"]
+            ],
+            dtype=int,
+        )
+        local_split_repair = getattr(
+            self.problem, "_turn_split_local_repair_contract", {}
+        )
+        coordinate_genome_is_geometry_donor = bool(
+            isinstance(local_split_repair, Mapping)
+            and local_split_repair.get(
+                "coordinate_genome_is_geometry_donor_not_Llt_rejection_authority"
+            )
+            is True
+        )
+        if coordinate_genome_is_geometry_donor:
+            # The corrected Llt repair enumerates every allowed physical split
+            # while holding geometry fixed, so its selected phenotype need not
+            # retain the topology encoded by ``u_N2_side``.  Mating/survival
+            # still operate on that coordinate genome; attest their diversity
+            # against the same coordinate-derived topology values instead of
+            # falsely comparing them with the selected physical Llt optimum.
+            terminal_topology_values = np.asarray(
+                _turn_split_main_values(
+                    terminal_x,
+                    fixed_primary_turns=self.problem.fixed_primary_turns,
+                    coordinate_index=int(topology_contract["coordinate_index"]),
+                ),
+                dtype=int,
+            )
+            topology_count_authority = (
+                "terminal_repaired_coordinate_genome_u_N2_side"
+            )
+        else:
+            terminal_topology_values = selected_physical_topologies
+            topology_count_authority = "terminal_physical_replay_frame"
+        if terminal_topology_values.shape != (len(terminal_frame),):
+            raise RuntimeError("terminal topology count authority shape drifted")
+        terminal_topology_counts = {
+            str(topology): int(
+                np.count_nonzero(terminal_topology_values == topology)
             )
             for topology in topologies
+        }
+        terminal_selected_physical_split_counts = {
+            str(value): int(
+                np.count_nonzero(selected_physical_topologies == value)
+            )
+            for value in sorted(set(selected_physical_topologies.tolist()))
         }
         minimum_each = int(
             topology_contract["survival"]["minimum_survivors_per_turn_split_sub_island"]
@@ -6882,6 +6927,13 @@ class Current7Tier1Runner:
             "schema_version": "mft-tier1-turn-split-evolution-audit-v1",
             **operator_audit,
             "terminal_topology_counts": terminal_topology_counts,
+            "terminal_topology_count_authority": topology_count_authority,
+            "coordinate_genome_is_geometry_donor_not_Llt_rejection_authority": (
+                coordinate_genome_is_geometry_donor
+            ),
+            "terminal_selected_physical_split_counts": (
+                terminal_selected_physical_split_counts
+            ),
             "terminal_basin_lane_counts": terminal_lane_counts,
             "bounded_diversity_budget": diversity_budget,
             "topology_niche_diversity_budget": niche_diversity_budget,
