@@ -122,6 +122,7 @@ from module.modeling_260706 import (
 from module.core_air_gap_contract import (
     EQUAL_THREE_LEG_RESULT_TOPOLOGY,
     LEGACY_CENTER_ONLY_RESULT_TOPOLOGY,
+    attest_equal_three_leg_symmetry_piece_bounds,
 )
 from module.core_material_contract import (
     LEG_STACKING_DIRECTION,
@@ -3818,23 +3819,53 @@ class Simulation():
                         "_leg_right_top", "_leg_right_bottom",
                     ))
                 ]
-                expected_names = {
-                    f"core_{index}_leg_{leg}_top"
-                    for index in range(
-                        1,
-                        int(self.df_plus["n_core_group"].iloc[0]) + 1,
+                try:
+                    symmetry_gap_audit = (
+                        attest_equal_three_leg_symmetry_piece_bounds(
+                            {
+                                obj.name: tuple(obj.bounding_box)
+                                for obj in retained_gap_pieces
+                            },
+                            n_group=int(
+                                self.df_plus["n_core_group"].iloc[0]
+                            ),
+                            w1_mm=float(self.df_plus["w1"].iloc[0]),
+                            core_plate_t_mm=float(
+                                self.df_plus["core_plate_t"].iloc[0]
+                            ),
+                            core_plate_pad_t_mm=float(
+                                self.df_plus["core_plate_pad_t"].iloc[0]
+                            ),
+                            l1_mm=float(self.df_plus["l1"].iloc[0]),
+                            l2_mm=float(self.df_plus["l2"].iloc[0]),
+                            h1_mm=float(self.df_plus["h1"].iloc[0]),
+                            gap_mm=center_gap_mm,
+                        )
                     )
-                    for leg in ("left", "center")
-                }
-                actual_names = {
-                    obj.name for obj in retained_gap_pieces
-                }
-                if actual_names != expected_names:
+                except ValueError as exc:
                     raise RuntimeError(
-                        "equal-three-leg air-gap symmetry retention mismatch: "
-                        f"actual={sorted(actual_names)!r}, "
-                        f"expected={sorted(expected_names)!r}"
+                        str(exc)
+                    ) from exc
+                self.df_plus[
+                    "core_air_gap_symmetry_retained_core_group_count"
+                ] = [symmetry_gap_audit["retained_group_count"]]
+                self.df_plus[
+                    "core_air_gap_symmetry_retained_core_group_indices"
+                ] = [
+                    ",".join(
+                        str(index)
+                        for index in symmetry_gap_audit[
+                            "retained_group_indices"
+                        ]
                     )
+                ]
+                self.df_plus[
+                    "core_air_gap_symmetry_bbox_max_error_mm"
+                ] = [
+                    symmetry_gap_audit[
+                        "maximum_bounding_box_error_mm"
+                    ]
+                ]
             else:
                 retained_gap_pieces = [
                     obj for obj in self.design1.core_objs
