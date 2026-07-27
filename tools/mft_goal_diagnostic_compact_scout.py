@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import copy
 from datetime import datetime, timezone
-import json
 import os
 from pathlib import Path
 import sys
@@ -24,8 +23,6 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from module.mft_goal_20260726_contract import (  # noqa: E402
-    FIXED_COOLING_IDENTITY_SHA256,
-    FIXED_OPERATING_IDENTITY_SHA256,
     GOAL_CONTRACT_SCHEMA,
     GOAL_STAGE_SPEC,
     GOAL_STAGE_SPEC_SHA256,
@@ -368,6 +365,38 @@ def prepare(args: argparse.Namespace) -> Path:
     }
     tasks = []
     for ordinal, seed in enumerate(seeds):
+        compact_run_authorization = (
+            preflight.seal_goal_compact_run_authorization(
+                authorization_mode=preflight.GOAL_COMPACT_AUTH_DIAGNOSTIC,
+                source_activation_schema=ACTIVATION_SCHEMA,
+                source_activation_payload_sha256=activation[
+                    "payload_sha256"
+                ],
+                seed=seed,
+                fixed_primary_turns=FIXED_PRIMARY_TURNS,
+                dataset_sha256=activation["source_identity"][
+                    "dataset_sha256"
+                ],
+                evaluation_model_sha256=activation["source_identity"][
+                    "evaluation_model_sha256"
+                ],
+                quality_status_sha256=activation["source_identity"][
+                    "quality_status_sha256"
+                ],
+                source_quality_passed=activation[
+                    "source_quality_passed"
+                ],
+                effective_hard_constraint_contract_sha256=activation[
+                    "effective_hard_constraint_contract_sha256"
+                ],
+                compact_search_contract_sha256=activation[
+                    "compact_search_contract_sha256"
+                ],
+                compact_coordinate_bank_sha256=activation[
+                    "compact_coordinate_bank_sha256"
+                ],
+            )
+        )
         tasks.append(
             goal_launch._seal(
                 {
@@ -397,6 +426,9 @@ def prepare(args: argparse.Namespace) -> Path:
                         "code_inventory_sha256"
                     ],
                     "activation": activation,
+                    "compact_run_authorization": (
+                        compact_run_authorization
+                    ),
                     "screening_only": True,
                     "production_eligible": False,
                     "final_design_claim_allowed": False,
@@ -481,6 +513,11 @@ def _validate_task(value: Mapping[str, Any]) -> dict[str, Any]:
     _seed_interval(int(seed), 1)
     source = task.get("source") or {}
     source_identity = task.get("source_identity") or {}
+    compact_authorization = (
+        preflight.validate_goal_compact_run_authorization_seal(
+            task.get("compact_run_authorization") or {}
+        )
+    )
     digest_fields = (
         "train_report_sha256",
         "candidate_sha256",
@@ -502,6 +539,34 @@ def _validate_task(value: Mapping[str, Any]) -> dict[str, Any]:
         or task.get("hard_constraint_contract_sha256")
         != activation["effective_hard_constraint_contract_sha256"]
         or task.get("source_identity") != activation["source_identity"]
+        or compact_authorization.get("authorization_mode")
+        != preflight.GOAL_COMPACT_AUTH_DIAGNOSTIC
+        or compact_authorization.get("source_activation_schema")
+        != ACTIVATION_SCHEMA
+        or compact_authorization.get("seed") != seed
+        or compact_authorization.get("fixed_primary_turns")
+        != FIXED_PRIMARY_TURNS
+        or compact_authorization.get("source_activation_payload_sha256")
+        != activation["payload_sha256"]
+        or compact_authorization.get("dataset_sha256")
+        != source_identity.get("dataset_sha256")
+        or compact_authorization.get("evaluation_model_sha256")
+        != source_identity.get("evaluation_model_sha256")
+        or compact_authorization.get("quality_status_sha256")
+        != source_identity.get("quality_status_sha256")
+        or compact_authorization.get(
+            "effective_hard_constraint_contract_sha256"
+        )
+        != task.get("hard_constraint_contract_sha256")
+        or compact_authorization.get("compact_search_contract_sha256")
+        != activation.get("compact_search_contract_sha256")
+        or compact_authorization.get("compact_coordinate_bank_sha256")
+        != activation.get("compact_coordinate_bank_sha256")
+        or compact_authorization.get("screening_only") is not True
+        or compact_authorization.get("production_eligible") is not False
+        or compact_authorization.get("final_design_claim_allowed") is not False
+        or compact_authorization.get("dataset_authentication_sha256")
+        is not None
         or set(source)
         != {*goal_launch.RUNTIME_SOURCE_ROLES, "expected_code_revision"}
         or any(
@@ -652,6 +717,8 @@ def execute(args: argparse.Namespace) -> Path:
         pre_optimization_callback=pre_optimization,
         compact_search_contract=compact_contract,
         compact_coordinate_bank=compact_bank,
+        compact_run_authorization=task["compact_run_authorization"],
+        compact_source_activation=activation,
     )
     artifacts = preflight.persist_search_outputs(
         runner,
@@ -695,6 +762,20 @@ def execute(args: argparse.Namespace) -> Path:
             "optimizer_repair_audit": result.tier1_repair_audit,
             "optimizer_topology_evolution_audit": (
                 result.tier1_topology_evolution_audit
+            ),
+            "compact_run_authorization_sha256": task[
+                "compact_run_authorization"
+            ]["sha256"],
+            "resonance_contract_schema": (
+                preflight.GOAL_FIXED_LM_RESONANCE_SCHEMA
+            ),
+            "fixed_lm2mh_resonance_contract_sha256": (
+                preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
+            ),
+            "effective_self_resonance_authority": (
+                preflight.goal_fixed_lm2mh_resonance_contract()[
+                    "effective_self_resonance_authority"
+                ]
             ),
             "terminal_population_count": artifacts[
                 "terminal_population_count"

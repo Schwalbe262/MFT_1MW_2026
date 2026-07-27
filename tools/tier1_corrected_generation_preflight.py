@@ -98,16 +98,12 @@ from module.mft_goal_20260726_contract import (
     GOAL_TEMPERATURE_CONTRACT_SHA256,
     GOAL_TEMPERATURE_TARGETS,
     CORE_TEMPERATURE_TARGETS,
-    TEMPERATURE_TARGET_LIMITS_C,
     WINDING_TEMPERATURE_TARGETS,
     attest_fixed_identity,
-    canonical_sha256 as goal_canonical_sha256,
     cw1_from_unit_coordinate,
     cw1_unit_coordinate,
-    dynamic_core_group_bounds,
     dynamic_core_group_violation,
     is_goal_stage_spec,
-    temperature_limit_for_target,
     validate_cw1_mm,
     validate_goal_stage_spec,
 )
@@ -148,8 +144,23 @@ REMOTE_PREFLIGHT_SCHEMA = "mft-tier1-current7-remote-model-load-v1"
 SEARCH_RESULT_SCHEMA = "mft-tier1-current7-search-seed-v1"
 WARM_ROLE_PARTITION_SCHEMA = "mft-tier1-authenticated-warm-role-partition-v1"
 GOAL_FIXED_LM_RESONANCE_SCHEMA = "mft-goal-fixed-lm2mh-resonance-v1"
-GOAL_COMPACT_SEARCH_SCHEMA = "mft-goal-fresh512-compact-search-v1"
-GOAL_COMPACT_BANK_SCHEMA = "mft-goal-fresh512-compact-coordinate-bank-v1"
+GOAL_COMPACT_SEARCH_SCHEMA = "mft-goal-authorized-compact-search-v2"
+GOAL_COMPACT_BANK_SCHEMA = "mft-goal-authorized-compact-coordinate-bank-v2"
+GOAL_COMPACT_RUN_AUTHORIZATION_SCHEMA = (
+    "mft-goal-compact-run-authorization-v1"
+)
+GOAL_COMPACT_AUTH_FRESH512 = "fresh512-b7-v8"
+GOAL_COMPACT_AUTH_DIAGNOSTIC = "diagnostic-n1-6-screening-only"
+GOAL_FRESH512_AUTH_SEED_START = 2_607_263_000
+GOAL_FRESH512_AUTH_SEED_END = 2_607_263_511
+GOAL_FRESH512_ACTIVATION_SCHEMA = "mft-goal-fresh512-search-activation-v1"
+GOAL_DIAGNOSTIC_COMPACT_ACTIVATION_SCHEMA = (
+    "mft-goal-diagnostic-n1-6-compact-activation-v1"
+)
+GOAL_B7_THERMAL_MESH_POLICY = (
+    "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
+)
+GOAL_B7_THERMAL_MESH_PLAN = "thermal-mesh-plan-v8"
 GOAL_FIXED_PRIMARY_MAGNETIZING_INDUCTANCE_H = 0.002
 GOAL_COMPACT_MUTATION_PERIOD_GENERATIONS = 5
 GOAL_COMPACT_STRATA = {
@@ -1153,7 +1164,7 @@ def goal_topology_contract(fixed_primary_turns: int) -> dict[str, Any]:
 
 
 def goal_fixed_lm2mh_resonance_contract() -> dict[str, Any]:
-    """Return the fresh512-only fixed-primary-Lm resonance authority."""
+    """Return fixed-primary-Lm physics for authorized compact executions."""
 
     value = {
         "schema_version": GOAL_FIXED_LM_RESONANCE_SCHEMA,
@@ -1175,14 +1186,29 @@ def goal_fixed_lm2mh_resonance_contract() -> dict[str, Any]:
         ),
         "physical_Lm_2mH_claimed_before_symmetric_FEA": False,
         "legacy_half_magnetizing_screen_reused": False,
-        "fresh512_only": True,
+        "effective_self_resonance_authority": (
+            "fixed_primary_Lm_2mH_plus_physical_leakage"
+        ),
+        "effective_authority_precedence": (
+            "fixed_lm2mh_resonance_contract_over_base_stage_spec"
+        ),
+        "legacy_constraint_name_is_compatibility_alias": (
+            RESONANCE_MINIMUM_CONSTRAINT
+        ),
+        "base_stage_magnetizing_inductance_factor_ignored": True,
+        "authorized_execution_roles": [
+            GOAL_COMPACT_AUTH_FRESH512,
+            GOAL_COMPACT_AUTH_DIAGNOSTIC,
+        ],
+        "per_seed_authorization_required": True,
+        "legacy_noncompact_execution_allowed": False,
     }
     value["sha256"] = canonical_sha256(value)
     return value
 
 
 def goal_compact_search_contract(fixed_primary_turns: int) -> dict[str, Any]:
-    """Seal compact initialization and mutation for one fresh512 N1 stratum."""
+    """Seal role-neutral compact science for one authorized N1 stratum."""
 
     turns = int(fixed_primary_turns)
     topology = goal_topology_contract(turns)
@@ -1208,7 +1234,14 @@ def goal_compact_search_contract(fixed_primary_turns: int) -> dict[str, Any]:
         "strata": copy.deepcopy(GOAL_COMPACT_STRATA),
         "active_strata_for_this_N1": active_strata,
         "inactive_strata_for_this_N1": inactive_strata,
-        "global_fresh512_all_strata_required": True,
+        "coverage_requirement_by_authorization_role": {
+            GOAL_COMPACT_AUTH_FRESH512: (
+                "global_exact_A_B_C_and_independent_H_across_N1_5_6_7_8"
+            ),
+            GOAL_COMPACT_AUTH_DIAGNOSTIC: (
+                "exact_active_strata_for_N1_6_screening_only"
+            ),
+        },
         "compact_C_exact_coverage_required_in_N1": [6, 7, 8],
         "height_boundary_is_independent_stratum": True,
         "cartesian_intersection_of_all_strata_required": False,
@@ -1248,7 +1281,11 @@ def goal_compact_search_contract(fixed_primary_turns: int) -> dict[str, Any]:
         "physical_Lm_claim_from_surrogate_allowed": False,
         "terminal_physical_replay_required": True,
         "legacy_campaign_behavior_changed": False,
-        "fresh512_only": True,
+        "authorized_execution_roles": [
+            GOAL_COMPACT_AUTH_FRESH512,
+            GOAL_COMPACT_AUTH_DIAGNOSTIC,
+        ],
+        "per_seed_authorization_required": True,
     }
     value["sha256"] = canonical_sha256(value)
     return value
@@ -1269,7 +1306,12 @@ def validate_goal_compact_search_contract(
     if (
         contract.get("sha256") != canonical_sha256(unsigned)
         or contract != expected
-        or contract.get("fresh512_only") is not True
+        or contract.get("per_seed_authorization_required") is not True
+        or contract.get("authorized_execution_roles")
+        != [
+            GOAL_COMPACT_AUTH_FRESH512,
+            GOAL_COMPACT_AUTH_DIAGNOSTIC,
+        ]
         or contract.get("initialization", {}).get("near_band_fallback_allowed")
         is not False
         or contract.get("mutation", {}).get("near_band_fallback_allowed")
@@ -1277,6 +1319,397 @@ def validate_goal_compact_search_contract(
     ):
         raise RuntimeError("compact search contract authentication failed")
     return contract
+
+
+def seal_goal_compact_run_authorization(
+    *,
+    authorization_mode: str,
+    source_activation_schema: str,
+    source_activation_payload_sha256: str,
+    seed: int,
+    fixed_primary_turns: int,
+    dataset_sha256: str,
+    evaluation_model_sha256: str,
+    quality_status_sha256: str,
+    source_quality_passed: bool,
+    effective_hard_constraint_contract_sha256: str,
+    compact_search_contract_sha256: str,
+    compact_coordinate_bank_sha256: str,
+    dataset_authentication_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Seal the only two authorities allowed to enter compact optimization."""
+
+    mode = str(authorization_mode)
+    if mode == GOAL_COMPACT_AUTH_FRESH512:
+        mode_fields = {
+            "thermal_mesh_policy": GOAL_B7_THERMAL_MESH_POLICY,
+            "thermal_mesh_plan_contract_version": GOAL_B7_THERMAL_MESH_PLAN,
+            "every_authenticated_row_exact_B7_v8": True,
+            "screening_only": False,
+            "fresh512_activation_evidence": True,
+            "reserved_fresh512_seed": True,
+        }
+    elif mode == GOAL_COMPACT_AUTH_DIAGNOSTIC:
+        mode_fields = {
+            "thermal_mesh_policy": None,
+            "thermal_mesh_plan_contract_version": None,
+            "every_authenticated_row_exact_B7_v8": False,
+            "screening_only": True,
+            "fresh512_activation_evidence": False,
+            "reserved_fresh512_seed": False,
+        }
+    else:
+        raise RuntimeError("compact run authorization mode is unsupported")
+    value = {
+        "schema_version": GOAL_COMPACT_RUN_AUTHORIZATION_SCHEMA,
+        "authorization_mode": mode,
+        "source_activation_schema": str(source_activation_schema),
+        "source_activation_payload_sha256": str(
+            source_activation_payload_sha256
+        ),
+        "seed": int(seed),
+        "fixed_primary_turns": int(fixed_primary_turns),
+        "dataset_sha256": str(dataset_sha256),
+        "evaluation_model_sha256": str(evaluation_model_sha256),
+        "quality_status_sha256": str(quality_status_sha256),
+        "source_quality_passed": bool(source_quality_passed),
+        "effective_hard_constraint_contract_sha256": str(
+            effective_hard_constraint_contract_sha256
+        ),
+        "fixed_lm2mh_resonance_contract_sha256": (
+            goal_fixed_lm2mh_resonance_contract()["sha256"]
+        ),
+        "compact_search_contract_sha256": str(
+            compact_search_contract_sha256
+        ),
+        "compact_coordinate_bank_sha256": str(
+            compact_coordinate_bank_sha256
+        ),
+        "dataset_authentication_sha256": dataset_authentication_sha256,
+        **mode_fields,
+        "production_eligible": False,
+        "final_design_claim_allowed": False,
+    }
+    value["sha256"] = canonical_sha256(value)
+    return value
+
+
+def validate_goal_compact_run_authorization_seal(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate a compact authority envelope before runtime binding."""
+
+    if not isinstance(value, Mapping):
+        raise RuntimeError("compact run authorization must be a mapping")
+    authorization = copy.deepcopy(dict(value))
+    unsigned = {
+        key: item for key, item in authorization.items() if key != "sha256"
+    }
+    required = {
+        "schema_version",
+        "authorization_mode",
+        "source_activation_schema",
+        "source_activation_payload_sha256",
+        "seed",
+        "fixed_primary_turns",
+        "dataset_sha256",
+        "evaluation_model_sha256",
+        "quality_status_sha256",
+        "source_quality_passed",
+        "effective_hard_constraint_contract_sha256",
+        "fixed_lm2mh_resonance_contract_sha256",
+        "compact_search_contract_sha256",
+        "compact_coordinate_bank_sha256",
+        "dataset_authentication_sha256",
+        "thermal_mesh_policy",
+        "thermal_mesh_plan_contract_version",
+        "every_authenticated_row_exact_B7_v8",
+        "screening_only",
+        "fresh512_activation_evidence",
+        "reserved_fresh512_seed",
+        "production_eligible",
+        "final_design_claim_allowed",
+        "sha256",
+    }
+    digest_fields = (
+        "source_activation_payload_sha256",
+        "dataset_sha256",
+        "evaluation_model_sha256",
+        "quality_status_sha256",
+        "effective_hard_constraint_contract_sha256",
+        "fixed_lm2mh_resonance_contract_sha256",
+        "compact_search_contract_sha256",
+        "compact_coordinate_bank_sha256",
+    )
+    if (
+        set(authorization) != required
+        or authorization.get("schema_version")
+        != GOAL_COMPACT_RUN_AUTHORIZATION_SCHEMA
+        or authorization.get("sha256") != canonical_sha256(unsigned)
+        or any(
+            not isinstance(authorization.get(name), str)
+            or len(authorization[name]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in authorization[name]
+            )
+            for name in digest_fields
+        )
+        or not isinstance(authorization.get("source_quality_passed"), bool)
+        or authorization.get("production_eligible") is not False
+        or authorization.get("final_design_claim_allowed") is not False
+    ):
+        raise RuntimeError("compact run authorization seal mismatch")
+    dataset_auth_sha = authorization.get("dataset_authentication_sha256")
+    if dataset_auth_sha is not None and (
+        not isinstance(dataset_auth_sha, str)
+        or len(dataset_auth_sha) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in dataset_auth_sha
+        )
+    ):
+        raise RuntimeError("compact dataset authentication seal mismatch")
+    return authorization
+
+
+def validate_goal_compact_run_authorization(
+    value: Mapping[str, Any],
+    *,
+    source_activation: Mapping[str, Any],
+    problem: Any,
+    seed: int,
+    authenticated: Any,
+    compact_contract: Mapping[str, Any],
+    compact_bank: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind compact authority to the exact runner, seed, model and dataset."""
+
+    authorization = validate_goal_compact_run_authorization_seal(value)
+    mode = authorization["authorization_mode"]
+    if not isinstance(source_activation, Mapping):
+        raise RuntimeError("compact source activation must be a mapping")
+    activation = copy.deepcopy(dict(source_activation))
+    activation_unsigned = {
+        key: item
+        for key, item in activation.items()
+        if key != "payload_sha256"
+    }
+    if (
+        activation.get("payload_sha256")
+        != canonical_sha256(activation_unsigned)
+        or activation.get("payload_sha256")
+        != authorization["source_activation_payload_sha256"]
+        or activation.get("schema_version")
+        != authorization["source_activation_schema"]
+    ):
+        raise RuntimeError("compact source activation seal mismatch")
+    observed_quality_passed = bool(authenticated.quality.get("passed"))
+    observed_model_sha = canonical_sha256(
+        authenticated.report["artifacts"]
+    )
+    reserved_seed = (
+        GOAL_FRESH512_AUTH_SEED_START
+        <= int(seed)
+        <= GOAL_FRESH512_AUTH_SEED_END
+    )
+    if (
+        authorization.get("seed") != int(seed)
+        or authorization.get("fixed_primary_turns")
+        != int(problem.fixed_primary_turns)
+        or authorization.get("dataset_sha256")
+        != authenticated.evidence["dataset"]["sha256"]
+        or authorization.get("evaluation_model_sha256")
+        != observed_model_sha
+        or authorization.get("quality_status_sha256")
+        != authenticated.evidence["quality_status"]["sha256"]
+        or authorization.get("source_quality_passed")
+        is not observed_quality_passed
+        or authorization.get("effective_hard_constraint_contract_sha256")
+        != problem.hard_constraint_contract_sha256
+        or authorization.get("fixed_lm2mh_resonance_contract_sha256")
+        != goal_fixed_lm2mh_resonance_contract()["sha256"]
+        or authorization.get("compact_search_contract_sha256")
+        != compact_contract.get("sha256")
+        or authorization.get("compact_coordinate_bank_sha256")
+        != compact_bank.get("sha256")
+        or authorization.get("reserved_fresh512_seed") is not reserved_seed
+        or not getattr(
+            problem, "_goal_fixed_lm2mh_resonance_installed", False
+        )
+    ):
+        raise RuntimeError("compact run authorization runtime binding mismatch")
+    if mode == GOAL_COMPACT_AUTH_FRESH512:
+        dataset_authentication = activation.get(
+            "dataset_authentication"
+        ) or {}
+        compact_by_n1 = activation.get("compact_by_N1") or {}
+        compact_item = compact_by_n1.get(
+            str(problem.fixed_primary_turns)
+        ) or {}
+        if (
+            authorization.get("source_activation_schema")
+            != GOAL_FRESH512_ACTIVATION_SCHEMA
+            or authorization.get("source_quality_passed") is not True
+            or authorization.get("screening_only") is not False
+            or authorization.get("fresh512_activation_evidence") is not True
+            or authorization.get("thermal_mesh_policy")
+            != GOAL_B7_THERMAL_MESH_POLICY
+            or authorization.get("thermal_mesh_plan_contract_version")
+            != GOAL_B7_THERMAL_MESH_PLAN
+            or authorization.get("every_authenticated_row_exact_B7_v8")
+            is not True
+            or authorization.get("dataset_authentication_sha256") is None
+            or activation.get("dataset_sha256")
+            != authorization.get("dataset_sha256")
+            or activation.get("evaluation_model_sha256")
+            != authorization.get("evaluation_model_sha256")
+            or activation.get("quality_status_sha256")
+            != authorization.get("quality_status_sha256")
+            or activation.get("quality_passed") is not True
+            or activation.get("search_only_proposal") is not False
+            or activation.get("seed_start")
+            != GOAL_FRESH512_AUTH_SEED_START
+            or activation.get("seed_end_inclusive")
+            != GOAL_FRESH512_AUTH_SEED_END
+            or activation.get("seed_count") != 512
+            or activation.get("seeds_per_N1_stratum") != 128
+            or set(compact_by_n1) != {"5", "6", "7", "8"}
+            or activation.get(
+                "global_exact_A_B_C_and_independent_H_coverage"
+            )
+            is not True
+            or activation.get(
+                "invalid_or_near_band_fallback_allowed"
+            )
+            is not False
+            or activation.get(
+                "symmetric_FEA_validation_still_required"
+            )
+            is not True
+            or activation.get(
+                "effective_hard_constraint_contract_sha256"
+            )
+            != authorization.get(
+                "effective_hard_constraint_contract_sha256"
+            )
+            or activation.get(
+                "fixed_lm2mh_resonance_contract_sha256"
+            )
+            != authorization.get(
+                "fixed_lm2mh_resonance_contract_sha256"
+            )
+            or canonical_sha256(dataset_authentication)
+            != authorization.get("dataset_authentication_sha256")
+            or dataset_authentication.get("thermal_mesh_policy")
+            != GOAL_B7_THERMAL_MESH_POLICY
+            or dataset_authentication.get("dataset_sha256")
+            != authorization.get("dataset_sha256")
+            or int(
+                dataset_authentication.get(
+                    "authenticated_row_count", -1
+                )
+            )
+            < 8
+            or int(dataset_authentication.get("unique_source_tasks", -1))
+            < 4
+            or dataset_authentication.get(
+                "thermal_mesh_plan_contract_version"
+            )
+            != GOAL_B7_THERMAL_MESH_PLAN
+            or dataset_authentication.get(
+                "every_authenticated_row_exact_B7_v8"
+            )
+            is not True
+            or compact_item.get("contract_sha256")
+            != compact_contract.get("sha256")
+            or compact_item.get("coordinate_bank_sha256")
+            != compact_bank.get("sha256")
+            or activation.get("scheduler_write_performed") is not False
+            or activation.get("scheduler_submission_performed") is not False
+        ):
+            raise RuntimeError("fresh512 compact authorization is incomplete")
+    elif mode == GOAL_COMPACT_AUTH_DIAGNOSTIC:
+        source_identity = activation.get("source_identity") or {}
+        if (
+            authorization.get("source_activation_schema")
+            != GOAL_DIAGNOSTIC_COMPACT_ACTIVATION_SCHEMA
+            or int(problem.fixed_primary_turns) != 6
+            or authorization.get("screening_only") is not True
+            or authorization.get("fresh512_activation_evidence") is not False
+            or authorization.get("thermal_mesh_policy") is not None
+            or authorization.get("thermal_mesh_plan_contract_version") is not None
+            or authorization.get("every_authenticated_row_exact_B7_v8")
+            is not False
+            or authorization.get("dataset_authentication_sha256") is not None
+            or activation.get("fixed_primary_turns") != 6
+            or activation.get("campaign_id")
+            != "mft-goal-diagnostic-n1-6-compact-scout"
+            or activation.get("screening_only") is not True
+            or activation.get("production_eligible") is not False
+            or activation.get("final_design_claim_allowed") is not False
+            or activation.get("fresh512_activation_evidence") is not False
+            or activation.get(
+                "reserved_fresh512_seed_interval_used"
+            )
+            is not False
+            or source_identity.get("dataset_sha256")
+            != authorization.get("dataset_sha256")
+            or source_identity.get("evaluation_model_sha256")
+            != authorization.get("evaluation_model_sha256")
+            or source_identity.get("quality_status_sha256")
+            != authorization.get("quality_status_sha256")
+            or activation.get("source_quality_passed")
+            is not authorization.get("source_quality_passed")
+            or activation.get(
+                "fixed_lm2mh_resonance_contract_sha256"
+            )
+            != authorization.get(
+                "fixed_lm2mh_resonance_contract_sha256"
+            )
+            or activation.get(
+                "effective_hard_constraint_contract_sha256"
+            )
+            != authorization.get(
+                "effective_hard_constraint_contract_sha256"
+            )
+            or activation.get("compact_search_contract_sha256")
+            != compact_contract.get("sha256")
+            or activation.get("compact_coordinate_bank_sha256")
+            != compact_bank.get("sha256")
+            or activation.get("scheduler_write_performed") is not False
+            or activation.get("scheduler_submission_performed") is not False
+        ):
+            raise RuntimeError("diagnostic compact authorization is incomplete")
+    else:
+        raise RuntimeError("compact run authorization mode is unsupported")
+    return authorization
+
+
+def goal_compact_initialization_claims(
+    compact_contract: Mapping[str, Any],
+    bank_replay: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Report per-run compact coverage without promoting global C coverage."""
+
+    active = list(compact_contract["active_strata_for_this_N1"])
+    counts = copy.deepcopy(dict(bank_replay["membership_counts"]))
+    if set(counts) != set(compact_contract["strata"]):
+        raise RuntimeError("compact initialization membership inventory drifted")
+    return {
+        "active_strata_for_this_N1": active,
+        "exact_membership_counts": counts,
+        "exact_A_B_C_bridge_inserted": all(
+            int(counts[name]) > 0
+            for name in ("compact_A", "compact_B", "compact_C")
+        ),
+        "global_fresh512_compact_C_coverage_deferred": (
+            "compact_C" not in active
+        ),
+        "height_boundary_inserted_independently": (
+            int(counts["height_boundary"]) > 0
+        ),
+    }
 
 
 def _compact_stratum_memberships(
@@ -1764,6 +2197,16 @@ def install_goal_fixed_lm2mh_resonance(
     effective_contract["base_hard_constraint_contract_sha256"] = base_contract_sha
     effective_contract["resonance_authority"] = copy.deepcopy(resonance_contract)
     effective_contract["resonance_authority_sha256"] = resonance_contract["sha256"]
+    effective_contract["effective_self_resonance_authority"] = (
+        resonance_contract["effective_self_resonance_authority"]
+    )
+    effective_contract["effective_resonance_authority_precedence"] = (
+        resonance_contract["effective_authority_precedence"]
+    )
+    effective_contract["legacy_constraint_name_is_compatibility_alias"] = (
+        RESONANCE_MINIMUM_CONSTRAINT
+    )
+    effective_contract["base_stage_magnetizing_inductance_factor_ignored"] = True
     effective_contract["core_center_gap_mm_FEA_synthesis_required"] = True
     effective_contract["physical_Lm_2mH_verified"] = False
     physical_evaluate = problem._evaluate
@@ -1835,6 +2278,17 @@ def install_goal_fixed_lm2mh_resonance(
         ),
         "resonance_contract": resonance_contract,
         "resonance_contract_sha256": resonance_contract["sha256"],
+        "resonance_contract_schema": GOAL_FIXED_LM_RESONANCE_SCHEMA,
+        "effective_self_resonance_authority": resonance_contract[
+            "effective_self_resonance_authority"
+        ],
+        "effective_authority_precedence": resonance_contract[
+            "effective_authority_precedence"
+        ],
+        "legacy_constraint_name_is_compatibility_alias": (
+            RESONANCE_MINIMUM_CONSTRAINT
+        ),
+        "base_stage_magnetizing_inductance_factor_ignored": True,
         "minimum_resonance_constraint_replaced_only": True,
         "other_physical_constraints_mutated": False,
         "core_center_gap_mm_FEA_synthesis_required": True,
@@ -5287,6 +5741,8 @@ class Current7Tier1Runner:
         pre_optimization_callback: Any | None = None,
         compact_search_contract: Mapping[str, Any] | None = None,
         compact_coordinate_bank: Mapping[str, Any] | None = None,
+        compact_run_authorization: Mapping[str, Any] | None = None,
+        compact_source_activation: Mapping[str, Any] | None = None,
     ) -> Any:
         """Run current NSGA semantics with one repair on every path."""
 
@@ -5313,6 +5769,12 @@ class Current7Tier1Runner:
                 "compact run requires both search contract and coordinate bank"
             )
         compact_active = compact_search_contract is not None
+        if compact_active != (compact_run_authorization is not None) or (
+            compact_active != (compact_source_activation is not None)
+        ):
+            raise RuntimeError(
+                "compact run requires an authenticated per-seed authority"
+            )
         if compact_active and (
             not getattr(self.problem, "goal_campaign", False)
             or not getattr(
@@ -5324,9 +5786,11 @@ class Current7Tier1Runner:
             or warm_start_niche_partition is not None
         ):
             raise RuntimeError(
-                "compact path is fresh512-only and requires fixed-Lm goal physics"
+                "compact path is authorization-gated and requires fixed-Lm "
+                "goal physics"
             )
         active_compact_contract = None
+        active_compact_authorization = None
         compact_bank_coordinates = None
         compact_bank_replay = None
         if compact_active:
@@ -5339,6 +5803,17 @@ class Current7Tier1Runner:
                     self.problem,
                     compact_coordinate_bank or {},
                     compact_contract=active_compact_contract,
+                )
+            )
+            active_compact_authorization = (
+                validate_goal_compact_run_authorization(
+                    compact_run_authorization or {},
+                    source_activation=compact_source_activation or {},
+                    problem=self.problem,
+                    seed=int(seed),
+                    authenticated=self.authenticated,
+                    compact_contract=active_compact_contract,
+                    compact_bank=compact_coordinate_bank or {},
                 )
             )
         niche_active = warm_start_niche_partition is not None
@@ -5570,8 +6045,10 @@ class Current7Tier1Runner:
                 "count": len(replayed),
                 "coordinate_sha256": canonical_sha256(replayed.tolist()),
                 "bank_replay": replay_audit,
-                "exact_A_B_C_bridge_inserted": True,
-                "height_boundary_inserted_independently": True,
+                **goal_compact_initialization_claims(
+                    active_compact_contract,
+                    replay_audit,
+                ),
                 "near_band_fallback_used": False,
             }
             compact_initialization_audit["sha256"] = canonical_sha256(
@@ -5926,6 +6403,11 @@ class Current7Tier1Runner:
                 if active_compact_contract is None
                 else active_compact_contract["sha256"]
             ),
+            "compact_run_authorization_sha256": (
+                None
+                if active_compact_authorization is None
+                else active_compact_authorization["sha256"]
+            ),
             "compact_initialization": compact_initialization_audit,
             "compact_exact_mutation_coverage_verified": bool(compact_active),
             "exact_topology_quota_every_generation_verified": exact_quota_mode,
@@ -5967,6 +6449,9 @@ class Current7Tier1Runner:
         result.tier1_topology_evolution_contract = topology_contract
         result.tier1_topology_evolution_audit = topology_audit
         result.tier1_compact_search_contract = active_compact_contract
+        result.tier1_compact_run_authorization = (
+            active_compact_authorization
+        )
         result.tier1_compact_initialization_audit = (
             compact_initialization_audit
         )
@@ -8109,6 +8594,40 @@ def persist_search_outputs(
     from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
     output = output.resolve(strict=True)
+    fixed_lm_active = bool(
+        getattr(
+            runner.problem,
+            "_goal_fixed_lm2mh_resonance_installed",
+            False,
+        )
+    )
+    resonance_contract = (
+        getattr(
+            runner.problem,
+            "_goal_fixed_lm2mh_resonance_contract",
+            None,
+        )
+        if fixed_lm_active
+        else None
+    )
+    if fixed_lm_active and (
+        resonance_contract != goal_fixed_lm2mh_resonance_contract()
+        or runner.problem.hard_constraint_contract.get(
+            "resonance_authority_sha256"
+        )
+        != resonance_contract["sha256"]
+        or runner.problem.hard_constraint_contract.get(
+            "effective_self_resonance_authority"
+        )
+        != resonance_contract["effective_self_resonance_authority"]
+        or runner.problem.hard_constraint_contract.get(
+            "base_stage_magnetizing_inductance_factor_ignored"
+        )
+        is not True
+    ):
+        raise RuntimeError(
+            "terminal fixed-Lm resonance authority is unauthenticated"
+        )
     terminal = getattr(result, "pop", None)
     if terminal is None:
         terminal = getattr(getattr(result, "algorithm", None), "pop", None)
@@ -8321,6 +8840,23 @@ def persist_search_outputs(
         "physical_deduplication_key": "physical_geometry_sha256",
         "global_pareto_provenance_ready": True,
     }
+    if resonance_contract is not None:
+        terminal_table_manifest.update(
+            {
+                "resonance_contract_schema": resonance_contract[
+                    "schema_version"
+                ],
+                "fixed_lm2mh_resonance_contract_sha256": (
+                    resonance_contract["sha256"]
+                ),
+                "effective_self_resonance_authority": (
+                    resonance_contract[
+                        "effective_self_resonance_authority"
+                    ]
+                ),
+                "base_stage_magnetizing_inductance_factor_ignored": True,
+            }
+        )
     terminal_table_manifest["payload_sha256"] = canonical_sha256(
         terminal_table_manifest
     )

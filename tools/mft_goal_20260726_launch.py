@@ -454,11 +454,7 @@ def build_fresh512_search_activation(
         or local_preflight.get("search_only_proposal") is not False
         or local_preflight.get("fixed_lm2mh_resonance_contract_sha256")
         != preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
-        or not getattr(
-            first_runner.problem,
-            "_goal_fixed_lm2mh_resonance_installed",
-            False,
-        )
+        or local_preflight.get("fixed_lm2mh_resonance_installed") is not False
     ):
         raise RuntimeError(
             "fresh512 activation is closed until valid B7/v8 retraining passes"
@@ -467,15 +463,29 @@ def build_fresh512_search_activation(
         runtime_dataset,
         local_preflight=local_preflight,
     )
-    runners: dict[int, preflight.Current7Tier1Runner] = {
-        int(first_runner.problem.fixed_primary_turns): first_runner
-    }
+    runners: dict[int, preflight.Current7Tier1Runner] = {}
+    fixed_lm_installations: dict[str, Any] = {}
     for turns in GOAL_PRIMARY_TURN_STRATA:
-        if turns in runners:
-            continue
         runner = preflight.runner_for_fixed_primary_turns(first_runner, turns)
-        preflight.install_goal_fixed_lm2mh_resonance(runner.problem)
+        _base, installation = preflight.install_goal_fixed_lm2mh_resonance(
+            runner.problem
+        )
         runners[turns] = runner
+        fixed_lm_installations[str(turns)] = installation
+    base_hashes = {
+        item["base_hard_constraint_contract_sha256"]
+        for item in fixed_lm_installations.values()
+    }
+    effective_hashes = {
+        runner.problem.hard_constraint_contract_sha256
+        for runner in runners.values()
+    }
+    if (
+        base_hashes != {local_preflight["hard_constraint_contract_sha256"]}
+        or len(effective_hashes) != 1
+    ):
+        raise RuntimeError("fresh512 fixed-Lm hard-contract binding failed")
+    effective_hard_hash = next(iter(effective_hashes))
     compact: dict[str, Any] = {}
     for turns in GOAL_PRIMARY_TURN_STRATA:
         runner = runners[turns]
@@ -535,9 +545,11 @@ def build_fresh512_search_activation(
         "fixed_lm2mh_resonance_contract_sha256": (
             preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
         ),
-        "effective_hard_constraint_contract_sha256": local_preflight[
+        "base_hard_constraint_contract_sha256": local_preflight[
             "hard_constraint_contract_sha256"
         ],
+        "effective_hard_constraint_contract_sha256": effective_hard_hash,
+        "fixed_lm2mh_installation_by_N1": fixed_lm_installations,
         "compact_by_N1": compact,
         "global_compact_membership_counts": global_membership_counts,
         "global_exact_A_B_C_and_independent_H_coverage": True,
@@ -566,6 +578,7 @@ def validate_fresh512_search_activation(
     compact = activation.get("compact_by_N1") or {}
     resonance = activation.get("fixed_lm2mh_resonance_contract") or {}
     dataset_authentication = activation.get("dataset_authentication") or {}
+    installations = activation.get("fixed_lm2mh_installation_by_N1") or {}
     required_policy = (
         "b7-rxmain-l5-shared-region-wcp-pad-symmetry-contact-clipped-v1"
     )
@@ -575,6 +588,8 @@ def validate_fresh512_search_activation(
         or activation.get("seed_count") != FRESH_AL_SEED_COUNT
         or activation.get("seeds_per_N1_stratum") != 128
         or set(compact) != {str(turns) for turns in GOAL_PRIMARY_TURN_STRATA}
+        or set(installations)
+        != {str(turns) for turns in GOAL_PRIMARY_TURN_STRATA}
         or resonance != preflight.goal_fixed_lm2mh_resonance_contract()
         or activation.get("fixed_lm2mh_resonance_contract_sha256")
         != resonance.get("sha256")
@@ -601,6 +616,19 @@ def validate_fresh512_search_activation(
             "every_authenticated_row_exact_B7_v8"
         )
         is not True
+        or any(
+            item.get("base_hard_constraint_contract_sha256")
+            != activation.get("base_hard_constraint_contract_sha256")
+            or item.get("effective_hard_constraint_contract_sha256")
+            != activation.get("effective_hard_constraint_contract_sha256")
+            or item.get("resonance_contract_schema")
+            != preflight.GOAL_FIXED_LM_RESONANCE_SCHEMA
+            or item.get("resonance_contract_sha256")
+            != resonance.get("sha256")
+            for item in installations.values()
+            if isinstance(item, Mapping)
+        )
+        or any(not isinstance(item, Mapping) for item in installations.values())
     ):
         raise RuntimeError("fresh512 search activation contract mismatch")
     for turns in GOAL_PRIMARY_TURN_STRATA:
@@ -699,8 +727,9 @@ def validate_fresh512_search_activation(
         != local_preflight.get("dataset_sha256")
         or activation.get("evaluation_model_sha256")
         != local_preflight.get("evaluation_model_sha256")
-        or activation.get("effective_hard_constraint_contract_sha256")
+        or activation.get("base_hard_constraint_contract_sha256")
         != local_preflight.get("hard_constraint_contract_sha256")
+        or local_preflight.get("fixed_lm2mh_resonance_installed") is not False
     ):
         raise RuntimeError("fresh512 activation differs from local preflight")
     return activation
@@ -862,18 +891,12 @@ def run_local_preflight(
         )
         for turns in GOAL_PRIMARY_TURN_STRATA
     }
-    fixed_lm_installations = {
-        str(turns): preflight.install_goal_fixed_lm2mh_resonance(
-            runners[str(turns)].problem
-        )[1]
-        for turns in GOAL_PRIMARY_TURN_STRATA
-    }
-    effective_hard_hashes = {
+    base_hard_hashes = {
         runner.problem.hard_constraint_contract_sha256
         for runner in runners.values()
     }
-    if len(effective_hard_hashes) != 1:
-        raise RuntimeError("fixed-Lm effective hard contract differs by N1 stratum")
+    if len(base_hard_hashes) != 1:
+        raise RuntimeError("base hard contract differs by N1 stratum")
     strata: dict[str, Any] = {}
     for turns in GOAL_PRIMARY_TURN_STRATA:
         runner = runners[str(turns)]
@@ -921,9 +944,7 @@ def run_local_preflight(
             "model_smoke_sha256": canonical_sha256(model_smoke),
             "all_24_required_models_exercised": True,
             "decoded_and_finite": True,
-            "fixed_lm2mh_resonance_installation": (
-                fixed_lm_installations[str(turns)]
-            ),
+            "fixed_lm2mh_resonance_installed": False,
         }
     artifacts = first.authenticated.report["artifacts"]
     value = {
@@ -940,14 +961,15 @@ def run_local_preflight(
             first.problem.hard_constraint_contract_sha256
         ),
         "base_hard_constraint_contract_sha256": (
-            first.problem._goal_base_hard_constraint_contract_sha256
+            first.problem.hard_constraint_contract_sha256
         ),
         "fixed_lm2mh_resonance_contract": (
-            first.problem._goal_fixed_lm2mh_resonance_contract
+            preflight.goal_fixed_lm2mh_resonance_contract()
         ),
         "fixed_lm2mh_resonance_contract_sha256": (
-            first.problem._goal_fixed_lm2mh_resonance_contract["sha256"]
+            preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
         ),
+        "fixed_lm2mh_resonance_installed": False,
         "operating_point_sha256": FIXED_OPERATING_IDENTITY_SHA256,
         "cooling_contract_sha256": FIXED_COOLING_IDENTITY_SHA256,
         "generation": first.authenticated.evidence["generation_relative"],
@@ -1042,6 +1064,40 @@ def build_bundle_values(
     for assignment in assignments:
         seed = int(assignment["seed"])
         turns = int(assignment["fixed_primary_turns"])
+        compact_item = (
+            None
+            if activation is None
+            else activation["compact_by_N1"][str(turns)]
+        )
+        compact_run_authorization = (
+            None
+            if activation is None
+            else preflight.seal_goal_compact_run_authorization(
+                authorization_mode=preflight.GOAL_COMPACT_AUTH_FRESH512,
+                source_activation_schema=FRESH512_ACTIVATION_SCHEMA,
+                source_activation_payload_sha256=activation["payload_sha256"],
+                seed=seed,
+                fixed_primary_turns=turns,
+                dataset_sha256=activation["dataset_sha256"],
+                evaluation_model_sha256=activation[
+                    "evaluation_model_sha256"
+                ],
+                quality_status_sha256=activation["quality_status_sha256"],
+                source_quality_passed=activation["quality_passed"],
+                effective_hard_constraint_contract_sha256=activation[
+                    "effective_hard_constraint_contract_sha256"
+                ],
+                compact_search_contract_sha256=compact_item[
+                    "contract_sha256"
+                ],
+                compact_coordinate_bank_sha256=compact_item[
+                    "coordinate_bank_sha256"
+                ],
+                dataset_authentication_sha256=canonical_sha256(
+                    activation["dataset_authentication"]
+                ),
+            )
+        )
         task = _seal(
             {
                 "schema_version": TASK_PAYLOAD_SCHEMA,
@@ -1057,9 +1113,13 @@ def build_bundle_values(
                 "temperature_contract_sha256": (
                     GOAL_TEMPERATURE_CONTRACT_SHA256
                 ),
-                "hard_constraint_contract_sha256": local_preflight[
-                    "hard_constraint_contract_sha256"
-                ],
+                "hard_constraint_contract_sha256": (
+                    local_preflight["hard_constraint_contract_sha256"]
+                    if activation is None
+                    else activation[
+                        "effective_hard_constraint_contract_sha256"
+                    ]
+                ),
                 "search_only_proposal": local_preflight[
                     "search_only_proposal"
                 ],
@@ -1110,6 +1170,7 @@ def build_bundle_values(
                     copy.deepcopy(activation) if exact_fresh512 else None
                 ),
                 "fresh512_compact_active": exact_fresh512,
+                "compact_run_authorization": compact_run_authorization,
             }
         )
         tasks.append(task)
@@ -1127,9 +1188,13 @@ def build_bundle_values(
             "temperature_contract_sha256": (
                 GOAL_TEMPERATURE_CONTRACT_SHA256
             ),
-            "hard_constraint_contract_sha256": local_preflight[
-                "hard_constraint_contract_sha256"
-            ],
+            "hard_constraint_contract_sha256": (
+                local_preflight["hard_constraint_contract_sha256"]
+                if activation is None
+                else activation[
+                    "effective_hard_constraint_contract_sha256"
+                ]
+            ),
             "local_preflight_sha256": local_preflight["payload_sha256"],
             "search_only_proposal": local_preflight[
                 "search_only_proposal"
@@ -1250,12 +1315,18 @@ def validate_task_payload(value: Any) -> dict[str, Any]:
     if not isinstance(compact_active, bool):
         raise RuntimeError("goal task compact activation flag is invalid")
     activation = task.get("fresh512_search_activation")
+    compact_authorization = task.get("compact_run_authorization")
     if compact_active:
         if not isinstance(activation, Mapping):
             raise RuntimeError("fresh512 task lacks compact search activation")
         activation = validate_fresh512_search_activation(activation)
         turns = int(task.get("fixed_primary_turns", -1))
         compact_item = (activation.get("compact_by_N1") or {}).get(str(turns))
+        authorization = (
+            preflight.validate_goal_compact_run_authorization_seal(
+                compact_authorization or {}
+            )
+        )
         if (
             not FRESH_AL_SEED_START
             <= int(task.get("seed", -1))
@@ -1266,10 +1337,36 @@ def validate_task_payload(value: Any) -> dict[str, Any]:
             != task.get("evaluation_model_sha256")
             or activation.get("effective_hard_constraint_contract_sha256")
             != task.get("hard_constraint_contract_sha256")
+            or authorization.get("authorization_mode")
+            != preflight.GOAL_COMPACT_AUTH_FRESH512
+            or authorization.get("source_activation_schema")
+            != FRESH512_ACTIVATION_SCHEMA
+            or authorization.get("seed") != task.get("seed")
+            or authorization.get("fixed_primary_turns") != turns
+            or authorization.get("source_activation_payload_sha256")
+            != activation.get("payload_sha256")
+            or authorization.get("dataset_sha256")
+            != task.get("dataset_sha256")
+            or authorization.get("evaluation_model_sha256")
+            != task.get("evaluation_model_sha256")
+            or authorization.get("quality_status_sha256")
+            != source_identity.get("quality_status_sha256")
+            or authorization.get(
+                "effective_hard_constraint_contract_sha256"
+            )
+            != task.get("hard_constraint_contract_sha256")
+            or authorization.get("compact_search_contract_sha256")
+            != compact_item.get("contract_sha256")
+            or authorization.get("compact_coordinate_bank_sha256")
+            != compact_item.get("coordinate_bank_sha256")
+            or authorization.get("dataset_authentication_sha256")
+            != canonical_sha256(activation["dataset_authentication"])
         ):
             raise RuntimeError("fresh512 task activation identity mismatch")
-    elif activation is not None:
-        raise RuntimeError("noncompact task cannot carry fresh512 activation")
+    elif activation is not None or compact_authorization is not None:
+        raise RuntimeError(
+            "noncompact task cannot carry a compact activation or authority"
+        )
     if (
         task.get("goal_contract_schema") != GOAL_CONTRACT_SCHEMA
         or task.get("stage_spec_sha256") != GOAL_STAGE_SPEC_SHA256
@@ -1497,9 +1594,32 @@ def execute_seed(args: argparse.Namespace) -> Path:
             else None
         ),
     )
-    _base_physical_evaluate, fixed_lm_installation = (
-        preflight.install_goal_fixed_lm2mh_resonance(runner.problem)
-    )
+    fixed_lm_installation = None
+    compact_contract = None
+    compact_bank = None
+    compact_run_authorization = None
+    if task["fresh512_compact_active"]:
+        activation = validate_fresh512_search_activation(
+            task["fresh512_search_activation"]
+        )
+        _base_physical_evaluate, fixed_lm_installation = (
+            preflight.install_goal_fixed_lm2mh_resonance(runner.problem)
+        )
+        compact_item = activation["compact_by_N1"][
+            str(task["fixed_primary_turns"])
+        ]
+        compact_contract = compact_item["contract"]
+        compact_bank = compact_item["coordinate_bank"]
+        compact_run_authorization = task["compact_run_authorization"]
+        preflight.validate_goal_compact_coordinate_bank(
+            runner.problem,
+            compact_bank,
+            compact_contract=compact_contract,
+        )
+    elif getattr(
+        runner.problem, "_goal_fixed_lm2mh_resonance_installed", False
+    ):
+        raise RuntimeError("nonreserved task unexpectedly installed fixed-Lm")
     source_identity = task["source_identity"]
     if (
         runner.authenticated.evidence["train_report"]["sha256"]
@@ -1545,23 +1665,6 @@ def execute_seed(args: argparse.Namespace) -> Path:
             int(task["fixed_primary_turns"])
         )
     )
-    compact_contract = None
-    compact_bank = None
-    if task["fresh512_compact_active"]:
-        activation = validate_fresh512_search_activation(
-            task["fresh512_search_activation"]
-        )
-        compact_item = activation["compact_by_N1"][
-            str(task["fixed_primary_turns"])
-        ]
-        compact_contract = compact_item["contract"]
-        compact_bank = compact_item["coordinate_bank"]
-        preflight.validate_goal_compact_coordinate_bank(
-            runner.problem,
-            compact_bank,
-            compact_contract=compact_contract,
-        )
-
     def seal_pre_optimization(value: Mapping[str, Any]) -> None:
         if (
             value.get("offspring_repair_operator_installed") is not True
@@ -1593,6 +1696,12 @@ def execute_seed(args: argparse.Namespace) -> Path:
         pre_optimization_callback=seal_pre_optimization,
         compact_search_contract=compact_contract,
         compact_coordinate_bank=compact_bank,
+        compact_run_authorization=compact_run_authorization,
+        compact_source_activation=(
+            task["fresh512_search_activation"]
+            if task["fresh512_compact_active"]
+            else None
+        ),
     )
     artifacts = preflight.persist_search_outputs(
         runner,
@@ -1656,9 +1765,33 @@ def execute_seed(args: argparse.Namespace) -> Path:
             "constraint_names": list(runner.problem.constraint_names),
             "temperature_targets": list(GOAL_TEMPERATURE_TARGETS),
             "optimizer_scaling_contract": scaling,
-            "fixed_lm2mh_resonance_installation": fixed_lm_installation,
-            "fixed_lm2mh_resonance_contract": (
-                runner.problem._goal_fixed_lm2mh_resonance_contract
+            **(
+                {}
+                if fixed_lm_installation is None
+                else {
+                    "fixed_lm2mh_resonance_installation": (
+                        fixed_lm_installation
+                    ),
+                    "fixed_lm2mh_resonance_contract": (
+                        runner.problem._goal_fixed_lm2mh_resonance_contract
+                    ),
+                    "resonance_contract_schema": (
+                        preflight.GOAL_FIXED_LM_RESONANCE_SCHEMA
+                    ),
+                    "fixed_lm2mh_resonance_contract_sha256": (
+                        runner.problem._goal_fixed_lm2mh_resonance_contract[
+                            "sha256"
+                        ]
+                    ),
+                    "effective_self_resonance_authority": (
+                        runner.problem._goal_fixed_lm2mh_resonance_contract[
+                            "effective_self_resonance_authority"
+                        ]
+                    ),
+                    "compact_run_authorization_sha256": (
+                        compact_run_authorization["sha256"]
+                    ),
+                }
             ),
             "fresh512_compact_active": task["fresh512_compact_active"],
             "fresh512_search_activation_payload_sha256": (
@@ -1901,6 +2034,33 @@ def _validated_seed_table(
                 "payload_sha256"
             ]
         )
+        or (
+            expected_task.get("fresh512_compact_active") is True
+            and (
+                result.get("resonance_contract_schema")
+                != preflight.GOAL_FIXED_LM_RESONANCE_SCHEMA
+                or result.get("fixed_lm2mh_resonance_contract_sha256")
+                != preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
+                or result.get("effective_self_resonance_authority")
+                != preflight.goal_fixed_lm2mh_resonance_contract()[
+                    "effective_self_resonance_authority"
+                ]
+                or result.get("compact_run_authorization_sha256")
+                != expected_task["compact_run_authorization"]["sha256"]
+            )
+        )
+        or (
+            expected_task.get("fresh512_compact_active") is False
+            and any(
+                result.get(name) is not None
+                for name in (
+                    "resonance_contract_schema",
+                    "fixed_lm2mh_resonance_contract_sha256",
+                    "effective_self_resonance_authority",
+                    "compact_run_authorization_sha256",
+                )
+            )
+        )
     ):
         raise RuntimeError(f"goal seed result contract mismatch: {path}")
     inventory = result.get("artifact_inventory") or {}
@@ -1997,6 +2157,20 @@ def _validated_seed_table(
         != GOAL_TEMPERATURE_CONTRACT_SHA256
         or table_manifest.get("hard_constraint_contract_sha256")
         != result["hard_constraint_contract_sha256"]
+        or table_manifest.get("resonance_contract_schema")
+        != result.get("resonance_contract_schema")
+        or table_manifest.get("fixed_lm2mh_resonance_contract_sha256")
+        != result.get("fixed_lm2mh_resonance_contract_sha256")
+        or table_manifest.get("effective_self_resonance_authority")
+        != result.get("effective_self_resonance_authority")
+        or table_manifest.get(
+            "base_stage_magnetizing_inductance_factor_ignored"
+        )
+        != (
+            True
+            if expected_task.get("fresh512_compact_active")
+            else None
+        )
         or not set(physical_columns + normalized_columns).issubset(
             table.columns
         )

@@ -10,7 +10,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from module import input_parameter_260706 as current_input
 from module import mft_goal_20260726_contract as goal
 from regression_260707.verify import finalize
 from tools import tier1_corrected_generation_adapter as adapter
@@ -221,6 +220,17 @@ def test_prepare_bundle_seals_all_three_relocation_cli_inputs(
         schema=launch.LOCAL_PREFLIGHT_SCHEMA,
     )
     assert sealed["source_relocation"] == relocation
+    task = json.loads(
+        (
+            output
+            / "tasks"
+            / f"seed-{launch.FRESH_AL_SEED_START}-n1-5.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert task["fresh512_compact_active"] is False
+    assert task["fresh512_search_activation"] is None
+    assert task["compact_run_authorization"] is None
+    assert task["hard_constraint_contract_sha256"] == "d" * 64
 
 
 def _synthetic_goal_code_manifest(revision: str = "c" * 40):
@@ -429,6 +439,544 @@ def test_fixed_lm2mh_wrapper_changes_only_resonance_G_before_scaling():
         problem._goal_fixed_lm2mh_resonance_contract["surrogate_k_used"]
         is False
     )
+    assert installation["resonance_contract_schema"] == (
+        preflight.GOAL_FIXED_LM_RESONANCE_SCHEMA
+    )
+    assert installation[
+        "base_stage_magnetizing_inductance_factor_ignored"
+    ] is True
+    assert problem.hard_constraint_contract[
+        "effective_self_resonance_authority"
+    ] == "fixed_primary_Lm_2mH_plus_physical_leakage"
+
+
+def _compact_authenticated(*, quality_passed: bool):
+    artifacts = {"target/models.pkl": "a" * 64}
+    return types.SimpleNamespace(
+        quality={"passed": quality_passed},
+        report={"artifacts": artifacts},
+        evidence={
+            "dataset": {"sha256": "b" * 64},
+            "quality_status": {"sha256": "c" * 64},
+        },
+    )
+
+
+def _compact_authorization(
+    problem,
+    *,
+    mode,
+    seed,
+    contract,
+    bank,
+    authenticated,
+):
+    diagnostic = mode == preflight.GOAL_COMPACT_AUTH_DIAGNOSTIC
+    dataset_authentication = (
+        {}
+        if diagnostic
+        else {
+            "thermal_mesh_policy": preflight.GOAL_B7_THERMAL_MESH_POLICY,
+            "thermal_mesh_plan_contract_version": (
+                preflight.GOAL_B7_THERMAL_MESH_PLAN
+            ),
+            "every_authenticated_row_exact_B7_v8": True,
+            "dataset_sha256": authenticated.evidence[
+                "dataset"
+            ]["sha256"],
+            "authenticated_row_count": 8,
+            "unique_source_tasks": 4,
+        }
+    )
+    activation_value = (
+        {
+            "schema_version": diagnostic_scout.ACTIVATION_SCHEMA,
+            "campaign_id": diagnostic_scout.CAMPAIGN_ID,
+            "fixed_primary_turns": 6,
+            "source_identity": {
+                "dataset_sha256": authenticated.evidence[
+                    "dataset"
+                ]["sha256"],
+                "evaluation_model_sha256": goal.canonical_sha256(
+                    authenticated.report["artifacts"]
+                ),
+                "quality_status_sha256": authenticated.evidence[
+                    "quality_status"
+                ]["sha256"],
+            },
+            "source_quality_passed": authenticated.quality["passed"],
+            "screening_only": True,
+            "production_eligible": False,
+            "final_design_claim_allowed": False,
+            "fresh512_activation_evidence": False,
+            "reserved_fresh512_seed_interval_used": False,
+            "effective_hard_constraint_contract_sha256": (
+                problem.hard_constraint_contract_sha256
+            ),
+            "fixed_lm2mh_resonance_contract_sha256": (
+                preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
+            ),
+            "compact_search_contract_sha256": contract["sha256"],
+            "compact_coordinate_bank_sha256": bank["sha256"],
+            "scheduler_write_performed": False,
+            "scheduler_submission_performed": False,
+        }
+        if diagnostic
+        else {
+            "schema_version": launch.FRESH512_ACTIVATION_SCHEMA,
+            "dataset_sha256": authenticated.evidence[
+                "dataset"
+            ]["sha256"],
+            "evaluation_model_sha256": goal.canonical_sha256(
+                authenticated.report["artifacts"]
+            ),
+            "quality_status_sha256": authenticated.evidence[
+                "quality_status"
+            ]["sha256"],
+            "quality_passed": True,
+            "search_only_proposal": False,
+            "seed_start": launch.FRESH_AL_SEED_START,
+            "seed_end_inclusive": launch.FRESH_AL_SEED_END,
+            "seed_count": launch.FRESH_AL_SEED_COUNT,
+            "seeds_per_N1_stratum": 128,
+            "effective_hard_constraint_contract_sha256": (
+                problem.hard_constraint_contract_sha256
+            ),
+            "fixed_lm2mh_resonance_contract_sha256": (
+                preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
+            ),
+            "dataset_authentication": dataset_authentication,
+            "compact_by_N1": {
+                str(turns): {
+                    "contract_sha256": contract["sha256"],
+                    "coordinate_bank_sha256": bank["sha256"],
+                }
+                for turns in goal.GOAL_PRIMARY_TURN_STRATA
+            },
+            "global_exact_A_B_C_and_independent_H_coverage": True,
+            "invalid_or_near_band_fallback_allowed": False,
+            "symmetric_FEA_validation_still_required": True,
+            "scheduler_write_performed": False,
+            "scheduler_submission_performed": False,
+        }
+    )
+    activation = launch._seal(activation_value)
+    authorization = preflight.seal_goal_compact_run_authorization(
+        authorization_mode=mode,
+        source_activation_schema=(
+            diagnostic_scout.ACTIVATION_SCHEMA
+            if diagnostic
+            else launch.FRESH512_ACTIVATION_SCHEMA
+        ),
+        source_activation_payload_sha256=activation["payload_sha256"],
+        seed=seed,
+        fixed_primary_turns=problem.fixed_primary_turns,
+        dataset_sha256=authenticated.evidence["dataset"]["sha256"],
+        evaluation_model_sha256=goal.canonical_sha256(
+            authenticated.report["artifacts"]
+        ),
+        quality_status_sha256=authenticated.evidence[
+            "quality_status"
+        ]["sha256"],
+        source_quality_passed=authenticated.quality["passed"],
+        effective_hard_constraint_contract_sha256=(
+            problem.hard_constraint_contract_sha256
+        ),
+        compact_search_contract_sha256=contract["sha256"],
+        compact_coordinate_bank_sha256=bank["sha256"],
+        dataset_authentication_sha256=(
+            None
+            if diagnostic
+            else goal.canonical_sha256(dataset_authentication)
+        ),
+    )
+    return authorization, activation
+
+
+def test_direct_runner_compact_call_without_per_seed_authority_fails_closed():
+    problem = _goal_problem(6)
+    preflight.install_goal_fixed_lm2mh_resonance(problem)
+    runner = types.SimpleNamespace(problem=problem)
+    with pytest.raises(
+        RuntimeError,
+        match="authenticated per-seed authority",
+    ):
+        preflight.Current7Tier1Runner.run_one(
+            runner,
+            seed=launch.FRESH_AL_SEED_START,
+            population=4,
+            max_generations=1,
+            compact_search_contract=(
+                preflight.goal_compact_search_contract(6)
+            ),
+            compact_coordinate_bank={},
+        )
+
+
+def test_compact_authority_binds_fresh512_seed_dataset_model_and_quality():
+    problem = _goal_problem(6)
+    preflight.install_goal_fixed_lm2mh_resonance(problem)
+    contract = preflight.goal_compact_search_contract(6)
+    bank = {"sha256": "f" * 64}
+    authenticated = _compact_authenticated(quality_passed=True)
+    seed = launch.FRESH_AL_SEED_START
+    authorization, activation = _compact_authorization(
+        problem,
+        mode=preflight.GOAL_COMPACT_AUTH_FRESH512,
+        seed=seed,
+        contract=contract,
+        bank=bank,
+        authenticated=authenticated,
+    )
+    observed = preflight.validate_goal_compact_run_authorization(
+        authorization,
+        source_activation=activation,
+        problem=problem,
+        seed=seed,
+        authenticated=authenticated,
+        compact_contract=contract,
+        compact_bank=bank,
+    )
+    assert observed["every_authenticated_row_exact_B7_v8"] is True
+    assert observed["screening_only"] is False
+    assert observed["production_eligible"] is False
+
+    wrong_dataset = _compact_authenticated(quality_passed=True)
+    wrong_dataset.evidence["dataset"]["sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="runtime binding"):
+        preflight.validate_goal_compact_run_authorization(
+            authorization,
+            source_activation=activation,
+            problem=problem,
+            seed=seed,
+            authenticated=wrong_dataset,
+            compact_contract=contract,
+            compact_bank=bank,
+        )
+    tampered = copy.deepcopy(authorization)
+    tampered["seed"] += 1
+    with pytest.raises(RuntimeError, match="seal mismatch"):
+        preflight.validate_goal_compact_run_authorization_seal(tampered)
+    tampered_activation = copy.deepcopy(activation)
+    tampered_activation["dataset_sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="source activation seal"):
+        preflight.validate_goal_compact_run_authorization(
+            authorization,
+            source_activation=tampered_activation,
+            problem=problem,
+            seed=seed,
+            authenticated=authenticated,
+            compact_contract=contract,
+            compact_bank=bank,
+        )
+
+
+def test_signed_diagnostic_compact_authority_is_nonreserved_screening_only():
+    problem = _goal_problem(6)
+    preflight.install_goal_fixed_lm2mh_resonance(problem)
+    contract = preflight.goal_compact_search_contract(6)
+    assert "fresh512_only" not in contract
+    assert contract["authorized_execution_roles"] == [
+        preflight.GOAL_COMPACT_AUTH_FRESH512,
+        preflight.GOAL_COMPACT_AUTH_DIAGNOSTIC,
+    ]
+    assert contract["coverage_requirement_by_authorization_role"][
+        preflight.GOAL_COMPACT_AUTH_DIAGNOSTIC
+    ] == "exact_active_strata_for_N1_6_screening_only"
+    bank = {"sha256": "f" * 64}
+    authenticated = _compact_authenticated(quality_passed=False)
+    seed = diagnostic_scout.DEFAULT_SEED_START
+    authorization, activation = _compact_authorization(
+        problem,
+        mode=preflight.GOAL_COMPACT_AUTH_DIAGNOSTIC,
+        seed=seed,
+        contract=contract,
+        bank=bank,
+        authenticated=authenticated,
+    )
+    observed = preflight.validate_goal_compact_run_authorization(
+        authorization,
+        source_activation=activation,
+        problem=problem,
+        seed=seed,
+        authenticated=authenticated,
+        compact_contract=contract,
+        compact_bank=bank,
+    )
+    assert observed["screening_only"] is True
+    assert observed["production_eligible"] is False
+    assert observed["final_design_claim_allowed"] is False
+    assert observed["fresh512_activation_evidence"] is False
+    assert observed["reserved_fresh512_seed"] is False
+
+
+def test_n1_5_compact_initialization_does_not_claim_missing_C_bridge():
+    contract = preflight.goal_compact_search_contract(5)
+    claims = preflight.goal_compact_initialization_claims(
+        contract,
+        {
+            "membership_counts": {
+                "compact_A": 2,
+                "compact_B": 2,
+                "compact_C": 0,
+                "height_boundary": 4,
+            }
+        },
+    )
+    assert claims["active_strata_for_this_N1"] == [
+        "compact_A",
+        "compact_B",
+        "height_boundary",
+    ]
+    assert claims["exact_A_B_C_bridge_inserted"] is False
+    assert claims["global_fresh512_compact_C_coverage_deferred"] is True
+
+
+def test_local_preflight_preserves_base_hard_contract_without_fixed_lm(
+    monkeypatch,
+    tmp_path,
+):
+    created = {}
+    artifacts = {"target/models.pkl": "a" * 64}
+
+    def make_runner(turns):
+        problem = _goal_problem(turns)
+        created[turns] = problem
+        authenticated = types.SimpleNamespace(
+            quality={"passed": True},
+            report={"artifacts": artifacts},
+            evidence={
+                "generation_relative": "generations/g1",
+                "train_report": {"sha256": "1" * 64},
+                "candidate": {"sha256": "2" * 64},
+                "quality_status": {"sha256": "3" * 64},
+                "dataset": {"sha256": "4" * 64},
+                "profile": {"canonical_sha256": "5" * 64},
+                "relocation": {"enabled": False},
+            },
+        )
+        runner = types.SimpleNamespace(
+            problem=problem,
+            authenticated=authenticated,
+            code_identity={"revision": "6" * 40},
+            models=_models(),
+        )
+
+        def repair_coordinates(values, *, stage):
+            repaired = problem.repair_unit_coordinates(values)
+            return repaired, {
+                "stage": stage,
+                "sha256": goal.canonical_sha256(repaired.tolist()),
+            }
+
+        def evaluate_coordinates(values):
+            out = {}
+            problem._evaluate(values, out)
+            return out
+
+        runner.repair_coordinates = repair_coordinates
+        runner.evaluate_coordinates = evaluate_coordinates
+        return runner
+
+    first = make_runner(5)
+    monkeypatch.setattr(
+        preflight,
+        "build_authenticated_runner",
+        lambda **_kwargs: first,
+    )
+    monkeypatch.setattr(
+        preflight,
+        "runner_for_fixed_primary_turns",
+        lambda _runner, turns: make_runner(turns),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_quality_contract",
+        lambda **_kwargs: {
+            "quality_passed": True,
+            "search_only_proposal": False,
+        },
+    )
+
+    def forbidden_install(_problem):
+        raise AssertionError("local preflight must preserve base resonance")
+
+    monkeypatch.setattr(
+        preflight,
+        "install_goal_fixed_lm2mh_resonance",
+        forbidden_install,
+    )
+    local, observed_first = launch.run_local_preflight(
+        generation=tmp_path / "generation",
+        candidate=tmp_path / "candidate.json",
+        quality_status=tmp_path / "quality.json",
+        code_root=tmp_path,
+        expected_code_revision="6" * 40,
+    )
+    assert observed_first is first
+    assert local["fixed_lm2mh_resonance_installed"] is False
+    assert local["hard_constraint_contract_sha256"] == (
+        first.problem.hard_constraint_contract_sha256
+    )
+    assert local["base_hard_constraint_contract_sha256"] == (
+        local["hard_constraint_contract_sha256"]
+    )
+    assert all(
+        item["fixed_lm2mh_resonance_installed"] is False
+        for item in local["strata"].values()
+    )
+    assert all(
+        not getattr(
+            problem,
+            "_goal_fixed_lm2mh_resonance_installed",
+            False,
+        )
+        for problem in created.values()
+    )
+
+
+def test_nonreserved_execute_seed_does_not_install_fixed_lm(
+    monkeypatch,
+    tmp_path,
+):
+    artifacts = {"target/models.pkl": "a" * 64}
+    model_sha = goal.canonical_sha256(artifacts)
+    local = launch._seal(
+        {
+            "schema_version": launch.LOCAL_PREFLIGHT_SCHEMA,
+            "hard_constraint_contract_sha256": "d" * 64,
+            "dataset_sha256": "4" * 64,
+            "profile_sha256": "5" * 64,
+            "evaluation_model_sha256": model_sha,
+            "train_report_sha256": "1" * 64,
+            "candidate_sha256": "2" * 64,
+            "quality_status_sha256": "3" * 64,
+            "code": {"revision": "6" * 40},
+            "search_only_proposal": False,
+        }
+    )
+    source = {
+        "generation": "generation",
+        "candidate": "candidate",
+        "quality_status": "quality",
+        "code_root": "code",
+        "dataset": "dataset",
+        "profile": "profile",
+        "expected_code_revision": "6" * 40,
+    }
+    _bundle, tasks, _scheduler = launch.build_bundle_values(
+        local_preflight=local,
+        assignments=[
+            {
+                "seed": diagnostic_scout.DEFAULT_SEED_START,
+                "ordinal": 0,
+                "phase": "single",
+                "wave": 0,
+                "fixed_primary_turns": 6,
+            }
+        ],
+        output_root=tmp_path,
+        source=source,
+        code_manifest=_synthetic_goal_code_manifest("6" * 40),
+    )
+    task = tasks[0]
+    payload = tmp_path / "task.json"
+    launch._atomic_json(payload, task)
+    problem = types.SimpleNamespace(
+        hard_constraint_contract_sha256="d" * 64,
+        hard_constraint_contract={"stage": "base-legacy"},
+        constraint_names=preflight.GOAL_CONSTRAINT_NAMES,
+        temperature_targets=goal.GOAL_TEMPERATURE_TARGETS,
+    )
+    authenticated = types.SimpleNamespace(
+        quality={"passed": True},
+        report={"artifacts": artifacts},
+        evidence={
+            "train_report": {"sha256": "1" * 64},
+            "candidate": {"sha256": "2" * 64},
+            "quality_status": {"sha256": "3" * 64},
+            "dataset": {"sha256": "4" * 64},
+            "profile": {"canonical_sha256": "5" * 64},
+        },
+    )
+    observed = {}
+    runner = types.SimpleNamespace(
+        problem=problem,
+        authenticated=authenticated,
+        code_identity={"revision": "6" * 40},
+    )
+    runner.install_offspring_repair_operator = (
+        lambda **_kwargs: {"installed": True}
+    )
+
+    def run_one(**kwargs):
+        observed.update(kwargs)
+        kwargs["pre_optimization_callback"](
+            {
+                "offspring_repair_operator_installed": True,
+                "optimizer_execution_started": False,
+            }
+        )
+        return types.SimpleNamespace(
+            tier1_evaluated_generations=launch.GENERATIONS,
+            tier1_completed_generations=(
+                launch.EXPECTED_ALGORITHM_N_GEN_COUNTER
+            ),
+            tier1_repair_audit={},
+            tier1_topology_evolution_audit={},
+        )
+
+    runner.run_one = run_one
+    monkeypatch.setattr(
+        preflight,
+        "build_authenticated_runner",
+        lambda **_kwargs: runner,
+    )
+
+    def forbidden_install(_problem):
+        raise AssertionError("nonreserved execute must preserve base resonance")
+
+    monkeypatch.setattr(
+        preflight,
+        "install_goal_fixed_lm2mh_resonance",
+        forbidden_install,
+    )
+    monkeypatch.setattr(
+        preflight,
+        "install_optimizer_scaling",
+        lambda _problem, **_kwargs: (
+            lambda *_args, **_inner_kwargs: None,
+            {"schema_version": "test-scaling"},
+        ),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "persist_search_outputs",
+        lambda *_args, **_kwargs: {
+            "terminal_population_count": launch.POPULATION,
+            "physical_feasible_count": 0,
+            "feasible_pareto_count": 0,
+            "artifact_inventory": {},
+            "artifact_inventory_sha256": goal.canonical_sha256({}),
+            "terminal_physical_candidates_manifest": {},
+        },
+    )
+    output = tmp_path / "result"
+    path = launch.execute_seed(
+        types.SimpleNamespace(
+            payload=payload,
+            output=output,
+            relocation=None,
+        )
+    )
+    result = launch._read_json(path)
+    assert observed["compact_search_contract"] is None
+    assert observed["compact_coordinate_bank"] is None
+    assert observed["compact_run_authorization"] is None
+    assert observed["compact_source_activation"] is None
+    assert result.get("fixed_lm2mh_resonance_installation") is None
+    assert result.get("resonance_contract_schema") is None
+    assert problem.hard_constraint_contract_sha256 == "d" * 64
 
 
 def test_n1_6_compact_bank_bridges_exact_A_B_C_and_independent_H():
@@ -885,6 +1433,7 @@ def test_reserved_fresh512_dry_run_manifest_seals_compact_activation_without_pos
             "fixed_lm2mh_resonance_contract_sha256": (
                 preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
             ),
+            "fixed_lm2mh_resonance_installed": False,
             "dataset_sha256": "a" * 64,
             "profile_sha256": "2" * 64,
             "evaluation_model_sha256": "b" * 64,
@@ -948,9 +1497,31 @@ def test_reserved_fresh512_dry_run_manifest_seals_compact_activation_without_pos
             "fixed_lm2mh_resonance_contract_sha256": (
                 preflight.goal_fixed_lm2mh_resonance_contract()["sha256"]
             ),
+            "base_hard_constraint_contract_sha256": local[
+                "hard_constraint_contract_sha256"
+            ],
             "effective_hard_constraint_contract_sha256": local[
                 "hard_constraint_contract_sha256"
             ],
+            "fixed_lm2mh_installation_by_N1": {
+                str(turns): {
+                    "base_hard_constraint_contract_sha256": local[
+                        "hard_constraint_contract_sha256"
+                    ],
+                    "effective_hard_constraint_contract_sha256": local[
+                        "hard_constraint_contract_sha256"
+                    ],
+                    "resonance_contract_schema": (
+                        preflight.GOAL_FIXED_LM_RESONANCE_SCHEMA
+                    ),
+                    "resonance_contract_sha256": (
+                        preflight.goal_fixed_lm2mh_resonance_contract()[
+                            "sha256"
+                        ]
+                    ),
+                }
+                for turns in goal.GOAL_PRIMARY_TURN_STRATA
+            },
             "compact_by_N1": compact,
             "global_compact_membership_counts": global_counts,
             "global_exact_A_B_C_and_independent_H_coverage": True,
@@ -1095,6 +1666,32 @@ def test_diagnostic_n1_6_compact_contract_is_separate_screening_only():
             "code_manifest_payload_sha256": "9" * 64,
             "code_inventory_sha256": "a" * 64,
             "activation": activation,
+            "compact_run_authorization": (
+                preflight.seal_goal_compact_run_authorization(
+                    authorization_mode=(
+                        preflight.GOAL_COMPACT_AUTH_DIAGNOSTIC
+                    ),
+                    source_activation_schema=(
+                        diagnostic_scout.ACTIVATION_SCHEMA
+                    ),
+                    source_activation_payload_sha256=activation[
+                        "payload_sha256"
+                    ],
+                    seed=diagnostic_scout.DEFAULT_SEED_START,
+                    fixed_primary_turns=6,
+                    dataset_sha256=source_identity["dataset_sha256"],
+                    evaluation_model_sha256=source_identity[
+                        "evaluation_model_sha256"
+                    ],
+                    quality_status_sha256=source_identity[
+                        "quality_status_sha256"
+                    ],
+                    source_quality_passed=False,
+                    effective_hard_constraint_contract_sha256="8" * 64,
+                    compact_search_contract_sha256=contract["sha256"],
+                    compact_coordinate_bank_sha256=bank["sha256"],
+                )
+            ),
             "screening_only": True,
             "production_eligible": False,
             "final_design_claim_allowed": False,
@@ -1306,7 +1903,7 @@ def test_terminal_320_table_contains_physical_dedupe_and_provenance():
     assert table["surrogate_physicality_passed"].sum() == 319
     assert table["physical_constraint_feasible"].all()
     assert table["physical_feasible"].sum() == 319
-    assert table.loc[7, "physical_feasible"] == False
+    assert not bool(table.loc[7, "physical_feasible"])
     assert table["evaluation_model_artifacts_sha256"].unique().tolist() == [
         "a" * 64
     ]
