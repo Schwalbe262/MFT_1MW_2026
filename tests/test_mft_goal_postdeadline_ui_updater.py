@@ -2004,11 +2004,22 @@ def test_compact_design_status_card_is_truthful_and_fail_closed() -> None:
     assert card["progress_pct"] == 45
     assert len(card["evidence"]) <= 12
     assert "FIXED-LM PATH TEST71 PASS" in card["title"]
-    assert "EXACT A/B/C/H READY" in card["title"]
-    assert "FRESH512 GATE CLOSED" in card["title"]
+    assert "AUDIT FIX2 PENDING" in card["title"]
+    assert "FRESH512/SCOUT POST0" in card["title"]
     assert "not proof that a compact design is impossible" in card["detail"]
+    assert "authenticated compact activation token" in card["detail"]
+    assert "fixed-Lm wrapper must not alter legacy/nonreserved runs" in card[
+        "detail"
+    ]
     assert any(
         "commit bc63ec5" in item and "tests 71 passed" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "code audit blockers=2" in item
+        and "Runner activation binding missing" in item
+        and "scope leak" in item
+        and "Scheduler POST0" in item
         for item in card["evidence"]
     )
     assert any(
@@ -2036,7 +2047,7 @@ def test_compact_design_status_card_is_truthful_and_fail_closed() -> None:
     assert any(
         "strict B7/v8 dataset" in item
         and "current real activation closed" in item
-        and "Scheduler POST0" in item
+        and "scout also blocked" in item
         for item in card["evidence"]
     )
     assert any(

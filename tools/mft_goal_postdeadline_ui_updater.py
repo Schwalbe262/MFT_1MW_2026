@@ -855,6 +855,7 @@ NEW_AXIS_COMPACT_SURROGATE_MIN_WINDING_C = 302.67
 COMPACT_DESIGN_CONTRACT_COMMIT = "ccdaa7d"
 COMPACT_SEARCH_READINESS_COMMIT = "bc63ec5"
 COMPACT_SEARCH_RELATED_TEST_COUNT = 71
+COMPACT_SEARCH_AUDIT_FIX_COUNT = 2
 COMPACT_OLD_GENERATION_SLICE_COUNT = 1_454
 COMPACT_OLD_GENERATION_HARD_FEASIBLE_COUNT = 0
 COMPACT_FOCUS_W_MAX_MM = 1_170.0
@@ -6327,11 +6328,16 @@ def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
         "id": COMPACT_DESIGN_STATUS_CARD_ID,
         "title": (
             "CODEX | COMPACT SEARCH | FIXED-LM PATH TEST71 PASS | "
-            "EXACT A/B/C/H READY | FRESH512 GATE CLOSED"
+            "AUDIT FIX2 PENDING | FRESH512/SCOUT POST0"
         ),
         "detail": (
             "The fixed-primary-Lm=2mH resonance path and exact compact "
             "initialization/mutation are implemented and independently tested. "
+            "An independent audit then found two execution-scope defects: the "
+            "internal Runner needs an authenticated compact activation token, "
+            "and the fixed-Lm wrapper must not alter legacy/nonreserved runs. "
+            "Both final fresh512 and the diagnostic scout remain submission-"
+            "blocked until those defects and their negative bypass tests pass. "
             "N1=6/7/8 replay exact A/B/C plus the independent height boundary; "
             "N1=5 replays A/B/height while its decoder-unreachable C band remains "
             "assigned to N1=6..8 without a near-band fallback. Final fresh512 "
@@ -6348,6 +6354,12 @@ def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
                 f"compact fixed-Lm readiness commit "
                 f"{COMPACT_SEARCH_READINESS_COMMIT} / related tests "
                 f"{COMPACT_SEARCH_RELATED_TEST_COUNT} passed"
+            ),
+            (
+                f"independent code audit blockers="
+                f"{COMPACT_SEARCH_AUDIT_FIX_COUNT} / direct Runner activation "
+                "binding missing + legacy/nonreserved fixed-Lm scope leak / "
+                "fix pending / Scheduler POST0"
             ),
             (
                 "resonance=Ltx(0.002H+Llt_phys), "
@@ -6370,7 +6382,7 @@ def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
             (
                 "final fresh512 activation requires strict B7/v8 dataset + "
                 "retrained PASS quality generation / current real activation "
-                "closed / Scheduler POST0"
+                "closed / diagnostic scout also blocked pending code-audit fix"
             ),
             (
                 f"compact acquisition contract sealed at commit "
