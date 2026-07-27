@@ -48,7 +48,8 @@ DEFAULT_TARGET_AXIS_COLLECTOR_STATE_FILE = Path(
 )
 DEFAULT_ACTIVE_EXACT100_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\diagnostic_l900_gap2p35_hgap20_exact100_5823d47"
+    r"\diagnostic_compact_offload"
+    r"\mft-goal-diag-compact-50320c178b89180a4383855d"
 )
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -61,6 +62,9 @@ LOG_SCHEMA = "mft-goal-postdeadline-ui-updater-event-v1"
 STATUS_SCHEMA = "mft-codex-work-status-v1"
 ACTIVE_EXACT100_RECEIPT_SCHEMA = (
     "mft-goal-diagnostic-compact-submission-receipt-v1"
+)
+ACTIVE_EXACT100_BUNDLE_ID = (
+    "mft-goal-diag-compact-50320c178b89180a4383855d"
 )
 POSTSUCCESS_STATE_SCHEMA = "mft-goal-postdeadline-standard-postsuccess-state-v1"
 THERMAL_BRIDGE_STATE_SCHEMA = "mft-corrected-thermal-terminal-transport-watch-state-v1"
@@ -8467,7 +8471,7 @@ def _active_exact100_post_state(
                 continue
             matching_schema_seen = True
             unsigned = copy.deepcopy(receipt)
-            observed_sha256 = unsigned.pop("payload_sha256", None)
+            observed_sha256 = unsigned.pop("sha256", None)
             tasks = receipt.get("tasks")
             task_ids = [
                 row.get("task_id")
@@ -8476,6 +8480,7 @@ def _active_exact100_post_state(
             ] if isinstance(tasks, list) else []
             valid = bool(
                 observed_sha256 == canonical_sha256(unsigned)
+                and receipt.get("bundle_id") == ACTIVE_EXACT100_BUNDLE_ID
                 and receipt.get("apply") is True
                 and receipt.get("task_count") == 100
                 and receipt.get("submitted_count") == 100

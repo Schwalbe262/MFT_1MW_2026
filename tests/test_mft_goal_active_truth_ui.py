@@ -8,6 +8,7 @@ from tools import mft_goal_postdeadline_ui_updater as updater
 def _sealed_receipt() -> dict:
     unsigned = {
         "schema_version": updater.ACTIVE_EXACT100_RECEIPT_SCHEMA,
+        "bundle_id": updater.ACTIVE_EXACT100_BUNDLE_ID,
         "apply": True,
         "task_count": 100,
         "tasks": [
@@ -24,7 +25,7 @@ def _sealed_receipt() -> dict:
     }
     return {
         **unsigned,
-        "payload_sha256": updater.canonical_sha256(unsigned),
+        "sha256": updater.canonical_sha256(unsigned),
     }
 
 
