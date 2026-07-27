@@ -105,6 +105,20 @@ def test_physics_network_uses_60_turn_midpoint_schedule_without_raw_c():
     )
 
 
+def test_physics_network_accepts_minimum_one_side_turn_endpoint():
+    geometry = _geometry()
+    geometry["N2_main"] = 59
+    geometry["N2_side"] = 1
+    result = reranker.physics_energy_network(geometry)
+
+    assert result["turn_voltage_schedule"]["turn_count"] == 60
+    assert result["delta_features"]["side_turn_fraction"] == pytest.approx(
+        1.0 / 60.0
+    )
+    assert math.isfinite(result["physics_Ceq_F"])
+    assert result["physics_Ceq_F"] > 0.0
+
+
 def test_smaller_interturn_gap_increases_adjacent_energy_component():
     tight = reranker.physics_energy_network(_geometry(0.5))
     loose = reranker.physics_energy_network(_geometry(2.0))
