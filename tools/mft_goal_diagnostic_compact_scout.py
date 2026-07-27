@@ -12,11 +12,14 @@ from __future__ import annotations
 import argparse
 import copy
 from datetime import datetime, timezone
+import json
 import math
 import os
 from pathlib import Path
 import sys
 from typing import Any, Mapping
+
+import numpy as np
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -1073,6 +1076,277 @@ def _bounded_secondary_length_repair(
     return float(target_length), float(target_gap)
 
 
+def _bounded_secondary_coordinate_audit(
+    problem: Any,
+    coordinates: Any,
+    *,
+    compact_contract: Mapping[str, Any],
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Decode one coordinate batch and report every final hard-band failure."""
+
+    contract = preflight.validate_goal_compact_search_contract(
+        compact_contract,
+        fixed_primary_turns=problem.fixed_primary_turns,
+    )
+    values = np.asarray(coordinates, dtype=float)
+    repaired = np.asarray(problem.repair_unit_coordinates(values), dtype=float)
+    frame, _shrink, decoder_valid = problem.decode_batch(repaired)
+    limits = contract["hard_size_limits_mm"]
+    records: list[dict[str, Any]] = []
+    for index in range(len(repaired)):
+        violations: list[str] = []
+        row = frame.iloc[index]
+        dimensions = (math.inf, math.inf, math.inf)
+        gap2 = math.nan
+        cw2 = math.nan
+        memberships: tuple[str, ...] = ()
+        if not bool(decoder_valid[index]):
+            violations.append("decoder_invalid")
+        else:
+            gap2 = float(row["gap2"])
+            cw2 = float(row["cw2"])
+            _volume, raw_dimensions = problem._goal_bounding_box_lit(row)
+            dimensions = tuple(map(float, raw_dimensions))
+            if gap2 < VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM:
+                violations.append("gap2_below_minimum")
+            if gap2 > VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM:
+                violations.append("gap2_above_maximum")
+            if cw2 < SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM:
+                violations.append("cw2_below_minimum")
+            if cw2 > SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM:
+                violations.append("cw2_above_maximum")
+            for axis, observed in zip(("W", "L", "H"), dimensions):
+                if observed > float(limits[axis]) + 1e-9:
+                    violations.append(f"{axis}_above_hard_limit")
+            memberships = preflight._compact_stratum_memberships(
+                *dimensions,
+                strata=contract["strata"],
+            )
+        records.append(
+            {
+                "row": index,
+                "decoder_valid": bool(decoder_valid[index]),
+                "gap2_mm": gap2,
+                "cw2_mm": cw2,
+                "W_mm": dimensions[0],
+                "L_mm": dimensions[1],
+                "H_mm": dimensions[2],
+                "memberships": list(memberships),
+                "violations": violations,
+                "passed": not violations,
+            }
+        )
+    return repaired, records
+
+
+def _finalize_bounded_secondary_coordinates(
+    problem: Any,
+    coordinates: Any,
+    *,
+    source_bank: Mapping[str, Any],
+    compact_contract: Mapping[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Repair, filter and deterministically replace all final hard-band rows."""
+
+    contract = preflight.validate_goal_compact_search_contract(
+        compact_contract,
+        fixed_primary_turns=problem.fixed_primary_turns,
+    )
+    values, initial = _bounded_secondary_coordinate_audit(
+        problem,
+        coordinates,
+        compact_contract=contract,
+    )
+    names = {
+        name: index
+        for index, name in enumerate(problem.sobol_dimension_names)
+    }
+    limits = contract["hard_size_limits_mm"]
+    repair_records: list[dict[str, Any]] = []
+    for index, record in enumerate(initial):
+        if record["passed"]:
+            continue
+        coordinate = values[index].copy()
+        before = copy.deepcopy(record)
+        for attempt in range(8):
+            single, audit = _bounded_secondary_coordinate_audit(
+                problem,
+                coordinate.reshape(1, -1),
+                compact_contract=contract,
+            )
+            coordinate = single[0]
+            item = audit[0]
+            if item["passed"]:
+                break
+            frame, _shrink, decoder_valid = problem.decode_batch(
+                coordinate.reshape(1, -1)
+            )
+            if not bool(decoder_valid[0]):
+                break
+            row = frame.iloc[0]
+            changed = False
+            if (
+                item["cw2_mm"]
+                > SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+                or item["gap2_mm"]
+                > VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+            ):
+                n2 = int(row["N2_main"]) + int(row["N2_side"])
+                gap_count = max(int(row["N2_main"]) - 1, 0) + max(
+                    int(row["N2_side"]) - 1, 0
+                )
+                total_length, target_gap = _bounded_secondary_length_repair(
+                    total_length_mm=(
+                        4.0 * float(row["l1"]) + 2.0 * float(row["l2"])
+                    ),
+                    n2=n2,
+                    gap_count=gap_count,
+                    cw2_mm=float(row["cw2"]),
+                    gap2_mm=float(row["gap2"]),
+                )
+                coordinate[names["total_length"]] = (
+                    problem._unit_from_physical(
+                        "total_length", total_length
+                    )
+                )
+                coordinate[names["gap2"]] = problem._unit_from_physical(
+                    "gap2",
+                    target_gap,
+                )
+                changed = True
+            for axis, physical_name, observed in (
+                ("W", "total_length", item["W_mm"]),
+                ("L", "w1", item["L_mm"]),
+                ("H", "total_height", item["H_mm"]),
+            ):
+                excess = float(observed) - float(limits[axis])
+                if excess > 1e-9:
+                    if physical_name == "total_length":
+                        current = (
+                            4.0 * float(row["l1"])
+                            + 2.0 * float(row["l2"])
+                        )
+                    elif physical_name == "total_height":
+                        current = (
+                            float(row["h1"]) + 2.0 * float(row["l1"])
+                        )
+                    else:
+                        current = float(row[physical_name])
+                    coordinate[names[physical_name]] = (
+                        problem._unit_from_physical(
+                            physical_name,
+                            current - math.ceil(excess) - 1.0,
+                        )
+                    )
+                    changed = True
+            if not changed:
+                break
+        values[index] = coordinate
+        _single, after_audit = _bounded_secondary_coordinate_audit(
+            problem,
+            coordinate.reshape(1, -1),
+            compact_contract=contract,
+        )
+        repair_records.append(
+            {
+                "row": index,
+                "before": before,
+                "after": after_audit[0],
+            }
+        )
+
+    values, repaired_audit = _bounded_secondary_coordinate_audit(
+        problem,
+        values,
+        compact_contract=contract,
+    )
+    good = [
+        index for index, record in enumerate(repaired_audit)
+        if record["passed"]
+    ]
+    replacements: list[dict[str, Any]] = []
+    source_rows = list(source_bank.get("rows") or [])
+    for index, record in enumerate(repaired_audit):
+        if record["passed"]:
+            continue
+        desired = set(
+            (source_rows[index] if index < len(source_rows) else {}).get(
+                "memberships", []
+            )
+        )
+        donors = [
+            donor
+            for donor in good
+            if desired.issubset(
+                set(repaired_audit[donor]["memberships"])
+            )
+        ]
+        if not donors:
+            raise RuntimeError(
+                "bounded secondary final filter has no exact-stratum donor: "
+                + json.dumps(record, sort_keys=True, allow_nan=False)
+            )
+        donor = donors[index % len(donors)]
+        replacement = values[donor].copy()
+        # Preserve the failed row's topology when that repaired clone remains
+        # within every final band; otherwise retain the already-good donor.
+        topology_clone = replacement.copy()
+        topology_clone[2] = np.asarray(coordinates, dtype=float)[index, 2]
+        clone_values, clone_audit = _bounded_secondary_coordinate_audit(
+            problem,
+            topology_clone.reshape(1, -1),
+            compact_contract=contract,
+        )
+        if (
+            clone_audit[0]["passed"]
+            and desired.issubset(set(clone_audit[0]["memberships"]))
+        ):
+            replacement = clone_values[0]
+            topology_preserved = True
+        else:
+            topology_preserved = False
+        values[index] = replacement
+        replacements.append(
+            {
+                "row": index,
+                "source_donor_row": donor,
+                "desired_memberships": sorted(desired),
+                "topology_preserved": topology_preserved,
+                "failed_row_diagnostics": copy.deepcopy(record),
+            }
+        )
+
+    values, final_audit = _bounded_secondary_coordinate_audit(
+        problem,
+        values,
+        compact_contract=contract,
+    )
+    failed = [record for record in final_audit if not record["passed"]]
+    if failed:
+        raise RuntimeError(
+            "bounded secondary final projection failed: "
+            + json.dumps(failed, sort_keys=True, allow_nan=False)
+        )
+    evidence = {
+        "schema_version": "mft-bounded-secondary-final-projection-v1",
+        "input_row_count": len(initial),
+        "initial_failed_rows": [
+            record for record in initial if not record["passed"]
+        ],
+        "repair_records": repair_records,
+        "replacement_records": replacements,
+        "final_row_count": len(final_audit),
+        "final_failed_row_count": 0,
+        "all_rows_decoder_valid": True,
+        "all_rows_size_within_hard_limits": True,
+        "all_rows_gap2_within_hard_band": True,
+        "all_rows_cw2_within_hard_band": True,
+        "final_rows": final_audit,
+    }
+    evidence["sha256"] = canonical_sha256(evidence)
+    return values, evidence
+
+
 def _project_bounded_secondary_bank(
     problem: Any,
     bank: Mapping[str, Any],
@@ -1175,9 +1449,15 @@ def _project_bounded_secondary_bank(
                 f"bounded secondary bank projection did not converge: {index}"
             )
         projected.append(coordinate)
-    repaired, records = preflight._goal_compact_coordinate_replay(
+    finalized, final_projection = _finalize_bounded_secondary_coordinates(
         problem,
         np.asarray(projected, dtype=float),
+        source_bank=bank,
+        compact_contract=contract,
+    )
+    repaired, records = preflight._goal_compact_coordinate_replay(
+        problem,
+        finalized,
         strata=contract["strata"],
         hard_size_limits_mm=contract["hard_size_limits_mm"],
     )
@@ -1195,6 +1475,7 @@ def _project_bounded_secondary_bank(
         )
         for topology in contract["turn_split_topologies_N2_main"]
     }
+    result["bounded_secondary_final_projection"] = final_projection
     result.pop("sha256", None)
     result["sha256"] = canonical_sha256(result)
     preflight.validate_goal_compact_coordinate_bank(

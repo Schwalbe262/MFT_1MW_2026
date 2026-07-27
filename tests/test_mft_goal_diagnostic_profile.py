@@ -180,6 +180,68 @@ def test_bounded_secondary_length_repair_closes_small_gap_ceiling_residual() -> 
     assert realized_cw2 <= 1.0
 
 
+def test_bounded_secondary_batch_audit_reports_every_hard_failure() -> None:
+    class Problem:
+        fixed_primary_turns = 6
+        sobol_dimension_names = (
+            "total_length",
+            "w1",
+            "u_N2_side",
+            "gap2",
+            "total_height",
+        )
+
+        @staticmethod
+        def repair_unit_coordinates(values: object) -> np.ndarray:
+            return np.asarray(values, dtype=float)
+
+        @staticmethod
+        def decode_batch(values: object) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+            coordinates = np.asarray(values, dtype=float)
+            frame = pd.DataFrame(
+                {
+                    "total_length": coordinates[:, 0],
+                    "w1": coordinates[:, 1],
+                    "total_height": coordinates[:, 4],
+                    "gap2": coordinates[:, 3],
+                    "cw2": [0.8, 1.05],
+                }
+            )
+            return (
+                frame,
+                np.zeros(len(frame), dtype=float),
+                np.ones(len(frame), dtype=bool),
+            )
+
+        @staticmethod
+        def _goal_bounding_box_lit(row: object) -> tuple[float, tuple[float, float, float]]:
+            return 0.0, (
+                float(row["total_length"]),
+                float(row["w1"]),
+                float(row["total_height"]),
+            )
+
+    effective = scout._effective_constraint_profile()
+    contract = scout.preflight.goal_diagnostic_l900_compact_search_contract(
+        6,
+        effective_constraint_profile_sha256=effective["payload_sha256"],
+    )
+    _coordinates, records = scout._bounded_secondary_coordinate_audit(
+        Problem(),
+        np.asarray(
+            [
+                [1201.0, 850.0, 0.5, 0.35, 740.0],
+                [1100.0, 850.0, 0.5, 0.35, 740.0],
+            ]
+        ),
+        compact_contract=contract,
+    )
+
+    assert records[0]["violations"] == ["W_above_hard_limit"]
+    assert records[1]["violations"] == ["cw2_above_maximum"]
+    assert not any(record["passed"] for record in records)
+
+
 def test_search_profile_accepts_only_aligned_hgap20_continuations() -> None:
     profile = _profile(20)
     unsigned = {
