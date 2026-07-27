@@ -237,6 +237,91 @@ def _authorized_plan_seeds(plan: Mapping[str, Any]) -> tuple[int, ...]:
     return seeds
 
 
+def _physics_delta_execution_contract(
+    search_profile: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the isolated physics-delta transport identity, if present.
+
+    The legacy diagnostic profile remains byte-for-byte compatible.  A
+    corrected profile is recognized only through its sealed, explicit gate
+    and never by interpreting or transferring the old raw-capacitance gate.
+    """
+
+    if not isinstance(search_profile, Mapping):
+        return None
+    gate = search_profile.get("physics_delta_rx_resonance_gate")
+    if gate is None:
+        return None
+    if (
+        not isinstance(gate, Mapping)
+        or gate.get("constraint_name")
+        != "physics_delta_fRx_q90_lcb_minimum"
+        or gate.get("target") != "C_rx_rx_turn_graded_F"
+        or gate.get("secondary_inductance_H") != 0.2
+        or gate.get("primary_magnetizing_inductance_H") != 0.002
+        or gate.get("minimum_frequency_Hz") != 15_000.0
+        or gate.get("frequency_lcb_formula")
+        != "1/(2*pi*sqrt(0.2*C_ucb))"
+        or gate.get("feature_extrapolation_penalty_active") is not True
+        or gate.get("raw_two_net_capacitance_predictor_called") is not False
+        or gate.get("raw_two_net_capacitance_G_present") is not False
+        or gate.get("legacy_half_magnetizing_resonance_G_present")
+        is not False
+        or gate.get("single_transfer_ratio_used") is not False
+        or gate.get("fixed20T_turn_graded_FEA_retraining_required")
+        is not True
+        or gate.get("final_turn_graded_symmetric_FEA_required") is not True
+        or gate.get("approved_dielectric_stack_sensitivity_required")
+        is not True
+        or not isinstance(gate.get("model_file_sha256"), str)
+        or len(gate["model_file_sha256"]) != 64
+        or not isinstance(gate.get("model_payload_sha256"), str)
+        or len(gate["model_payload_sha256"]) != 64
+        or search_profile.get("worker_entrypoint")
+        != (
+            "artifacts/code/tools/"
+            "mft_goal_corrected_physics_nsga_lane.py"
+        )
+    ):
+        raise RuntimeError(
+            "diagnostic corrected physics-delta transport contract mismatch"
+        )
+    return {
+        "capacitance_acquisition_mode": (
+            "turn_voltage_physics_delta_q90_ucb"
+        ),
+        "physics_delta_Crx_q90_ucb_gate_active": True,
+        "physics_delta_fRx_q90_lcb_gate_active": True,
+        "physics_delta_model_file_sha256": gate["model_file_sha256"],
+        "physics_delta_model_payload_sha256": gate[
+            "model_payload_sha256"
+        ],
+        "physics_delta_frequency_lcb_formula": gate[
+            "frequency_lcb_formula"
+        ],
+        "physics_delta_secondary_inductance_H": 0.2,
+        "raw_same_metric_C_rx_rx_F_UCB_gate_active": False,
+        "raw_two_net_C_optimizer_objective_constraint_authority": False,
+        "raw_two_net_C_terminal_eligibility_authority": False,
+        "single_0p759701_transfer_ratio_used": False,
+        "legacy_half_magnetizing_resonance_G_present": False,
+        "feature_extrapolation_penalty_active": True,
+        "fixed20T_turn_graded_FEA_retraining_required": True,
+        "final_turn_graded_symmetric_FEA_required": True,
+        "approved_dielectric_stack_sensitivity_required": True,
+        "secondary_interturn_gap_search_mm": {
+            "minimum": scout.VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM,
+            "maximum": scout.VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM,
+            "step": scout.VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM,
+        },
+        "secondary_conductor_thickness_search_mm": {
+            "minimum": scout.SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM,
+            "maximum": scout.SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM,
+        },
+        "worker_entrypoint": search_profile["worker_entrypoint"],
+    }
+
+
 def _exact_task_inventory(
     task_values: Iterable[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -269,6 +354,9 @@ def _exact_task_inventory(
     contract_sha = activation["compact_search_contract_sha256"]
     bank_sha = activation["compact_coordinate_bank_sha256"]
     search_profile = activation.get("manufacturing_search_profile")
+    physics_delta_execution = _physics_delta_execution_contract(
+        search_profile
+    )
     secondary_gap_mode = (
         scout.SECONDARY_GAP_MODE_FIXED
         if search_profile is None
@@ -340,6 +428,7 @@ def _exact_task_inventory(
         ),
         "secondary_gap_mode": secondary_gap_mode,
         "scheduler_priority": scheduler_priority,
+        "physics_delta_execution_contract": physics_delta_execution,
     }
     return ordered, common
 
@@ -793,40 +882,51 @@ def build_plan(
                         scout.FIXED_WINDING_COLD_PLATE_THICKNESS_MM
                     ),
                     **(
-                        {
-                            "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
-                        }
-                        if common["secondary_gap_mode"]
-                        == scout.SECONDARY_GAP_MODE_FIXED
-                        else {
-                            "raw_same_metric_C_rx_rx_F_UCB_gate_active": False,
-                            "provisional_turn_graded_C_acquisition_gate_active": (
-                                True
-                            ),
-                            "authenticated_turn_graded_transfer_ratio": (
-                                scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
-                            ),
-                            "secondary_interturn_gap_search_mm": {
-                                "minimum": (
-                                    scout.VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
+                        common["physics_delta_execution_contract"]
+                        if common["physics_delta_execution_contract"]
+                        is not None
+                        else (
+                            {
+                                "raw_same_metric_C_rx_rx_F_UCB_gate_active": (
+                                    True
                                 ),
-                                "maximum": (
-                                    scout.VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+                            }
+                            if common["secondary_gap_mode"]
+                            == scout.SECONDARY_GAP_MODE_FIXED
+                            else {
+                                "raw_same_metric_C_rx_rx_F_UCB_gate_active": (
+                                    False
                                 ),
-                                "step": (
-                                    scout.VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM
+                                "provisional_turn_graded_C_acquisition_gate_active": (
+                                    True
                                 ),
-                            },
-                            "secondary_conductor_thickness_search_mm": {
-                                "minimum": (
-                                    scout.SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM
+                                "authenticated_turn_graded_transfer_ratio": (
+                                    scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
                                 ),
-                                "maximum": (
-                                    scout.SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+                                "secondary_interturn_gap_search_mm": {
+                                    "minimum": (
+                                        scout.VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
+                                    ),
+                                    "maximum": (
+                                        scout.VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+                                    ),
+                                    "step": (
+                                        scout.VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM
+                                    ),
+                                },
+                                "secondary_conductor_thickness_search_mm": {
+                                    "minimum": (
+                                        scout.SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM
+                                    ),
+                                    "maximum": (
+                                        scout.SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+                                    ),
+                                },
+                                "final_turn_graded_symmetric_FEA_required": (
+                                    True
                                 ),
-                            },
-                            "final_turn_graded_symmetric_FEA_required": True,
-                        }
+                            }
+                        )
                     ),
                 }
             ),
@@ -878,6 +978,9 @@ def build_plan(
         "scheduler_claim_root": str(plan_dir / "scheduler-claims"),
         "secondary_gap_mode": common["secondary_gap_mode"],
         "scheduler_priority": common["scheduler_priority"],
+        "physics_delta_execution_contract": common[
+            "physics_delta_execution_contract"
+        ],
         "screening_only": True,
         "production_eligible": False,
         "final_design_claim_allowed": False,
@@ -941,43 +1044,48 @@ def _validate_deployment_inventory(
                     scout.FIXED_WINDING_COLD_PLATE_THICKNESS_MM
                 ),
                 **(
-                    {
-                        "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
-                    }
-                    if plan.get(
-                        "secondary_gap_mode",
-                        scout.SECONDARY_GAP_MODE_FIXED,
+                    plan["physics_delta_execution_contract"]
+                    if plan.get("physics_delta_execution_contract")
+                    is not None
+                    else (
+                        {
+                            "raw_same_metric_C_rx_rx_F_UCB_gate_active": True,
+                        }
+                        if plan.get(
+                            "secondary_gap_mode",
+                            scout.SECONDARY_GAP_MODE_FIXED,
+                        )
+                        == scout.SECONDARY_GAP_MODE_FIXED
+                        else {
+                            "raw_same_metric_C_rx_rx_F_UCB_gate_active": False,
+                            "provisional_turn_graded_C_acquisition_gate_active": (
+                                True
+                            ),
+                            "authenticated_turn_graded_transfer_ratio": (
+                                scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
+                            ),
+                            "secondary_interturn_gap_search_mm": {
+                                "minimum": (
+                                    scout.VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
+                                ),
+                                "maximum": (
+                                    scout.VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
+                                ),
+                                "step": (
+                                    scout.VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM
+                                ),
+                            },
+                            "secondary_conductor_thickness_search_mm": {
+                                "minimum": (
+                                    scout.SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM
+                                ),
+                                "maximum": (
+                                    scout.SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
+                                ),
+                            },
+                            "final_turn_graded_symmetric_FEA_required": True,
+                        }
                     )
-                    == scout.SECONDARY_GAP_MODE_FIXED
-                    else {
-                        "raw_same_metric_C_rx_rx_F_UCB_gate_active": False,
-                        "provisional_turn_graded_C_acquisition_gate_active": (
-                            True
-                        ),
-                        "authenticated_turn_graded_transfer_ratio": (
-                            scout.AUTHENTICATED_TURN_GRADED_TRANSFER_RATIO
-                        ),
-                        "secondary_interturn_gap_search_mm": {
-                            "minimum": (
-                                scout.VARIABLE_SECONDARY_INTERTURN_GAP_MINIMUM_MM
-                            ),
-                            "maximum": (
-                                scout.VARIABLE_SECONDARY_INTERTURN_GAP_MAXIMUM_MM
-                            ),
-                            "step": (
-                                scout.VARIABLE_SECONDARY_INTERTURN_GAP_STEP_MM
-                            ),
-                        },
-                        "secondary_conductor_thickness_search_mm": {
-                            "minimum": (
-                                scout.SECONDARY_CONDUCTOR_THICKNESS_MINIMUM_MM
-                            ),
-                            "maximum": (
-                                scout.SECONDARY_CONDUCTOR_THICKNESS_MAXIMUM_MM
-                            ),
-                        },
-                        "final_turn_graded_symmetric_FEA_required": True,
-                    }
                 ),
             }
         )
@@ -1244,6 +1352,8 @@ def authenticate_plan(
         )
         or common.get("scheduler_priority", SCHEDULER_PRIORITY)
         != plan.get("scheduler_priority", SCHEDULER_PRIORITY)
+        or common.get("physics_delta_execution_contract")
+        != plan.get("physics_delta_execution_contract")
     ):
         raise RuntimeError("diagnostic plan/bundle source binding mismatch")
     claim_authority = _load_claim_root(plan=plan, tasks=tasks)

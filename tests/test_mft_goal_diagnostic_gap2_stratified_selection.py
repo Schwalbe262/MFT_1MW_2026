@@ -91,6 +91,7 @@ def _fallback_candidate(
     candidate.update(
         {
             "gap2_stratum": stratum,
+            "realized_gap2_mm": gap2,
             "volume_L": 700.0 + spread,
             "total_loss_W": 7_000.0 + spread,
             "strict_latest_rerank_eligible": False,
@@ -99,7 +100,8 @@ def _fallback_candidate(
                 "physics_delta_fRx_q90_lcb_below_15000Hz",
             ],
             "normalized_G": {
-                "Llt_robust_band": violation,
+                "analytical_flux_density_limit": violation,
+                "Llt_robust_band": 100.0 + spread,
                 selection.CORRECTED_CAP_CONSTRAINT: 1.0e6,
                 "half_magnetizing_resonance_minimum": 1.0e6,
             },
@@ -350,7 +352,7 @@ def test_multi_violation_formula_excludes_legacy_gates() -> None:
     )
     evidence = candidate["multi_violation_evidence"]
     assert set(evidence["positive_normalized_components"]) == {
-        "Llt_robust_band",
+        "analytical_flux_density_limit",
         selection.PHYSICS_RESONANCE_CONSTRAINT_NAME,
     }
     assert evidence["normalized_positive_sum"] == pytest.approx(
@@ -364,6 +366,10 @@ def test_multi_violation_formula_excludes_legacy_gates() -> None:
         "half_magnetizing_resonance_minimum"
         not in evidence["positive_normalized_components"]
     )
+    assert evidence["repairable_Llt_normalized_components_not_ranked"] == {
+        "Llt_robust_band": 100.0
+    }
+    assert evidence["repairable_Llt_constraints_used_for_fallback_rank"] is False
 
 
 def test_nearest_fallback_selects_exactly_four_per_gap_stratum() -> None:
@@ -380,9 +386,11 @@ def test_nearest_fallback_selects_exactly_four_per_gap_stratum() -> None:
                     spread=float(index),
                 )
             )
-    by_stratum, selected = selection._build_nearest_fallback_proposal(  # noqa: SLF001
-        candidates
-    )
+    (
+        by_stratum,
+        definition,
+        selected,
+    ) = selection._build_nearest_fallback_proposal(candidates)  # noqa: SLF001
     assert {name: len(pool) for name, pool in by_stratum.items()} == {
         "low": 6,
         "mid": 6,
@@ -395,6 +403,7 @@ def test_nearest_fallback_selects_exactly_four_per_gap_stratum() -> None:
     } == {"low": 4, "mid": 4, "high": 4}
     assert all(item["exploratory_nonpromotion"] is True for item in selected)
     assert all(item["strict_latest_rerank_eligible"] is False for item in selected)
+    assert definition["mode"] == "absolute_physical_gap2_strata"
 
 
 def test_nearest_fallback_is_invariant_to_legacy_gate_values() -> None:
@@ -414,7 +423,7 @@ def test_nearest_fallback_is_invariant_to_legacy_gate_values() -> None:
             )
         )
     ]
-    _, first = selection._build_nearest_fallback_proposal(  # noqa: SLF001
+    _, _, first = selection._build_nearest_fallback_proposal(  # noqa: SLF001
         copy.deepcopy(candidates)
     )
     changed = copy.deepcopy(candidates)
@@ -425,18 +434,80 @@ def test_nearest_fallback_is_invariant_to_legacy_gate_values() -> None:
         candidate["normalized_G"]["half_magnetizing_resonance_minimum"] = (
             1.0e12 - index
         )
+        candidate["normalized_G"]["Llt_robust_band"] = (
+            1.0e15 - index * 1.0e12
+        )
         candidate["multi_violation_evidence"] = (
             selection._multi_violation_evidence(  # noqa: SLF001
                 candidate,
                 candidate["physics_delta_prediction"],
             )
         )
-    _, second = selection._build_nearest_fallback_proposal(  # noqa: SLF001
+    _, _, second = selection._build_nearest_fallback_proposal(  # noqa: SLF001
         changed
     )
     assert [item["physical_geometry_sha256"] for item in first] == [
         item["physical_geometry_sha256"] for item in second
     ]
+
+
+def test_nearest_fallback_uses_sealed_observed_gap2_quantile_tertiles() -> None:
+    candidates = [
+        _fallback_candidate(
+            token,
+            stratum="high",
+            gap2=1.5 + index * 0.02,
+            violation=0.1 + index * 0.01,
+            spread=float(index),
+        )
+        for index, token in enumerate("abcdefghijklmnopqr")
+    ]
+    physical, definition, selected = (
+        selection._build_nearest_fallback_proposal(candidates)  # noqa: SLF001
+    )
+    assert {name: len(pool) for name, pool in physical.items()} == {
+        "low": 0,
+        "mid": 0,
+        "high": 18,
+    }
+    assert (
+        definition["mode"]
+        == "observed_recovered_gap2_rank_quantile_tertiles"
+    )
+    assert [item["population_count"] for item in definition["strata"]] == [
+        6,
+        6,
+        6,
+    ]
+    assert len(selected) == 12
+    assert {
+        name: sum(
+            item["fallback_gap2_selection_stratum"] == name
+            for item in selected
+        )
+        for name in selection.ADAPTIVE_GAP2_QUANTILE_STRATA
+    } == {
+        "observed_gap2_q1": 4,
+        "observed_gap2_q2": 4,
+        "observed_gap2_q3": 4,
+    }
+    assert len({item["physical_geometry_sha256"] for item in selected}) == 12
+
+
+def test_n2_split_sweep_keeps_total60_and_marks_redecode() -> None:
+    sweep = selection._n2_neighbor_split_sweep(  # noqa: SLF001
+        {"decoded": {"N2_main": 35, "N2_side": 25}}
+    )
+    assert [(item["N2_main"], item["N2_side"]) for item in sweep["cases"]] == [
+        (33, 27),
+        (34, 26),
+        (35, 25),
+        (36, 24),
+        (37, 23),
+    ]
+    assert all(item["N2_total"] == 60 for item in sweep["cases"])
+    assert sum(item["baseline"] for item in sweep["cases"]) == 1
+    assert sweep["Llt_constraints_used_for_fallback_ranking"] is False
 
 
 def test_seed_retry_dedupe_keeps_highest_authenticated_task(

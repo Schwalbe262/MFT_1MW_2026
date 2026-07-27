@@ -146,6 +146,17 @@ PHYSICS_RESONANCE_CONSTRAINT_NAME = (
     "physics_delta_fRx_q90_lcb_minimum"
 )
 FALLBACK_INITIAL_COUNT = 12
+ADAPTIVE_GAP2_QUANTILE_STRATA = (
+    "observed_gap2_q1",
+    "observed_gap2_q2",
+    "observed_gap2_q3",
+)
+REPAIRABLE_FALLBACK_CONSTRAINTS = frozenset(
+    {
+        "Llt_robust_band",
+        "Llt_ensemble_disagreement",
+    }
+)
 IDENTITY_COLUMNS = collector.IDENTITY_COLUMNS
 FAIL_CLOSED_FLAGS = collector.FAIL_CLOSED_FLAGS
 DIVERSITY_FEATURES = (
@@ -1254,6 +1265,15 @@ def _multi_violation_evidence(
         for name, value in normalized.items()
         if (
             name not in REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+            and name not in REPAIRABLE_FALLBACK_CONSTRAINTS
+            and _finite(value, f"normalized_G:{name}") > 1e-12
+        )
+    }
+    repairable_positive = {
+        str(name): max(_finite(value, f"normalized_G:{name}"), 0.0)
+        for name, value in normalized.items()
+        if (
+            name in REPAIRABLE_FALLBACK_CONSTRAINTS
             and _finite(value, f"normalized_G:{name}") > 1e-12
         )
     }
@@ -1286,7 +1306,53 @@ def _multi_violation_evidence(
         ),
         "physics_resonance_normalized_violation": physics_normalized,
         "positive_normalized_components": components,
+        "repairable_Llt_normalized_components_not_ranked": (
+            repairable_positive
+        ),
+        "repairable_Llt_constraints_used_for_fallback_rank": False,
         "legacy_corrected_C_and_old_resonance_excluded": True,
+    }
+
+
+def _n2_neighbor_split_sweep(
+    candidate: Mapping[str, Any],
+    *,
+    radius: int = 2,
+) -> dict[str, Any]:
+    decoded = candidate.get("decoded")
+    if not isinstance(decoded, Mapping):
+        raise StratifiedSelectionError(
+            "decoded candidate is absent for N2 split sweep"
+        )
+    main = _integer(decoded.get("N2_main"), "N2_main")
+    side = _integer(decoded.get("N2_side"), "N2_side")
+    total = main + side
+    if total != FIXED_SECONDARY_TURNS:
+        raise StratifiedSelectionError("N2 split sweep lost fixed 60 turns")
+    cases = []
+    for delta in range(-radius, radius + 1):
+        proposed_main = main + delta
+        proposed_side = total - proposed_main
+        if proposed_main <= 0 or proposed_side <= 0:
+            continue
+        cases.append(
+            {
+                "delta_N2_main": delta,
+                "N2_main": proposed_main,
+                "N2_side": proposed_side,
+                "N2_total": total,
+                "baseline": delta == 0,
+                "requires_geometry_redecode_and_new_SHA": delta != 0,
+            }
+        )
+    return {
+        "role": (
+            "repairable_Llt_acquisition_plan_not_current_geometry_truth"
+        ),
+        "Llt_constraints_used_for_fallback_ranking": False,
+        "fixed_total_secondary_turns": total,
+        "neighbor_radius_turns": radius,
+        "cases": cases,
     }
 
 
@@ -1382,10 +1448,14 @@ def _build_nearest_fallback_proposal(
     candidate_pool: Sequence[dict[str, Any]],
     *,
     total_count: int = FALLBACK_INITIAL_COUNT,
-) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
-    """Build an exactly balanced gap-stratified exploratory fallback."""
+) -> tuple[
+    dict[str, list[dict[str, Any]]],
+    dict[str, Any],
+    list[dict[str, Any]],
+]:
+    """Build a balanced physical or observed-quantile exploratory fallback."""
 
-    by_stratum = {
+    physical_by_stratum = {
         name: [
             item for item in candidate_pool if item["gap2_stratum"] == name
         ]
@@ -1396,17 +1466,95 @@ def _build_nearest_fallback_proposal(
             "fallback count must divide evenly across gap2 strata"
         )
     quota = total_count // len(GAP_STRATA)
-    if any(len(pool) < quota for pool in by_stratum.values()):
-        return by_stratum, []
+    use_physical_strata = all(
+        len(pool) >= quota for pool in physical_by_stratum.values()
+    )
+    if use_physical_strata:
+        selection_pools = physical_by_stratum
+        strata_definition = {
+            "mode": "absolute_physical_gap2_strata",
+            "tie_break": "physical_geometry_sha256",
+            "quota_per_stratum": quota,
+            "strata": [
+                {
+                    "name": name,
+                    "lower_gap2_mm": lower,
+                    "upper_gap2_mm": upper,
+                    "upper_inclusive": upper_inclusive,
+                    "population_count": len(physical_by_stratum[name]),
+                }
+                for name, lower, upper, upper_inclusive in GAP_STRATA
+            ],
+        }
+    else:
+        ordered = sorted(
+            candidate_pool,
+            key=lambda item: (
+                float(item["realized_gap2_mm"]),
+                str(item["physical_geometry_sha256"]),
+            ),
+        )
+        if len(ordered) < total_count:
+            return physical_by_stratum, {
+                "mode": "insufficient_recovered_population",
+                "population_count": len(ordered),
+                "required_count": total_count,
+            }, []
+        split_indices = np.array_split(
+            np.arange(len(ordered), dtype=np.int64),
+            len(ADAPTIVE_GAP2_QUANTILE_STRATA),
+        )
+        selection_pools = {
+            name: [ordered[int(index)] for index in indices]
+            for name, indices in zip(
+                ADAPTIVE_GAP2_QUANTILE_STRATA,
+                split_indices,
+            )
+        }
+        strata_definition = {
+            "mode": "observed_recovered_gap2_rank_quantile_tertiles",
+            "population_count": len(ordered),
+            "sort": ["realized_gap2_mm", "physical_geometry_sha256"],
+            "split_method": (
+                "stable_sorted_row_indices_split_into_three_contiguous_"
+                "near_equal_groups"
+            ),
+            "quota_per_stratum": quota,
+            "absolute_physical_strata_underfilled": [
+                name
+                for name, pool in physical_by_stratum.items()
+                if len(pool) < quota
+            ],
+            "strata": [
+                {
+                    "name": name,
+                    "empirical_rank_start_1based": int(indices[0]) + 1,
+                    "empirical_rank_end_1based": int(indices[-1]) + 1,
+                    "population_count": len(indices),
+                    "minimum_gap2_mm": float(
+                        ordered[int(indices[0])]["realized_gap2_mm"]
+                    ),
+                    "maximum_gap2_mm": float(
+                        ordered[int(indices[-1])]["realized_gap2_mm"]
+                    ),
+                    "ties_resolved_by_geometry_sha256": True,
+                }
+                for name, indices in zip(
+                    ADAPTIVE_GAP2_QUANTILE_STRATA,
+                    split_indices,
+                )
+            ],
+        }
     selected: list[dict[str, Any]] = []
-    for name, *_ in GAP_STRATA:
+    for name, pool in selection_pools.items():
         chosen = _select_fallback_diverse(
-            by_stratum[name],
+            pool,
             count=quota,
         )
         for order, item in enumerate(chosen, start=1):
             item["selection_order_in_stratum"] = order
-            item["fallback_quota_source"] = f"gap2_{name}_quota"
+            item["fallback_quota_source"] = f"{name}_quota"
+            item["fallback_gap2_selection_stratum"] = name
         selected.extend(chosen)
     selected = sorted(
         selected,
@@ -1423,7 +1571,13 @@ def _build_nearest_fallback_proposal(
         item["exploratory_nonpromotion"] = True
         item["latest_rerank_nds_rank"] = -1
         item["physics_delta_ucb_rank_in_stratum"] = -1
-    return by_stratum, selected
+    if len({item["physical_geometry_sha256"] for item in selected}) != len(
+        selected
+    ):
+        raise StratifiedSelectionError(
+            "fallback selected duplicate physical geometry"
+        )
+    return physical_by_stratum, strata_definition, selected
 
 
 def _build_stratified_proposal(
@@ -1969,9 +2123,16 @@ def prepare_selection(
         fallback_by_stratum: dict[str, list[dict[str, Any]]] = {
             name: [] for name, *_ in GAP_STRATA
         }
+        fallback_strata_definition: dict[str, Any] = {
+            "mode": "not_used_strict_selection_ready"
+        }
         selection_authority = "strict_latest_hard_plus_physics_q90"
         if missing_strata:
-            fallback_by_stratum, selected = (
+            (
+                fallback_by_stratum,
+                fallback_strata_definition,
+                selected,
+            ) = (
                 _build_nearest_fallback_proposal(
                     recovered_pool,
                     total_count=FALLBACK_INITIAL_COUNT,
@@ -2105,6 +2266,12 @@ def prepare_selection(
                         ),
                         "fallback_quota_source": candidate.get(
                             "fallback_quota_source"
+                        ),
+                        "fallback_gap2_selection_stratum": candidate.get(
+                            "fallback_gap2_selection_stratum"
+                        ),
+                        "N2_main_N2_side_neighbor_split_sweep": (
+                            _n2_neighbor_split_sweep(candidate)
                         ),
                         "parallel_FEA_execution_priority": priority_by_geometry[
                             candidate["physical_geometry_sha256"]
@@ -2297,9 +2464,13 @@ def prepare_selection(
                     ),
                     "fallback_is_not_feasibility_evidence": True,
                     "fallback_exact_gap2_quota": {
-                        name: FALLBACK_INITIAL_COUNT // len(GAP_STRATA)
-                        for name, *_ in GAP_STRATA
+                        name: FALLBACK_INITIAL_COUNT
+                        // len(ADAPTIVE_GAP2_QUANTILE_STRATA)
+                        for name in ADAPTIVE_GAP2_QUANTILE_STRATA
                     },
+                    "fallback_gap2_strata_definition": (
+                        fallback_strata_definition
+                    ),
                     "multi_violation_formula": {
                         "active_search_component": "max(normalized_G_i,0)",
                         "physics_component": (
@@ -2311,6 +2482,13 @@ def prepare_selection(
                         ),
                         "excluded_source_constraints": sorted(
                             REPLACED_LEGACY_CAPACITANCE_CONSTRAINTS
+                        ),
+                        "repairable_annotation_not_ranked": sorted(
+                            REPAIRABLE_FALLBACK_CONSTRAINTS
+                        ),
+                        "fallback_rank_priorities": (
+                            "core_flux_temperature_geometry_physics_C_"
+                            "then_maximin_diversity"
                         ),
                         "formula_is_inside_sealed_selection_payload": True,
                     },
@@ -2482,6 +2660,9 @@ def prepare_selection(
                 name: len(candidates)
                 for name, candidates in fallback_by_stratum.items()
             },
+            "fallback_gap2_stratification_mode": (
+                fallback_strata_definition["mode"]
+            ),
             "selection_authority": selection_authority,
             "exploratory_nonpromotion": (
                 selection_authority
