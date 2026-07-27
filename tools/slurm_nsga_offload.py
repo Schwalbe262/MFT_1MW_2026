@@ -566,11 +566,6 @@ print(json.dumps(verified, sort_keys=True))
                     raise RuntimeError(f"local size changed after plan: {local}")
                 if sha256_file(local) != record["sha256"]:
                     raise RuntimeError(f"local fingerprint changed after plan: {local}")
-                remote = incoming + "/" + relative
-                parent = remote.rsplit("/", 1)[0]
-                mkdir = session.run(f"mkdir -p {shlex.quote(parent)}", timeout=60)
-                if mkdir.exit_code != 0:
-                    raise RuntimeError(mkdir.stderr or f"mkdir failed: {parent}")
                 if relative in resume_verified:
                     print(
                         json.dumps(
@@ -586,6 +581,11 @@ print(json.dumps(verified, sort_keys=True))
                         flush=True,
                     )
                     continue
+                remote = incoming + "/" + relative
+                parent = remote.rsplit("/", 1)[0]
+                mkdir = session.run(f"mkdir -p {shlex.quote(parent)}", timeout=60)
+                if mkdir.exit_code != 0:
+                    raise RuntimeError(mkdir.stderr or f"mkdir failed: {parent}")
                 part = remote + ".part"
                 session.upload_file(str(local), part)
                 moved = session.run(
