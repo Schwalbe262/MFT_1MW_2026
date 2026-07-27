@@ -853,6 +853,8 @@ NEW_AXIS_THERMAL_FEASIBLE = 0
 NEW_AXIS_PRODUCTION_PARETO = 0
 NEW_AXIS_COMPACT_SURROGATE_MIN_WINDING_C = 302.67
 COMPACT_DESIGN_CONTRACT_COMMIT = "ccdaa7d"
+COMPACT_SEARCH_READINESS_COMMIT = "bc63ec5"
+COMPACT_SEARCH_RELATED_TEST_COUNT = 71
 COMPACT_OLD_GENERATION_SLICE_COUNT = 1_454
 COMPACT_OLD_GENERATION_HARD_FEASIBLE_COUNT = 0
 COMPACT_FOCUS_W_MAX_MM = 1_170.0
@@ -6324,22 +6326,52 @@ def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
     return {
         "id": COMPACT_DESIGN_STATUS_CARD_ID,
         "title": (
-            "CODEX | COMPACT DESIGN | OLD AUDIT 1454 | HARD-FEASIBLE 0 | "
-            "ACQUISITION TRIGGER CLOSED"
+            "CODEX | COMPACT SEARCH | FIXED-LM PATH TEST71 PASS | "
+            "EXACT A/B/C/H READY | FRESH512 GATE CLOSED"
         ),
         "detail": (
-            "The old-generation audit contains 1,454 geometries in the compact "
-            "geometric-and-volume slice, but none pass every hard constraint. "
-            "That result closes acquisition from the old generation; it is not "
-            "proof that a compact design is impossible. The sealed trigger opens "
-            "only after all 512 fresh exact seeds authenticate, the unchanged "
-            "model quality gate passes, and at least one complete hard-feasible "
-            "compact row exists."
+            "The fixed-primary-Lm=2mH resonance path and exact compact "
+            "initialization/mutation are implemented and independently tested. "
+            "N1=6/7/8 replay exact A/B/C plus the independent height boundary; "
+            "N1=5 replays A/B/height while its decoder-unreachable C band remains "
+            "assigned to N1=6..8 without a near-band fallback. Final fresh512 "
+            "execution remains fail-closed until a strict B7/v8 dataset is "
+            "retrained and its unchanged quality gate passes. The old audit "
+            "still has zero hard-feasible rows, but that is not proof that a "
+            "compact design is impossible."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 0,
+        "progress_pct": 45,
         "evidence": [
+            (
+                f"compact fixed-Lm readiness commit "
+                f"{COMPACT_SEARCH_READINESS_COMMIT} / related tests "
+                f"{COMPACT_SEARCH_RELATED_TEST_COUNT} passed"
+            ),
+            (
+                "resonance=Ltx(0.002H+Llt_phys), "
+                "Lrx=Ltx*(N2/N1)^2, min(fTx,fRx)>=15kHz / "
+                "surrogate k unused / physical air-gap synthesis still required"
+            ),
+            (
+                "exact compact strata: A=W1160..1170,L975..1000 / "
+                "B=W1170..1200,L960..975 / "
+                "C=W1160..1170,L960..975 / H=740..750 independent"
+            ),
+            (
+                "N1=6/7/8 exact A/B/C/H banks replayed / N1=5 exact A/B/H / "
+                "compact_C global coverage delegated to N1=6..8"
+            ),
+            (
+                "joint compact mutation every 5 generations / exact replay "
+                "required / invalid_or_near_feasible_fallback=false"
+            ),
+            (
+                "final fresh512 activation requires strict B7/v8 dataset + "
+                "retrained PASS quality generation / current real activation "
+                "closed / Scheduler POST0"
+            ),
             (
                 f"compact acquisition contract sealed at commit "
                 f"{COMPACT_DESIGN_CONTRACT_COMMIT} / trigger_allowed=false"
@@ -6359,22 +6391,6 @@ def _compact_design_status_card(observed_at: str) -> dict[str, Any]:
                 "axis policy=no_axis_swap / original W/L/H, temperature, "
                 "resonance, cooling, operating-point, and all hard constraints "
                 "retained"
-            ),
-            (
-                f"trigger condition 1/3: fresh exact"
-                f"{COMPACT_FRESH_EXACT_SEED_COUNT} authenticated=true required"
-            ),
-            (
-                "trigger condition 2/3: unchanged new-model quality gate "
-                "passed=true required"
-            ),
-            (
-                "trigger condition 3/3: compact hard-feasible row count>=1 "
-                "required"
-            ),
-            (
-                "invalid_or_near_feasible_fallback=false / constraint "
-                "relaxation=false / automatic Scheduler submission=false"
             ),
         ],
     }

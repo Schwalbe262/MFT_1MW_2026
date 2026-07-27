@@ -2001,12 +2001,44 @@ def test_compact_design_status_card_is_truthful_and_fail_closed() -> None:
     assert card["id"] == updater.COMPACT_DESIGN_STATUS_CARD_ID
     assert len(card["title"]) <= 160
     assert card["state"] == "in_progress"
-    assert card["progress_pct"] == 0
+    assert card["progress_pct"] == 45
     assert len(card["evidence"]) <= 12
-    assert "OLD AUDIT 1454" in card["title"]
-    assert "HARD-FEASIBLE 0" in card["title"]
-    assert "TRIGGER CLOSED" in card["title"]
+    assert "FIXED-LM PATH TEST71 PASS" in card["title"]
+    assert "EXACT A/B/C/H READY" in card["title"]
+    assert "FRESH512 GATE CLOSED" in card["title"]
     assert "not proof that a compact design is impossible" in card["detail"]
+    assert any(
+        "commit bc63ec5" in item and "tests 71 passed" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "Ltx(0.002H+Llt_phys)" in item
+        and "Lrx=Ltx*(N2/N1)^2" in item
+        and "air-gap synthesis still required" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "A=W1160..1170,L975..1000" in item
+        and "B=W1170..1200,L960..975" in item
+        and "C=W1160..1170,L960..975" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "N1=6/7/8 exact A/B/C/H" in item
+        and "N1=5 exact A/B/H" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "every 5 generations" in item
+        and "invalid_or_near_feasible_fallback=false" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "strict B7/v8 dataset" in item
+        and "current real activation closed" in item
+        and "Scheduler POST0" in item
+        for item in card["evidence"]
+    )
     assert any(
         "commit ccdaa7d" in item and "trigger_allowed=false" in item
         for item in card["evidence"]
@@ -2026,23 +2058,6 @@ def test_compact_design_status_card_is_truthful_and_fail_closed() -> None:
     assert any(
         "axis policy=no_axis_swap" in item
         and "all hard constraints retained" in item
-        for item in card["evidence"]
-    )
-    assert any(
-        "fresh exact512 authenticated=true required" in item
-        for item in card["evidence"]
-    )
-    assert any(
-        "quality gate passed=true required" in item
-        for item in card["evidence"]
-    )
-    assert any(
-        "compact hard-feasible row count>=1 required" in item
-        for item in card["evidence"]
-    )
-    assert any(
-        "invalid_or_near_feasible_fallback=false" in item
-        and "constraint relaxation=false" in item
         for item in card["evidence"]
     )
 
