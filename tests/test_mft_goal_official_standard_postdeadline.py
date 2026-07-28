@@ -51,6 +51,35 @@ ALL_INPUT_KEYS = [
 """
 
 
+def test_git_show_scopes_safe_directory_to_reviewed_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def run(command: list[str], **kwargs: Any) -> Any:
+        calls.append((command, kwargs))
+        return official.subprocess.CompletedProcess(
+            command, 0, stdout=b"sealed source"
+        )
+
+    monkeypatch.setattr(official.subprocess, "run", run)
+    revision = "a" * 40
+
+    assert official._git_show("module/input.py", revision) == b"sealed source"
+    assert calls == [(
+        [
+            "git",
+            "-c",
+            f"safe.directory={official.REPOSITORY.as_posix()}",
+            "-C",
+            str(official.REPOSITORY),
+            "show",
+            f"{revision}:module/input.py",
+        ],
+        {"check": False, "capture_output": True},
+    )]
+
+
 def _fixture_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

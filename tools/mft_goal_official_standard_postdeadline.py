@@ -409,7 +409,15 @@ def _one_candidate(
 
 def _git_show(path: str, revision: str = SOLVER_REVISION) -> bytes:
     result = subprocess.run(
-        ["git", "-C", str(REPOSITORY), "show", f"{revision}:{path}"],
+        [
+            "git",
+            "-c",
+            f"safe.directory={REPOSITORY.as_posix()}",
+            "-C",
+            str(REPOSITORY),
+            "show",
+            f"{revision}:{path}",
+        ],
         check=False,
         capture_output=True,
     )
