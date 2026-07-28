@@ -9,6 +9,7 @@ import time
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import pytest
 
 from regression_260707.monitoring.app import create_app
 from regression_260707.monitoring.pipeline_status import (
@@ -104,18 +105,65 @@ def _create_queue(root: Path, now: float) -> Path:
     generation_id = "d" * 64
     generation = root / "artifacts" / "dataset" / generation_id
     generation.mkdir(parents=True)
-    (generation / "manifest.json").write_text(json.dumps({
+    artifact = generation / "train.parquet"
+    artifact.write_bytes(b"immutable parquet fixture")
+    manifest = {
         "schema_version": 1,
         "kind": "dataset",
         "generation_id": generation_id,
         "created_at": datetime.fromtimestamp(now - 20, timezone.utc).isoformat(),
+        "artifacts": {"train.parquet": {
+            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            "size": artifact.stat().st_size,
+        }},
         "metadata": {
             "strict_full_rows": 123,
             "solver_revision": SOLVER_REVISION,
             "library_revision": LIBRARY_REVISION,
         },
+    }
+    manifest_path = generation / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (generation / "COMPLETED").write_text(json.dumps({
+        "generation_id": generation_id,
+        "manifest_sha256": hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest(),
+    }), encoding="utf-8")
+    (root / "surrogate_status.json").write_text(json.dumps({
+        "schema_version": 1,
+        "updated_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "pid": os.getpid(),
+        "state": "waiting_for_next_dataset_check",
+        "solver_revision": SOLVER_REVISION,
+        "library_revision": LIBRARY_REVISION,
+        "dataset_generation": f"dataset:{generation_id}",
+        "raw_rows": 321,
+        "strict_full_rows": 123,
     }), encoding="utf-8")
     return database
+
+
+def _verified_contract() -> dict:
+    return {
+        "available": True,
+        "verified": True,
+        "quality_contract_path": "C:/fixture/quality_contract.py",
+        "quality_contract_sha256": "1" * 64,
+        "profile_path": "C:/fixture/standard.json",
+        "profile_sha256": "2" * 64,
+        "status": {},
+        "error": None,
+    }
+
+
+def _audit_123(path, solver_revision, library_revision):
+    return {
+        "raw_rows": 321,
+        "strict_em_rows": 150,
+        "strict_full_rows": 123,
+        "em_only_rows": 27,
+    }
 
 
 def test_pipeline_reader_reports_real_parallel_lanes_revisions_and_errors(tmp_path):
@@ -136,7 +184,11 @@ def test_pipeline_reader_reports_real_parallel_lanes_revisions_and_errors(tmp_pa
     before_hash = hashlib.sha256(database.read_bytes()).hexdigest()
     before_mtime = database.stat().st_mtime_ns
     payload = ContinuousPipelineReader(
-        root, clock=lambda: now, inspect_external_processes=False
+        root,
+        clock=lambda: now,
+        inspect_external_processes=False,
+        dataset_auditor=_audit_123,
+        contract_provenance_provider=lambda revisions: _verified_contract(),
     ).snapshot()
 
     assert payload["health"] == "degraded"  # fine FEA is retrying.
@@ -186,6 +238,7 @@ def test_pipeline_reader_reports_real_parallel_lanes_revisions_and_errors(tmp_pa
     assert collect["elapsed_seconds"] >= 0
     assert lanes["train"]["current_job"]["input_generation"] == "dataset:g1"
     assert lanes["train"]["current_job"]["output_generation"] == "models:g2"
+    assert payload["training"]["active_job"] is None
     assert lanes["verify_standard"]["last_error"]["reason"] == "solver exploded"
     assert lanes["verify_fine"]["health"] == "retrying"
     assert payload["cohort"]["current_strict_full_rows"] == 123
@@ -198,6 +251,93 @@ def test_pipeline_reader_reports_real_parallel_lanes_revisions_and_errors(tmp_pa
     # query_only plus mode=ro must leave the durable queue byte-for-byte alone.
     assert hashlib.sha256(database.read_bytes()).hexdigest() == before_hash
     assert database.stat().st_mtime_ns == before_mtime
+
+
+def test_pipeline_cohort_uses_fresh_authority_over_stale_controller_log(
+    tmp_path,
+):
+    now = time.time()
+    root = tmp_path / "pipeline"
+    _create_queue(root, now)
+    _write_role(root, "controller", now)
+    _write_role(root, "supervisor", now)
+    log_root = root / "logs"
+    log_root.mkdir(parents=True, exist_ok=True)
+    old_id = "d" * 64
+    (log_root / "controller.stdout.log").write_text(
+        json.dumps({
+            "dataset_generation": f"dataset:{old_id}",
+            "jobs": {"collect": 1},
+            "blocked": {},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (log_root / "controller.stderr.log").write_text("", encoding="utf-8")
+    (log_root / "supervisor.stdout.log").write_text("", encoding="utf-8")
+    (log_root / "supervisor.stderr.log").write_text("", encoding="utf-8")
+
+    old_path = root / "artifacts" / "dataset" / old_id
+    os.utime(old_path, (now - 30, now - 30))
+    new_id = "e" * 64
+    new_path = root / "artifacts" / "dataset" / new_id
+    new_path.mkdir(parents=True)
+    artifact = new_path / "train.parquet"
+    artifact.write_bytes(b"new immutable parquet fixture")
+    manifest = {
+        "schema_version": 1,
+        "kind": "dataset",
+        "generation_id": new_id,
+        "created_at": datetime.fromtimestamp(now - 5, timezone.utc).isoformat(),
+        "artifacts": {"train.parquet": {
+            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            "size": artifact.stat().st_size,
+        }},
+        "metadata": {
+            "strict_full_rows": 456,
+            "solver_revision": SOLVER_REVISION,
+            "library_revision": LIBRARY_REVISION,
+        },
+    }
+    manifest_path = new_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (new_path / "COMPLETED").write_text(json.dumps({
+        "generation_id": new_id,
+        "manifest_sha256": hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest(),
+    }), encoding="utf-8")
+    (root / "surrogate_status.json").write_text(json.dumps({
+        "schema_version": 1,
+        "updated_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "pid": os.getpid(),
+        "state": "waiting_for_next_dataset_check",
+        "solver_revision": SOLVER_REVISION,
+        "library_revision": LIBRARY_REVISION,
+        "dataset_generation": f"dataset:{new_id}",
+        "raw_rows": 500,
+        "strict_full_rows": 456,
+    }), encoding="utf-8")
+    os.utime(new_path, (now - 5, now - 5))
+
+    payload = ContinuousPipelineReader(
+        root,
+        clock=lambda: now,
+        inspect_external_processes=False,
+        dataset_auditor=lambda path, solver, library: {
+            "raw_rows": 500,
+            "strict_em_rows": 480,
+            "strict_full_rows": 456,
+            "em_only_rows": 24,
+        },
+        contract_provenance_provider=lambda revisions: _verified_contract(),
+    ).snapshot()
+
+    assert payload["controller_cycle"]["dataset_generation"] == f"dataset:{old_id}"
+    assert payload["cohort"]["generation"] == f"dataset:{new_id}"
+    assert payload["cohort"]["strict_full_rows"] == 456
+    assert payload["cohort"]["controller_generation"] == f"dataset:{new_id}"
+    assert payload["cohort"]["is_controller_generation"] is True
+    assert payload["cohort"]["authority_verified"] is True
 
 
 def test_external_tuner_counts_only_after_recent_cpu_or_io_activity(
@@ -305,6 +445,7 @@ def test_pipeline_reader_audits_row_tiers_once_per_dataset_fingerprint(tmp_path)
         clock=lambda: now,
         inspect_external_processes=False,
         dataset_auditor=audit,
+        contract_provenance_provider=lambda revisions: _verified_contract(),
     )
     first = reader.snapshot()
     second = reader.snapshot()
@@ -318,7 +459,7 @@ def test_pipeline_reader_audits_row_tiers_once_per_dataset_fingerprint(tmp_path)
     assert first["cohort"]["em_only_rows"] == 27
     assert first["cohort"]["current_strict_full_rows"] == 123
     assert first["cohort"]["counts_source"] == (
-        "train.parquet_quality_contract"
+        "authenticated_train.parquet_quality_contract"
     )
     assert first["cohort"]["manifest_matches_audit"] is True
     assert first["cohort"]["em_only_is_invalid"] is False
@@ -326,7 +467,7 @@ def test_pipeline_reader_audits_row_tiers_once_per_dataset_fingerprint(tmp_path)
     assert second["cohort"] == first["cohort"]
 
 
-def test_pipeline_reader_bounds_dataset_audit_and_keeps_manifest_full_count(tmp_path):
+def test_pipeline_reader_bounds_dataset_audit_and_fails_closed(tmp_path):
     now = time.time()
     root = tmp_path / "pipeline"
     _create_queue(root, now)
@@ -348,15 +489,205 @@ def test_pipeline_reader_bounds_dataset_audit_and_keeps_manifest_full_count(tmp_
         inspect_external_processes=False,
         dataset_audit_max_bytes=8,
         dataset_auditor=audit,
+        contract_provenance_provider=lambda revisions: _verified_contract(),
     ).snapshot()
 
     assert called is False
-    assert payload["cohort"]["available"] is True
+    assert payload["cohort"]["available"] is False
     assert payload["cohort"]["counts_available"] is False
     assert payload["cohort"]["strict_em_rows"] is None
-    assert payload["cohort"]["strict_full_rows"] == 123
+    assert payload["cohort"]["strict_full_rows"] == 0
     assert payload["cohort"]["em_only_rows"] is None
-    assert "audit limit" in payload["cohort"]["counts_error"]
+    assert "exceeds" in payload["cohort"]["counts_error"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    (
+        ("stale", "stale"),
+        ("pid", "PID"),
+        ("revision", "revision mismatch"),
+    ),
+)
+def test_pipeline_controller_authority_fails_closed(
+    tmp_path, mutation, expected_error
+):
+    now = time.time()
+    root = tmp_path / "pipeline"
+    _create_queue(root, now)
+    _write_role(root, "controller", now)
+    status_path = root / "surrogate_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    if mutation == "stale":
+        status["updated_at"] = datetime.fromtimestamp(
+            now - 181, timezone.utc
+        ).isoformat()
+    elif mutation == "pid":
+        status["pid"] = os.getpid() + 10_000
+    else:
+        status["solver_revision"] = "f" * 40
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    payload = ContinuousPipelineReader(
+        root,
+        clock=lambda: now,
+        inspect_external_processes=False,
+        dataset_auditor=_audit_123,
+        contract_provenance_provider=lambda revisions: _verified_contract(),
+    ).snapshot()
+
+    assert payload["controller_authority"]["verified"] is False
+    assert expected_error in payload["controller_authority"]["error"]
+    assert payload["cohort"]["available"] is False
+    assert payload["cohort"]["strict_full_rows"] == 0
+
+
+@pytest.mark.parametrize("target", ("parquet", "completed"))
+def test_pipeline_dataset_hash_chain_tamper_fails_closed(tmp_path, target):
+    now = time.time()
+    root = tmp_path / "pipeline"
+    _create_queue(root, now)
+    _write_role(root, "controller", now)
+    generation = root / "artifacts" / "dataset" / ("d" * 64)
+    if target == "parquet":
+        (generation / "train.parquet").write_bytes(b"tampered")
+    else:
+        completed = json.loads(
+            (generation / "COMPLETED").read_text(encoding="utf-8")
+        )
+        completed["manifest_sha256"] = "0" * 64
+        (generation / "COMPLETED").write_text(
+            json.dumps(completed), encoding="utf-8"
+        )
+
+    payload = ContinuousPipelineReader(
+        root,
+        clock=lambda: now,
+        inspect_external_processes=False,
+        dataset_auditor=_audit_123,
+        contract_provenance_provider=lambda revisions: _verified_contract(),
+    ).snapshot()
+
+    assert payload["cohort"]["available"] is False
+    assert "mismatch" in payload["cohort"]["error"]
+
+
+def test_contract_provenance_uses_checkpoint_deployment_not_shadow_import(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "pipeline"
+    deployment = tmp_path / "deployment" / "regression_260707"
+    checkpoint_root = deployment / "training" / "checkpoint_runs" / "run"
+    checkpoint_root.mkdir(parents=True)
+    contract = deployment / "quality_contract.py"
+    contract.write_text("DEPLOYMENT_SENTINEL = True\n", encoding="utf-8")
+    profile = deployment / "verify" / "profiles" / "standard.json"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(json.dumps({"param_overrides": {}}), encoding="utf-8")
+    contract_sha = hashlib.sha256(contract.read_bytes()).hexdigest()
+    canonical_profile_sha = hashlib.sha256(json.dumps(
+        {"param_overrides": {}}, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    status = {
+        "expected_solver_revision": SOLVER_REVISION,
+        "expected_library_revision": LIBRARY_REVISION,
+        "checkpoint_run_root": str(checkpoint_root),
+        "state_identity": {
+            "library_revision": LIBRARY_REVISION,
+            "quality_contract_sha256": contract_sha,
+            "profile_sha256": canonical_profile_sha,
+            "profile_path": str(profile),
+        },
+    }
+    checkpoint = root / "canonical_checkpoint" / "strict_data_status.json"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text(json.dumps(status), encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "quality_contract", object())
+
+    provenance = ContinuousPipelineReader(
+        root, inspect_external_processes=False
+    )._contract_provenance({
+        "solver_revision": SOLVER_REVISION,
+        "library_revision": LIBRARY_REVISION,
+    })
+
+    assert provenance["verified"] is True
+    assert Path(provenance["quality_contract_path"]) == contract.resolve()
+    assert provenance["quality_contract_sha256"] == contract_sha
+
+
+def test_active_model_awaiting_is_not_active_and_active_chain_is_authenticated(
+    tmp_path,
+):
+    now = time.time()
+    root = tmp_path / "pipeline"
+    registry = root / "canonical_checkpoint" / "registry"
+    registry.mkdir(parents=True)
+    active_path = root / "active_surrogate.json"
+    common = {
+        "schema_version": 1,
+        "observed_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "registry": str(registry),
+        "strict_full_rows": 5_670,
+        "activation_minimum_strict_full_rows": 3_000,
+        "solver_revision": SOLVER_REVISION,
+        "library_revision": LIBRARY_REVISION,
+    }
+    active_path.write_text(json.dumps({
+        **common, "state": "awaiting_activation"
+    }), encoding="utf-8")
+    reader = ContinuousPipelineReader(root, clock=lambda: now)
+    revisions = {
+        "solver_revision": SOLVER_REVISION,
+        "library_revision": LIBRARY_REVISION,
+    }
+    awaiting = reader._active_model_status(revisions, now)
+    assert awaiting["verified"] is True
+    assert awaiting["production_active"] is False
+
+    generation = registry / "generations" / "run-1"
+    generation.mkdir(parents=True)
+    report = {
+        "training_run_id": "run-1",
+        "dataset_sha256": "3" * 64,
+        "profile_sha256": "4" * 64,
+    }
+    report_path = generation / "train_report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = hashlib.sha256(report_path.read_bytes()).hexdigest()
+    gate = {
+        "passed": True,
+        "training_run_id": "run-1",
+        "dataset_sha256": "3" * 64,
+        "profile_sha256": "4" * 64,
+    }
+    gate_path = generation / "quality_gate.json"
+    gate_path.write_text(json.dumps(gate), encoding="utf-8")
+    gate_sha = hashlib.sha256(gate_path.read_bytes()).hexdigest()
+    pointer = {
+        "schema_version": 2,
+        "training_run_id": "run-1",
+        "generation": "generations/run-1",
+        "dataset_sha256": "3" * 64,
+        "profile_sha256": "4" * 64,
+        "strict_full_rows": 5_670,
+        "generation_report_sha256": report_sha,
+        "quality_gate_sha256": gate_sha,
+    }
+    (registry / "current.json").write_text(
+        json.dumps(pointer), encoding="utf-8"
+    )
+    active_path.write_text(json.dumps({
+        **common, "state": "active"
+    }), encoding="utf-8")
+    active = reader._active_model_status(revisions, now)
+    assert active["verified"] is True
+    assert active["production_active"] is True
+
+    report_path.write_text("{}", encoding="utf-8")
+    tampered = reader._active_model_status(revisions, now)
+    assert tampered["verified"] is False
+    assert tampered["production_active"] is False
 
 
 def test_pipeline_reader_is_bounded_and_fail_soft_for_missing_or_corrupt_state(tmp_path):
@@ -380,6 +711,45 @@ def test_pipeline_reader_is_bounded_and_fail_soft_for_missing_or_corrupt_state(t
     assert payload["roles"]["controller"]["status"] in {"stale", "unknown"}
     assert payload["queue"]["available"] is False
     assert "DatabaseError" in payload["queue"]["error"]
+
+
+def test_experimental_hpo_projection_exposes_bounded_live_progress(
+        tmp_path, monkeypatch):
+    now = time.time()
+    root = tmp_path / "pipeline"
+    status_path = root / "experimental_shadow_d7_continuous" / "status.json"
+    status_path.parent.mkdir(parents=True)
+    dataset = tmp_path / "train.parquet"
+    dataset.write_bytes(b"parquet identity placeholder")
+    status_path.write_text(json.dumps({
+        "state": "wave_running",
+        "wave_phase": "experimental_hpo",
+        "active_wave": "wave-test",
+        "pid": os.getpid(),
+        "updated_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "canonical_dataset": str(dataset),
+        "observed_strict_full_rows": 5098,
+        "selected_hpo_target_count": 8,
+        "completed_hpo_target_count": 4,
+        "active_hpo_processes": 4,
+        "active_hpo_batch": 2,
+        "hpo_batch_count": 2,
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        "regression_260707.monitoring.pipeline_status._inspect_process",
+        lambda pid: (True, now - 30.0),
+    )
+
+    payload = ContinuousPipelineReader(
+        root, clock=lambda: now, inspect_external_processes=False
+    )._experimental_shadow_training(now)
+
+    assert payload["validated_running"] is True
+    assert payload["observed_strict_full_rows"] == 5098
+    assert payload["selected_hpo_target_count"] == 8
+    assert payload["completed_hpo_target_count"] == 4
+    assert payload["active_hpo_processes"] == 4
+    assert payload["active_hpo_batch"] == payload["hpo_batch_count"] == 2
 
 
 def test_pipeline_log_tail_is_bounded_and_current_role_error_is_visible(tmp_path):
@@ -445,6 +815,8 @@ def test_pipeline_api_and_static_panel_are_exposed(tmp_path):
     assert "cohort.strict_em_rows" in script
     assert "cohort.em_only_rows" in script
     assert "무효 데이터가 아닙니다" in script
+    assert "tier1_feedback_search" in script
+    assert "#nsga-tier1-progress" in script
     stylesheet = client.get("/static/app.css").text
     assert ".continuous-pipeline-panel" in stylesheet
     assert ".continuous-lane-table" in stylesheet

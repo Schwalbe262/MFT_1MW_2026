@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="light">
   <title>{{ title }}</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=20260723-pareto-light-v1">
 </head>
 <body class="cohorts-page" data-refresh-seconds="{{ refresh_seconds }}">
   <header class="topbar">
@@ -53,6 +53,6 @@
     </section>
     <p class="root-path">Project root: <code>{{ project_root }}</code></p>
   </main>
-  <script src="{{ url_for('static', path='/cohorts.js') }}" defer></script>
+  <script src="{{ url_for('static', path='/cohorts.js') }}?v=20260723-pareto-light-v1" defer></script>
 </body>
 </html>

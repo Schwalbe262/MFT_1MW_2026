@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="light">
   <title>{{ title }}</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=20260725-campaign-scope-v2">
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=20260725-slurm-allocation-jobs-v2">
 </head>
 <body data-refresh-seconds="{{ refresh_seconds }}">
   <header class="topbar">
@@ -44,6 +44,25 @@
           <strong id="codex-work-deadline">마감 —</strong>
           <small id="codex-work-updated">갱신 —</small>
         </div>
+      </div>
+      <div id="codex-campaign-strip" class="codex-campaign-strip unknown" aria-label="마감 Slurm 캠페인 권위 상태">
+        <div>
+          <span>활성 Slurm allocation job</span>
+          <strong id="codex-campaign-allocation-jobs">—</strong>
+        </div>
+        <div>
+          <span>제출 누계</span>
+          <strong id="codex-campaign-submitted">—</strong>
+        </div>
+        <div>
+          <span>현재 실행</span>
+          <strong id="codex-campaign-running">—</strong>
+        </div>
+        <div>
+          <span>완료·회수</span>
+          <strong id="codex-campaign-collections">—</strong>
+        </div>
+        <p id="codex-campaign-note">마감 캠페인의 권위 상태를 확인하는 중입니다.</p>
       </div>
       <div class="codex-work-grid">
         <article class="codex-work-column current">
@@ -173,6 +192,11 @@
           <p id="pipeline-external-tuner-detail">durable queue 밖의 tuner를 확인하는 중입니다.</p>
           <ul id="pipeline-external-tuners" class="plain-list"></ul>
         </article>
+        <article class="continuous-role-card external-tuner-card">
+          <div><span>지속 HPO</span><b id="pipeline-hpo-state" class="state-chip unknown">확인 중</b></div>
+          <p id="pipeline-hpo-progress">targets — / — · batch — / —</p>
+          <p id="pipeline-hpo-detail">heartbeat와 trial 진행을 확인하는 중입니다.</p>
+        </article>
       </div>
       <div class="continuous-pipeline-summary" aria-label="pipeline 병렬 실행 요약">
         <div><span>동시 running lane</span><strong id="pipeline-running-lanes">—</strong></div>
@@ -194,6 +218,42 @@
       <p class="continuous-pipeline-root">Read-only source: <code id="continuous-pipeline-root">—</code></p>
     </section>
 
+    <section class="continuous-pipeline-panel" aria-labelledby="compute-campaign-title">
+      <div class="section-heading compact">
+        <div>
+          <p class="eyebrow">SLURM MODEL SUCCESSOR</p>
+          <h2 id="compute-campaign-title">HPO → 최종 학습 → 새 모델 탐색</h2>
+          <p id="compute-campaign-detail" class="continuous-pipeline-detail">인증된 단계 상태를 확인하는 중입니다.</p>
+        </div>
+        <span id="compute-campaign-state" class="status-pill status-loading"><i></i> 확인 중</span>
+      </div>
+      <div class="continuous-role-grid">
+        <article class="continuous-role-card">
+          <div><span>HPO 병합</span><b id="compute-hpo-state" class="state-chip unknown">확인 중</b></div>
+          <p id="compute-hpo-detail">인증 결과와 trial 수를 확인하는 중입니다.</p>
+        </article>
+        <article class="continuous-role-card">
+          <div><span>21-target 학습·품질 gate</span><b id="compute-acceptance-state" class="state-chip unknown">대기</b></div>
+          <p id="compute-acceptance-detail">SLURM task 상태를 확인하는 중입니다.</p>
+        </article>
+        <article class="continuous-role-card">
+          <div><span>모델 회수·게시</span><b id="compute-harvest-state" class="state-chip unknown">대기</b></div>
+          <p id="compute-harvest-detail">인증된 generation 상태를 확인하는 중입니다.</p>
+        </article>
+        <article class="continuous-role-card">
+          <div><span>Current7 controller 전환 (모델 독립)</span><b id="compute-cutover-state" class="state-chip unknown">대기</b></div>
+          <p id="compute-cutover-detail">검색 freshness와 모델 게시 상태를 섞지 않고 controller 전환만 표시합니다.</p>
+        </article>
+      </div>
+      <div class="continuous-pipeline-summary" aria-label="SLURM 탐색 자원 요약">
+        <div><span>정책 target</span><strong id="compute-resource-tasks">—</strong></div>
+        <div><span>target CPU 상한</span><strong id="compute-resource-cpus">—</strong></div>
+        <div><span>target 메모리 상한</span><strong id="compute-resource-memory">—</strong></div>
+        <div><span>작업당 자원</span><strong id="compute-resource-per-task">—</strong></div>
+        <div><span>known-node unplaced 상한</span><strong id="compute-resource-unplaced">—</strong></div>
+      </div>
+    </section>
+
     <section aria-labelledby="data-title">
       <div class="section-heading">
         <div><p class="eyebrow">01 · DATA CAMPAIGN</p><h2 id="data-title">데이터 확보 현황</h2></div>
@@ -203,8 +263,13 @@
         </div>
       </div>
       <div class="metric-grid data-metrics">
-        <article class="metric-card primary"><span>현재 물리 revision 학습 가능</span><strong id="data-total">—</strong><small id="data-strict-detail">physics revision — · strict full</small><small id="data-member-shas" class="member-shas">SHA: —</small></article>
-        <article class="metric-card"><span>전체 수집 데이터</span><strong id="data-raw-total">—</strong><small id="data-quality-detail">—</small></article>
+        <article class="metric-card primary"><span>전체 수집 Raw</span><strong id="data-raw-total">—</strong><small id="data-raw-basis">basis: —</small></article>
+        <article class="metric-card"><span>현재 학습 eligible</span><strong id="data-training-total">—</strong><small id="data-training-basis">basis: —</small><small id="data-training-revisions" class="member-shas">solver/library: —</small></article>
+        <article class="metric-card"><span>현재 학습 job</span><strong id="data-active-training">—</strong><small id="data-active-training-detail">snapshot: —</small></article>
+        <article class="metric-card"><span>최근 완료 학습</span><strong id="data-completed-training">—</strong><small id="data-completed-training-detail">snapshot: —</small></article>
+        <article class="metric-card"><span>활성 모델 pointer</span><strong id="data-active-model">—</strong><small id="data-active-model-detail">cohort: —</small></article>
+        <article class="metric-card"><span>Active physics strict EM</span><strong id="data-active-em">—</strong><small id="data-active-em-basis">basis: —</small></article>
+        <article class="metric-card"><span>Active physics strict full</span><strong id="data-total">—</strong><small id="data-strict-detail">basis: —</small><small id="data-member-shas" class="member-shas">SHA: —</small></article>
         <article class="metric-card"><span>최근 1시간</span><strong id="data-throughput">—</strong><small id="data-throughput-detail">—</small></article>
         <article class="metric-card"><span>3,000개 예상 도달</span><strong id="data-eta">—</strong><small id="data-stall">—</small></article>
       </div>
@@ -216,8 +281,8 @@
         </article>
         <article class="panel goal-panel">
           <h3>긴급 생산 목표</h3>
-          <div class="goal-row"><div><span>1차 목표</span><b id="goal-label">0 / 3,000</b></div><div class="progress"><i id="goal-progress"></i></div></div>
-          <div class="goal-row"><div><span>연속 수집</span><b id="stretch-label">0 / 10,000+</b></div><div class="progress secondary"><i id="stretch-progress"></i></div></div>
+          <div class="goal-row"><div><span>Active physics full 1차 목표</span><b id="goal-label">0 / 3,000</b></div><div class="progress"><i id="goal-progress"></i></div></div>
+          <div class="goal-row"><div><span>Active physics full 연속 수집</span><b id="stretch-label">0 / 10,000+</b></div><div class="progress secondary"><i id="stretch-progress"></i></div></div>
           <dl class="detail-list">
             <div><dt>최근 24시간 증가</dt><dd id="data-24h">—</dd></div>
             <div><dt>목표까지 남은 수</dt><dd id="data-remaining">—</dd></div>
@@ -333,6 +398,7 @@
           <div class="panel-title"><div><h3 id="model-chart-title">모델을 선택하세요</h3><p id="model-evaluation-kind">활성 모델과 체크포인트 CV를 구분해 표시합니다.</p></div><span id="model-trained-at" class="muted">—</span></div>
           <section class="model-plot-block" aria-labelledby="model-parity-title">
             <div class="model-plot-heading"><h4 id="model-parity-title">Parity plot</h4><span id="model-parity-meta" class="muted">—</span></div>
+            <p id="model-parity-provenance" class="parity-provenance-note hidden" role="status"></p>
             <svg id="model-parity-chart" class="chart parity-chart" viewBox="0 0 620 300" role="img" aria-label="실제값과 교차검증 예측값 parity plot"></svg>
             <p id="model-parity-empty" class="empty-state">검증된 parity 데이터가 없습니다.</p>
           </section>
@@ -367,7 +433,59 @@
         <article class="metric-card"><span>Pareto 후보</span><strong id="nsga-count">—</strong></article>
         <article class="metric-card"><span>최소 체적</span><strong id="nsga-min-volume">—</strong></article>
         <article class="metric-card"><span>최소 손실</span><strong id="nsga-min-loss">—</strong></article>
+        <article class="metric-card"><span>Tier-1 보정 탐색</span><strong id="nsga-tier1-progress">—</strong></article>
       </div>
+      <article id="sealed-successor-panel" class="panel sealed-successor-panel hidden" aria-live="polite">
+        <div class="sealed-successor-header">
+          <div>
+            <p class="eyebrow">READ-ONLY · NOT CANONICAL PARETO</p>
+            <h3 id="sealed-successor-title">Sealed successor / FEA pending</h3>
+          </div>
+          <span id="sealed-successor-integrity" class="state-chip unknown">미확인</span>
+        </div>
+        <p id="sealed-successor-description" class="sealed-successor-description"></p>
+        <div id="sealed-successor-candidates" class="sealed-successor-candidate-grid hidden" aria-label="Sealed successor evidence candidates"></div>
+        <div class="sealed-successor-summary">
+          <div><span>Evidence</span><strong id="sealed-successor-id">—</strong></div>
+          <div><span>외형 W×L×H</span><strong id="sealed-successor-box">—</strong></div>
+          <div><span>0.5×Lm 공진</span><strong id="sealed-successor-resonance">—</strong></div>
+          <div><span>All11 robust 최고온도</span><strong id="sealed-successor-temperature">—</strong></div>
+          <div><span>Llt robust G</span><strong id="sealed-successor-llt">—</strong></div>
+          <div><span>권한 상태</span><strong id="sealed-successor-authority">production=false · FEA=pending</strong></div>
+          <div><span>Standard-FEA 검증</span><strong id="sealed-successor-validation" class="standard-fea-overlay">not configured</strong></div>
+        </div>
+        <div class="sealed-successor-actions">
+          <span id="sealed-successor-warning" class="inline-error hidden"></span>
+          <button id="sealed-successor-detail-button" type="button" disabled>무결성·설계 상세 보기</button>
+        </div>
+      </article>
+      <article class="panel nsga-generation-panel" aria-labelledby="nsga-generation-title">
+        <div class="nsga-generation-heading">
+          <div>
+            <p class="eyebrow">CONSTRAINT GENERATIONS</p>
+            <h3 id="nsga-generation-title">조건별 Pareto</h3>
+            <p>조건 세대를 선택하면 해당 조건으로 계산된 Pareto만 표시합니다.</p>
+          </div>
+          <span id="nsga-generation-state" class="state-chip unknown">조건 이력 확인 중</span>
+        </div>
+        <div id="nsga-generation-selector" class="nsga-generation-selector" role="tablist" aria-label="NSGA-II 조건 세대"></div>
+        <p id="nsga-generation-summary" class="nsga-generation-summary">조건 세대 목록을 불러오는 중입니다.</p>
+      </article>
+      <article id="nsga-near-panel" class="panel table-panel nsga-near-panel hidden" aria-labelledby="nsga-near-title" aria-live="polite">
+        <div class="panel-title">
+          <div>
+            <h3 id="nsga-near-title">Near feasible · 제약 미통과 후보</h3>
+            <p id="nsga-near-summary">유효 Pareto가 나오기 전 탐색 진척을 보여주는 읽기 전용 후보입니다.</p>
+          </div>
+          <span id="nsga-near-state" class="state-chip attention">유효 Pareto 아님</span>
+        </div>
+        <div class="table-scroll nsga-near-scroll">
+          <table>
+            <thead><tr><th>출처 / seed</th><th>W × L × H</th><th>체적</th><th>Llt robust</th><th>최저 공진</th><th>Robust 최고온도</th><th>남은 제약</th></tr></thead>
+            <tbody id="nsga-near-table"></tbody>
+          </table>
+        </div>
+      </article>
       <div class="split-grid nsga-layout">
         <article class="panel chart-panel">
           <div class="panel-title"><div><h3>체적–총손실 Pareto front</h3><p>점을 누르면 후보 상세값을 확인할 수 있습니다.</p></div><span id="nsga-comparison" class="muted">—</span></div>
@@ -384,6 +502,7 @@
           </div>
         </article>
       </div>
+      <p id="nsga-constraint-contract" class="footnote"></p>
       <p id="nsga-note" class="footnote"></p>
     </section>
 
@@ -392,9 +511,16 @@
         <div><p class="eyebrow">04 · FEA VERIFICATION</p><h2 id="verify-title">후보 검증 및 최종 판정</h2></div>
         <span id="verify-stage" class="section-badge">검증 전</span>
       </div>
+      <div id="verify-deadline-campaign" class="verify-deadline-campaign unknown" aria-label="마감 캠페인 Standard FEA 상태">
+        <div>
+          <span>마감 캠페인 Standard FEA</span>
+          <strong id="verify-campaign-summary">권위 상태 확인 중</strong>
+        </div>
+        <p id="verify-campaign-note">아래 기존 pipeline 검증 표와 별도 범위입니다.</p>
+      </div>
       <div class="split-grid verification-layout">
         <article class="panel table-panel">
-          <div class="panel-title"><div><h3>Standard FEA 후보</h3><p id="verify-coverage">아직 제출된 검증이 없습니다.</p></div></div>
+          <div class="panel-title"><div><h3>기존 pipeline Standard FEA 후보</h3><p id="verify-coverage">기존 pipeline 검증 결과를 확인하는 중입니다.</p></div></div>
           <div class="table-scroll">
             <table>
               <thead><tr><th>후보</th><th>Task</th><th>Llt</th><th>최고온도</th><th>Bmax</th><th>손실</th><th>단계 소요시간</th><th>판정</th></tr></thead>
@@ -434,7 +560,35 @@
     <form method="dialog"><button class="dialog-close" aria-label="닫기">×</button></form>
     <p class="eyebrow">PARETO CANDIDATE</p><h2 id="dialog-title">후보 상세</h2>
     <div id="dialog-summary" class="dialog-summary"></div>
+    <section class="local-aedt-actions" aria-labelledby="local-aedt-title">
+      <div>
+        <h3 id="local-aedt-title">로컬 AEDT GUI</h3>
+        <p>모델 생성은 자동 해석 없이 AEDT GUI만 준비합니다. 해석 시작은 Maxwell EM·기생 C 해석을 자동 실행한 뒤 GUI를 유지하며 Icepak 열해석은 포함하지 않습니다. 모든 동작은 이 PC의 독립 standalone AEDT에서만 수행하고 Slurm/AEDT pool에는 제출하지 않습니다.</p>
+      </div>
+      <div class="local-aedt-buttons">
+        <button id="open-symmetry-gui" type="button">Symmetry 모델만 생성</button>
+        <button id="solve-symmetry-gui" class="solve-action" type="button">Symmetry 해석 시작</button>
+        <button id="open-full-gui" type="button">Full 모델만 생성</button>
+        <button id="solve-full-gui" class="solve-action" type="button">Full 해석 시작</button>
+      </div>
+      <p id="local-aedt-status" class="local-aedt-status" role="status">후보를 선택하면 로컬 실행 상태를 확인합니다.</p>
+      <section id="local-aedt-result" class="local-aedt-result hidden" aria-labelledby="local-aedt-result-title">
+        <h4 id="local-aedt-result-title">Local FEA validation</h4>
+        <dl id="local-aedt-result-summary" class="detail-value-grid"></dl>
+        <p id="local-aedt-report-summary" class="local-aedt-report-summary"></p>
+        <details>
+          <summary>FEA result artifact / task identity</summary>
+          <pre id="local-aedt-result-json"></pre>
+        </details>
+      </section>
+      <details id="local-aedt-log-details" class="local-aedt-log-details hidden">
+        <summary>로컬 AEDT 실행 로그</summary>
+        <pre id="local-aedt-log"></pre>
+      </details>
+    </section>
     <h3>손실 및 성능</h3><dl id="dialog-performance" class="detail-value-grid"></dl>
+    <h3>온도 예측</h3><dl id="dialog-temperatures" class="detail-value-grid"></dl>
+    <h3>기생 정전용량 및 공진</h3><dl id="dialog-electrostatic" class="detail-value-grid"></dl>
     <h3>제약 판정</h3><div id="dialog-checks" class="check-grid"></div>
     <h3>환산 설계값</h3><dl id="dialog-derived" class="detail-value-grid"></dl>
     <details class="raw-parameter-details">
@@ -443,7 +597,22 @@
     </details>
   </dialog>
 
+  <dialog id="sealed-successor-dialog" class="candidate-dialog sealed-successor-dialog">
+    <form method="dialog"><button class="dialog-close" aria-label="닫기">×</button></form>
+    <p class="eyebrow">SEALED SUCCESSOR EVIDENCE · READ ONLY</p>
+    <h2 id="sealed-successor-dialog-title">Sealed successor / FEA pending</h2>
+    <p class="sealed-successor-boundary">이 증거는 canonical Pareto 후보나 terminal FEA 결과가 아닙니다. sealed terminal/Pareto/production/FEA 플래그는 항상 false로 유지하며, Standard-FEA 실행 상태와 결과는 권한 없는 별도 read-only overlay로만 표시합니다.</p>
+    <div id="sealed-successor-dialog-summary" class="dialog-summary"></div>
+    <h3>생명주기·무결성·출처</h3><dl id="sealed-successor-provenance" class="detail-value-grid"></dl>
+    <h3>Standard-FEA validation (read-only overlay)</h3><dl id="sealed-successor-standard-fea" class="detail-value-grid"></dl>
+    <h3>Standard-FEA actual T120 gates</h3><dl id="sealed-successor-standard-fea-temperatures" class="detail-value-grid"></dl>
+    <h3>Robust Llt·공진·목적함수</h3><dl id="sealed-successor-physics" class="detail-value-grid"></dl>
+    <h3>All11 robust 온도</h3><dl id="sealed-successor-temperatures" class="detail-value-grid"></dl>
+    <h3>전체 hard constraint G (≤ 0 PASS)</h3><dl id="sealed-successor-constraints" class="detail-value-grid"></dl>
+    <h3>Decoded geometry</h3><dl id="sealed-successor-geometry" class="parameter-grid"></dl>
+  </dialog>
+
   <div id="loading-indicator" class="loading-indicator" aria-hidden="true"></div>
-  <script src="{{ url_for('static', path='/app.js') }}?v=20260725-campaign-scope-v2" defer></script>
+  <script src="{{ url_for('static', path='/app.js') }}?v=20260725-slurm-allocation-jobs-v2" defer></script>
 </body>
 </html>
