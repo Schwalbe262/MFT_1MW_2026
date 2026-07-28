@@ -24,7 +24,10 @@ from typing import Any
 
 
 EXACT_SOLVER_REVISION = "8a8d90f68e8728669282f586f24304c7cc807029"
-EXACT_SOLVER_BRANCH = "deadline-timk3-k3-20260723"
+# The historical feature ref was intentionally retired after its exact commit
+# was archived.  An empty branch is therefore part of the immutable contract:
+# the authenticated solver must be checked out detached at EXACT_SOLVER_REVISION.
+EXACT_SOLVER_BRANCH = ""
 EXACT_SOLVER_RUNNER_SHA256 = (
     "c3e2b8a2dce2dbf6f87e93723ffabd864702c579db6d2fe9b2f78494b227a14c"
 )

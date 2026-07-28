@@ -95,7 +95,7 @@ ALLOWED_TIM_COOLING_VARIANTS = {
     },
 }
 DEADLINE_LOCAL_GUI_RUNNER_SHA256 = (
-    "4b533c4c945ac63bfd695c02629d7a25f92a7d51dc5737f3616ca200d76c86a0"
+    "fba96fd527279e3750517f993cc815f8ae98b8e35f5d4a983a2e607596b4a550"
 )
 LOCAL_GUI_EXECUTION_PROFILE_VERSION = (
     "deadline-tim-k3-local-gui-exact-fea-profile-v1"
@@ -162,7 +162,7 @@ LOCAL_GUI_PROFILE_ECHO_KEYS = tuple(dict.fromkeys((
 EXPECTED_LOCAL_GUI_SOLVER = {
     "solver_variant": "deadline-tim-k3",
     "solver_revision": EXPECTED_TIM["solver_revision"],
-    "solver_branch": "deadline-timk3-k3-20260723",
+    "solver_branch": "",
     "solver_source_runner_sha256": (
         "c3e2b8a2dce2dbf6f87e93723ffabd864702c579db6d2fe9b2f78494b227a14c"
     ),
