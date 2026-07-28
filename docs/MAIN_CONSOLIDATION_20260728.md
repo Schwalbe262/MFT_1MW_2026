@@ -69,6 +69,20 @@ experiment artifacts, so `git diff --check 4bdf44a..02afd14` reports those
 historical artifact lines. No consolidation commit introduced new whitespace
 errors.
 
+The later GitHub-branch dependency migration was validated separately:
+
+- full pre-hardening integrated run:
+  - top-level `tests`: 1,958 passed, 1 skipped;
+  - `regression_260707`: 926 passed, 48 skipped;
+  - combined: 2,884 passed, 49 skipped, 0 failed;
+- final hardening revision `a0a85e630f44983b4f3afce561813534462388fe`:
+  - directly affected top-level tests: 33 passed;
+  - complete `regression_260707`: 932 passed, 48 skipped, 0 failed;
+  - collection audit: 1,959 top-level and 980 regression tests;
+  - Python compilation and `git diff --check`: passed;
+- baseline parallel logs:
+  `C:\w\mft-git-archives\remote-ref-cleanup-tests-20260728_195547`.
+
 ## Backup and recovery
 
 - Full pre-cleanup bundle:
@@ -87,6 +101,14 @@ errors.
   - SHA256:
     `0bd0d1588999143aab610e36dce51db44e958558625a24186b262c6bf4716b36`
   - `git bundle verify`: complete history, 663 refs
+- Immediate pre-GitHub-branch-deletion bundle:
+  `C:\w\mft-git-archives\MFT_1MW_2026_pre_remote_branch_delete_20260728_201408.bundle`
+  - SHA256:
+    `52a2552024f62ca04d77199a8a5f24c6bbe446c99c985b3e891d1e649897ac9b`
+  - captured remote heads: 73
+  - missing refs: 0
+  - SHA mismatches: 0
+  - `git bundle verify`: passed
 
 ## Local branch and worktree cleanup
 
@@ -101,9 +123,47 @@ branches and 550 registered worktrees at the final cleanup boundary.
 - final attached worktrees: 1 (`main`);
 - six clean `C:\w\mft-main-*` helper worktrees were removed;
 - final registered worktrees: 544 (1 attached, 543 detached);
-- remote feature branches were not deleted or rewritten;
+- at this initial local-cleanup boundary, remote feature branches had not yet
+  been deleted; the subsequent GitHub cleanup is recorded below;
 - data-bearing worktree directories, including simulation and drawing
   results, were not removed.
+
+## GitHub remote branch cleanup
+
+Before remote deletion, three live branch dependencies were removed:
+
+- corrected-thermal submission executor resolution and generated fetches now
+  require exact pushed `refs/heads/main`;
+- corrected-thermal transport bridge plans and fetches now require
+  `refs/heads/main`;
+- the historical production-300 submitter now validates the exact official
+  origin, advertised `main`, clean local `main`, and the pinned solver's
+  ancestry from `main`.
+
+The two old production-300 branch names remain only as immutable strings used
+to authenticate the sealed 2026-07-12 recovery evidence. They are not used by
+live `ls-remote`, fetch, launch, or Scheduler mutation paths.
+
+Deletion gates and outcome:
+
+- GitHub default branch: `main`;
+- open pull requests: 0;
+- protected branches: 0;
+- tracked GitHub workflows: 0;
+- queued/running/attaching Scheduler tasks: 0;
+- deletion dry-run: 72 of 72 targets accepted;
+- deletion mode: one atomic push, explicitly excluding `main`;
+- deleted remote feature branches: 72;
+- final remote heads: 1 (`main`);
+- final remote `main` at deletion:
+  `a0a85e630f44983b4f3afce561813534462388fe`;
+- local branches after helper cleanup: 1 (`main`);
+- registered worktrees: 544 (1 attached, 543 detached).
+
+The production-300 worker's shallow-clone/raw-SHA path was probed before and
+after deletion. After both old refs were absent, a fresh depth-1 clone still
+fetched and checked out
+`b171c7ce5f7a018be6a575a32b1a1f5b7caa980c` exactly.
 
 ## Physical-design authority
 
