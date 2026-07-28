@@ -88,6 +88,11 @@ _WINDING_TEMPERATURE_FAMILIES = (
     "secondary_winding",
 )
 
+_WINDING_TEMPERATURE_FAMILIES = (
+    "primary_winding",
+    "secondary_winding",
+)
+
 # Exact copy of the geometry identity used by the terminal-population
 # exporter.  Keeping the same projection makes generated hashes directly
 # comparable with current NSGA-II physical-geometry hashes.

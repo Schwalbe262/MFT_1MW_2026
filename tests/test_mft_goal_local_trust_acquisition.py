@@ -204,6 +204,12 @@ def test_resonance_residual_preserves_hz_constraint_units(
         (15_000.0 - actual_resonance_hz)
         / local.RESONANCE_CONSTRAINT_SCALE_HZ
     )
+    assert measurement["predicted"]["metrics"]["winding_max_C"] == pytest.approx(
+        118.5
+    )
+    assert measurement["actual"]["metrics"]["winding_max_C"] == pytest.approx(
+        119.0
+    )
 
 
 @pytest.mark.parametrize(
