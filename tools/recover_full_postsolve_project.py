@@ -152,6 +152,20 @@ _THERMAL_MESH_EXPECTED_COUNTS = {
     "thermal_mesh_postsolve_probe_missing_count": 0,
     "thermal_mesh_postsolve_probe_complete": 1,
 }
+_APPROVED_THERMAL_MESH_CONTRACTS = {
+    THERMAL_MESH_POLICY: {
+        "plan_contract_version": THERMAL_MESH_PLAN_CONTRACT_VERSION,
+        "preflight_contract_version": THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION,
+    },
+    # Task 95074 and its sealed recovery fixture were produced before the B7
+    # shared-region cutover.  Authenticate that exact B3 contract without
+    # rewriting the historical row or treating arbitrary old policies as
+    # current production evidence.
+    "b3-rxmain-l5-wcp-pad-padded-regions-v1": {
+        "plan_contract_version": "thermal-mesh-plan-v4",
+        "preflight_contract_version": "thermal-mesh-preflight-v2",
+    },
+}
 _SOURCE_HISTORICAL_THERMAL_POSTSOLVE_COUNTS = {
     "thermal_mesh_postsolve_probe_object_count": 9,
     "thermal_mesh_postsolve_probe_missing_count": 9,
@@ -2804,15 +2818,32 @@ def _validate_thermal_mesh_result(
     """Require candidate-exact static, native, and post-solve mesh evidence."""
     if not isinstance(frame, pd.DataFrame) or len(frame) != 1:
         raise RuntimeError("rebuilt thermal mesh result is not one row")
+    try:
+        mesh_policy = str(frame["thermal_mesh_policy"].iloc[0]).strip()
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "rebuilt thermal mesh policy is unavailable"
+        ) from error
+    mesh_contract = _APPROVED_THERMAL_MESH_CONTRACTS.get(mesh_policy)
+    if mesh_contract is None:
+        raise RuntimeError(
+            "rebuilt thermal result string contract mismatch: "
+            f"thermal_mesh_policy={mesh_policy!r}, "
+            f"expected one of={sorted(_APPROVED_THERMAL_MESH_CONTRACTS)!r}"
+        )
+    plan_contract_version = str(mesh_contract["plan_contract_version"])
+    preflight_contract_version = str(
+        mesh_contract["preflight_contract_version"]
+    )
     for name, expected in (
-        ("thermal_mesh_policy", THERMAL_MESH_POLICY),
+        ("thermal_mesh_policy", mesh_policy),
         (
             "thermal_mesh_plan_contract_version",
-            THERMAL_MESH_PLAN_CONTRACT_VERSION,
+            plan_contract_version,
         ),
         (
             "thermal_mesh_preflight_contract_version",
-            THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION,
+            preflight_contract_version,
         ),
         (
             "thermal_mesh_preflight_status",
@@ -2880,12 +2911,12 @@ def _validate_thermal_mesh_result(
     ]
     if (
         preflight.get("schema")
-        != THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION
+        != preflight_contract_version
         or failed_flags
         or preflight.get("required_objects_missing") != []
         or preflight.get("unmeshed_objects") != []
         or preflight.get("native_errors") != []
-        or preflight.get("mesh_policy") != THERMAL_MESH_POLICY
+        or preflight.get("mesh_policy") != mesh_policy
         or preflight.get("mesh_plan_sha256") != plan_sha256
         or int(preflight.get("fresh_mesh_artifact_count", 0)) < 1
     ):
@@ -3015,11 +3046,9 @@ def _validate_thermal_mesh_result(
             "rebuilt thermal mesh idle/stable-artifact barrier mismatch"
         )
     return {
-        "policy": THERMAL_MESH_POLICY,
-        "plan_contract_version": THERMAL_MESH_PLAN_CONTRACT_VERSION,
-        "preflight_contract_version": (
-            THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION
-        ),
+        "policy": mesh_policy,
+        "plan_contract_version": plan_contract_version,
+        "preflight_contract_version": preflight_contract_version,
         "plan_sha256": plan_sha256,
         "counts": dict(_THERMAL_MESH_EXPECTED_COUNTS),
         "native_generation_passed": True,
