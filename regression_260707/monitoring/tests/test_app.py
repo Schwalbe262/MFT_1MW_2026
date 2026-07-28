@@ -11,6 +11,18 @@ from regression_260707.model_targets import CORE_REGION_TEMPERATURE_TARGETS
 from regression_260707.monitoring.app import create_app
 
 
+def _test_client_with_address(app, *, client, **kwargs):
+    """Supply an ASGI client address on Starlette versions without client=."""
+
+    async def app_with_client_address(scope, receive, send):
+        if scope["type"] in {"http", "websocket"}:
+            scope = dict(scope)
+            scope["client"] = list(client)
+        await app(scope, receive, send)
+
+    return TestClient(app_with_client_address, **kwargs)
+
+
 def test_dashboard_page_and_all_read_only_apis(artifact_service):
     client = TestClient(create_app(service=artifact_service))
     page = client.get("/")
@@ -326,7 +338,7 @@ def test_local_operator_can_set_versioned_drain_simulation_policy(
         "regression_260707.monitoring.app.CAMPAIGN_MUTATION_LOCK_PATH",
         tmp_path / "campaign-mutation.lock",
     )
-    client = TestClient(
+    client = _test_client_with_address(
         create_app(service=artifact_service),
         base_url="http://127.0.0.1:8010",
         client=("127.0.0.1", 51000),
@@ -360,7 +372,7 @@ def test_simulation_policy_control_rejects_csrf_remote_and_invalid_requests(
         tmp_path / "campaign-mutation.lock",
     )
     app = create_app(service=artifact_service)
-    local = TestClient(
+    local = _test_client_with_address(
         app,
         base_url="http://127.0.0.1:8010",
         client=("127.0.0.1", 51001),
@@ -398,7 +410,7 @@ def test_simulation_policy_control_rejects_csrf_remote_and_invalid_requests(
         )
         assert response.status_code == 422
 
-    remote = TestClient(
+    remote = _test_client_with_address(
         app,
         base_url="http://127.0.0.1:8010",
         client=("192.0.2.10", 51002),
@@ -417,7 +429,7 @@ def test_simulation_policy_allows_allowlisted_trusted_lan(
         tmp_path / "campaign-mutation.lock",
     )
     monkeypatch.setenv("MFT_MONITOR_OPERATOR_HOSTS", "monitor.local,192.168.0.37")
-    client = TestClient(
+    client = _test_client_with_address(
         create_app(service=artifact_service),
         base_url="http://192.168.0.37:8010",
         client=("192.168.0.18", 51003),
@@ -446,7 +458,7 @@ def test_simulation_policy_rejects_stale_browser_revision(
         "regression_260707.monitoring.app.CAMPAIGN_MUTATION_LOCK_PATH",
         tmp_path / "campaign-mutation.lock",
     )
-    client = TestClient(
+    client = _test_client_with_address(
         create_app(service=artifact_service),
         base_url="http://127.0.0.1:8010",
         client=("127.0.0.1", 51004),
