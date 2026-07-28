@@ -131,6 +131,21 @@ SCHEDULER_STRICT_NODE_LEGACY_41B_CUTOVER_SHA256 = (
 SCHEDULER_STRICT_NODE_LEGACY_41B_CUTOVER_SCHEMA = (
     "slurm-scheduler-cutover-receipt-v3"
 )
+# These exact goal-contract identities were active when the e542 and 41b
+# strict-node generations were sealed.  They are accepted only to read those
+# historical artifacts; every new plan continues to use the current contract.
+LEGACY_STRICT_GOAL_CONTRACT_SCHEMA = (
+    "mft-goal-20260726-hard-contract-v1"
+)
+LEGACY_STRICT_HARD_SPEC_SHA256 = (
+    "ce1302bd19f3f0dcfda2b86c2906530da95841ac6fa64f7d7e2c59a50468bbbd"
+)
+LEGACY_STRICT_TEMPERATURE_CONTRACT_SHA256 = (
+    "484258f61430d59474c15c72d0804012315e4700312f878a32bbaf492ab0cb01"
+)
+LEGACY_STRICT_FEA_PARAM_KEYSET_SHA256 = (
+    "73c76e4f4dfccca55d6e6db252946bd8011833657cbb8d35a07d49c3199516ad"
+)
 # Only this successor generation may create or submit a new strict retry.
 # The e542 and 41b generations remain accepted solely for authenticating
 # historical plans, submissions, and terminal collections.
@@ -4696,8 +4711,16 @@ def _validate_timeout_retry_record(
     original_plan_path = _recorded_external_file(
         record["original_plan"], "original diagnostic plan"
     )
+    historical_ancestry_scheduler_revision = None
+    if _plan_uses_legacy_strict_goal_contract(plan):
+        historical_ancestry_scheduler_revision = (
+            _plan_strict_node_contract(plan)["scheduler_revision"]
+        )
     original_plan, original_params, original_selected = _load_plan(
-        original_plan_path
+        original_plan_path,
+        historical_ancestry_scheduler_revision=(
+            historical_ancestry_scheduler_revision
+        ),
     )
     if _plan_retry_kind(original_plan) is not None:
         raise HandoffContractError(
@@ -6545,8 +6568,85 @@ def _plan_artifact(root: Path, record: Any, label: str) -> Path:
     return target
 
 
+def _plan_has_legacy_goal_contract_identity(
+    plan: Mapping[str, Any],
+) -> bool:
+    if (
+        plan.get("goal_contract_schema")
+        != LEGACY_STRICT_GOAL_CONTRACT_SCHEMA
+        or plan.get("hard_spec_sha256")
+        != LEGACY_STRICT_HARD_SPEC_SHA256
+        or canonical_sha256(plan.get("hard_spec"))
+        != LEGACY_STRICT_HARD_SPEC_SHA256
+        or plan.get("temperature_contract_sha256")
+        != LEGACY_STRICT_TEMPERATURE_CONTRACT_SHA256
+    ):
+        return False
+    return True
+
+
+def _plan_uses_legacy_strict_goal_contract(
+    plan: Mapping[str, Any],
+) -> bool:
+    if (
+        _plan_retry_kind(plan) != "timeout"
+        or not _plan_has_legacy_goal_contract_identity(plan)
+    ):
+        return False
+    try:
+        scheduler_pin = _strict_node_scheduler_pin(
+            plan.get("scheduler_strict_node_contract")
+        )
+    except HandoffContractError:
+        return False
+    return scheduler_pin["revision"] in {
+        SCHEDULER_STRICT_NODE_LEGACY_E542_REVISION,
+        SCHEDULER_STRICT_NODE_LEGACY_41B_REVISION,
+    }
+
+
+def _plan_uses_accepted_legacy_goal_contract(
+    plan: Mapping[str, Any],
+    *,
+    historical_ancestry_scheduler_revision: str | None,
+) -> bool:
+    if _plan_uses_legacy_strict_goal_contract(plan):
+        return True
+    return (
+        historical_ancestry_scheduler_revision
+        in {
+            SCHEDULER_STRICT_NODE_LEGACY_E542_REVISION,
+            SCHEDULER_STRICT_NODE_LEGACY_41B_REVISION,
+        }
+        and _plan_retry_kind(plan) is None
+        and _plan_has_legacy_goal_contract_identity(plan)
+    )
+
+
+def _plan_goal_contract_is_accepted(
+    plan: Mapping[str, Any],
+    *,
+    historical_ancestry_scheduler_revision: str | None,
+) -> bool:
+    current = (
+        plan.get("goal_contract_schema") == GOAL_CONTRACT_SCHEMA
+        and plan.get("hard_spec") == GOAL_STAGE_SPEC
+        and plan.get("hard_spec_sha256") == GOAL_STAGE_SPEC_SHA256
+        and plan.get("temperature_contract_sha256")
+        == GOAL_TEMPERATURE_CONTRACT_SHA256
+    )
+    return current or _plan_uses_accepted_legacy_goal_contract(
+        plan,
+        historical_ancestry_scheduler_revision=(
+            historical_ancestry_scheduler_revision
+        ),
+    )
+
+
 def _load_plan(
     path: Path,
+    *,
+    historical_ancestry_scheduler_revision: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     resolved = path.resolve(strict=True)
     raw_plan = production._read_json(resolved)
@@ -6580,11 +6680,12 @@ def _load_plan(
     flags = _diagnostic_flags()
     if (
         plan.get("campaign_id") != "mft-goal-20260726"
-        or plan.get("goal_contract_schema") != GOAL_CONTRACT_SCHEMA
-        or plan.get("hard_spec") != GOAL_STAGE_SPEC
-        or plan.get("hard_spec_sha256") != GOAL_STAGE_SPEC_SHA256
-        or plan.get("temperature_contract_sha256")
-        != GOAL_TEMPERATURE_CONTRACT_SHA256
+        or not _plan_goal_contract_is_accepted(
+            plan,
+            historical_ancestry_scheduler_revision=(
+                historical_ancestry_scheduler_revision
+            ),
+        )
         or any(plan.get(name) is not value for name, value in flags.items())
         or plan.get("available_submission_commands") != expected_commands
         or plan.get("physics_override_allowed") is not False
@@ -6599,8 +6700,22 @@ def _load_plan(
     params = production._read_json(
         _plan_artifact(root, plan.get("fea_params"), "diagnostic FEA params")
     )
+    parameter_keys_are_current = set(params) == set(ALL_INPUT_KEYS)
+    accepted_legacy_goal_contract = (
+        _plan_uses_accepted_legacy_goal_contract(
+            plan,
+            historical_ancestry_scheduler_revision=(
+                historical_ancestry_scheduler_revision
+            ),
+        )
+    )
+    parameter_keys_are_sealed_legacy = (
+        accepted_legacy_goal_contract
+        and canonical_sha256(sorted(params))
+        == LEGACY_STRICT_FEA_PARAM_KEYSET_SHA256
+    )
     if (
-        set(params) != set(ALL_INPUT_KEYS)
+        not (parameter_keys_are_current or parameter_keys_are_sealed_legacy)
         or canonical_sha256(params) != plan.get("fea_params_sha256")
     ):
         raise HandoffContractError("diagnostic FEA parameter identity drifted")
@@ -6649,7 +6764,19 @@ def _load_plan(
             operational_pressure_after_timeout_retry
         ),
     )
-    effective = production._effective_params(params, profile)
+    if accepted_legacy_goal_contract:
+        effective = scheduler_client.effective_verification_params(
+            dict(params), dict(profile)
+        )
+        if (
+            canonical_sha256(sorted(effective))
+            != LEGACY_STRICT_FEA_PARAM_KEYSET_SHA256
+        ):
+            raise HandoffContractError(
+                "legacy profile changed sealed FEA parameter schema"
+            )
+    else:
+        effective = production._effective_params(params, profile)
     stage = plan.get("stage")
     if not isinstance(stage, dict):
         raise HandoffContractError("diagnostic Standard stage is absent")
