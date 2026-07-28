@@ -7770,7 +7770,7 @@ class Simulation():
             if label != "loss" or not bool(getattr(
                     self, "loss_native_analyze_required", False)):
                 self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
-                t0 = time.time()
+                t0 = time.monotonic()
                 try:
                     # The original, non-copied design retains PyAEDT's supported
                     # high-level path. Setup.analyze() itself returns None.
@@ -7804,7 +7804,7 @@ class Simulation():
                 except Exception:
                     self._log_recent_aedt_messages(label)
                     raise
-                elapsed = time.time() - t0
+                elapsed = time.monotonic() - t0
                 if getattr(self, "aedt_backend", "standalone") == "pooled":
                     self.solver_may_be_running = False
                 self.save_project()
@@ -7825,7 +7825,7 @@ class Simulation():
             try:
                 dispatch_design = context["odesign"]
                 self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
-                t0 = time.time()
+                t0 = time.monotonic()
                 try:
                     self._record_solver_core_dispatch(label, {
                         "dispatch": "native_analyze_validated_dso",
@@ -7845,7 +7845,7 @@ class Simulation():
                     analyze_result = dispatch_design.Analyze("Setup1", True)
                 except Exception as error:
                     dispatch_error = error
-                elapsed = time.time() - t0
+                elapsed = time.monotonic() - t0
             finally:
                 pending_error = sys.exc_info()[1]
                 try:
