@@ -31,8 +31,10 @@ try:
         _task_index,
         _task_templates,
         _validate_state as validate_v1_state,
+        _validate_previous_successor_state,
     )
     from tier1_final1000_slurm_launch import (
+        PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS,
         REQUIRED_SCHEDULER_FIELDS,
         SUCCESSOR_ACTIVE_QUOTAS,
         validate_launch_plan,
@@ -45,6 +47,7 @@ try:
         validate_chained_predecessor_plan,
         validate_historical_resource_quota_successor_plan,
         validate_predecessor_plan,
+        validate_previous_successor_plan,
     )
     from tier1_final1000_stage_profiles import BY_ID, STAGES, TOTAL_ACTIVE_QUOTA
 except ImportError:  # pragma: no cover - repository import path
@@ -67,8 +70,10 @@ except ImportError:  # pragma: no cover - repository import path
         _task_index,
         _task_templates,
         _validate_state as validate_v1_state,
+        _validate_previous_successor_state,
     )
     from tools.tier1_final1000_slurm_launch import (
+        PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS,
         REQUIRED_SCHEDULER_FIELDS,
         SUCCESSOR_ACTIVE_QUOTAS,
         validate_launch_plan,
@@ -81,6 +86,7 @@ except ImportError:  # pragma: no cover - repository import path
         validate_chained_predecessor_plan,
         validate_historical_resource_quota_successor_plan,
         validate_predecessor_plan,
+        validate_previous_successor_plan,
     )
     from tools.tier1_final1000_stage_profiles import BY_ID, STAGES, TOTAL_ACTIVE_QUOTA
 
@@ -252,6 +258,19 @@ def _stored_v1_task(entry: Mapping[str, Any]) -> dict[str, Any]:
     return copy.deepcopy(task)
 
 
+def _validate_upgrade_plan(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Authenticate either the current plan or its exact sealed predecessor."""
+
+    try:
+        return validate_launch_plan(value)
+    except RuntimeError:
+        # The live-v3 ledger is immutable evidence from the immediately prior
+        # 200/160/90/50 release.  Keep that narrow validator available for
+        # read-only upgrade/restart without replaying the current science
+        # template or accepting an unsealed arbitrary legacy plan.
+        return validate_previous_successor_plan(value)
+
+
 def upgrade_v1_state(
     v1_state: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -265,10 +284,16 @@ def upgrade_v1_state(
 ) -> dict[str, Any]:
     """Create a mixed v1/v2 ledger without changing or cancelling a v1 lane."""
 
-    plan = validate_launch_plan(plan)
-    validated_source_plan = validate_launch_plan(source_plan or plan)
+    plan = _validate_upgrade_plan(plan)
+    validated_source_plan = _validate_upgrade_plan(source_plan or plan)
     if allow_chained_shadow:
         v1_state = _validate_chained_shadow_state(v1_state, validated_source_plan)
+    elif validated_source_plan.get("open_ended_refill", {}).get(
+        "stage_active_quotas"
+    ) == PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS:
+        v1_state = _validate_previous_successor_state(
+            v1_state, validated_source_plan
+        )
     else:
         v1_state = validate_v1_state(v1_state, validated_source_plan)
     if int(batch_length) not in PHASE_A_OPERATIONAL_BATCH_LENGTHS:
@@ -401,7 +426,7 @@ def upgrade_v1_state(
 
 
 def validate_state(value: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str, Any]:
-    plan = validate_launch_plan(plan)
+    plan = _validate_upgrade_plan(plan)
     unsigned = {key: item for key, item in value.items() if key != "state_sha256"}
     entries = value.get("entries")
     next_seeds = value.get("next_seed_by_stage")
