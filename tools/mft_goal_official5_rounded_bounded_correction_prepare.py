@@ -205,6 +205,33 @@ read_json = rounded.read_json
 write_immutable_json = rounded.write_immutable_json
 sha256_file = rounded.sha256_file
 
+LEGACY_REPAIR_SOURCE_REVISION = (
+    "441a29dea9daccc88fd6f0c2955f4e8c43113f07"
+)
+LEGACY_REPAIR_PREFLIGHT_BLOB_SHA256 = (
+    "913dfe67a194508deb56e5c0fd105c5795039deb70242fc8d9edfc1aebfe42cb"
+)
+LEGACY_REPAIR_COMPATIBILITY = {
+    "schema_version": (
+        "mft-goal-rounded-bounded-correction-legacy-repair-v1"
+    ),
+    "source_revision": LEGACY_REPAIR_SOURCE_REVISION,
+    "source_preflight_blob_sha256": (
+        LEGACY_REPAIR_PREFLIGHT_BLOB_SHA256
+    ),
+    "repair_projection": (
+        "pre-geometry-profile goal repair; project wh2 only"
+    ),
+    "geometry_constraint_profile": None,
+    "current_goal_factory_default_mutated": False,
+    "repair_decoder_only": True,
+    "launch_eligible": False,
+    "scheduler_mutation_allowed": False,
+}
+LEGACY_REPAIR_COMPATIBILITY_SHA256 = payload_sha256(
+    LEGACY_REPAIR_COMPATIBILITY
+)
+
 
 def _finite(value: Any, label: str) -> float:
     if isinstance(value, bool):
@@ -786,6 +813,60 @@ class _RepairBase:
         )
 
 
+def _activate_legacy_repair_compatibility(problem: Any) -> Any:
+    """Restore only the repair projection sealed by commit 441a29d."""
+
+    official = goal_repair.GOAL_OFFICIAL_GEOMETRY_CONSTRAINT_PROFILE
+    observed = getattr(problem, "geometry_constraint_profile", None)
+    if (
+        getattr(problem, "goal_campaign", None) is not True
+        or getattr(problem, "stage_spec", None) != GOAL_STAGE_SPEC
+        or getattr(problem, "fixed_primary_turns", None)
+        != FROZEN_TOPOLOGY["N1_main"]
+        or observed != official
+        or observed.get("primary_axial_clearance", {}).get("minimum_mm")
+        != 40.0
+        or getattr(problem, "geometry_constraint_profile_sha256", None)
+        != official["sha256"]
+    ):
+        raise ContractError(
+            "current official geometry profile is not the reviewed 40 mm "
+            "factory default"
+        )
+    problem.geometry_constraint_profile = None
+    problem.geometry_constraint_profile_sha256 = None
+    problem.launch_eligible = False
+    problem.legacy_repair_compatibility = copy.deepcopy(
+        LEGACY_REPAIR_COMPATIBILITY
+    )
+    problem.legacy_repair_compatibility_sha256 = (
+        LEGACY_REPAIR_COMPATIBILITY_SHA256
+    )
+    return _require_legacy_repair_compatibility(problem)
+
+
+def _require_legacy_repair_compatibility(problem: Any) -> Any:
+    compatibility = getattr(
+        problem, "legacy_repair_compatibility", None
+    )
+    if (
+        compatibility != LEGACY_REPAIR_COMPATIBILITY
+        or payload_sha256(compatibility)
+        != LEGACY_REPAIR_COMPATIBILITY_SHA256
+        or getattr(problem, "legacy_repair_compatibility_sha256", None)
+        != LEGACY_REPAIR_COMPATIBILITY_SHA256
+        or getattr(problem, "geometry_constraint_profile", object())
+        is not None
+        or getattr(problem, "geometry_constraint_profile_sha256", object())
+        is not None
+        or getattr(problem, "launch_eligible", None) is not False
+    ):
+        raise ContractError(
+            "sealed legacy repair compatibility is absent or drifted"
+        )
+    return problem
+
+
 def exact_goal_repair_problem(
     *,
     core_lamination_factor: float,
@@ -813,7 +894,7 @@ def exact_goal_repair_problem(
     problem.spec["core_lamination_factor"] = _finite(
         core_lamination_factor, "core lamination factor"
     )
-    return problem
+    return _activate_legacy_repair_compatibility(problem)
 
 
 def _same_number(left: Any, right: Any) -> bool:
@@ -831,6 +912,7 @@ def attest_anchor_replay(
     anchor_coordinate: Sequence[float],
     base_params: Mapping[str, Any],
 ) -> tuple[pd.Series, dict[str, Any]]:
+    _require_legacy_repair_compatibility(problem)
     coordinate = np.asarray(anchor_coordinate, dtype=float)
     repaired = np.asarray(
         problem.repair_unit_coordinates(coordinate), dtype=float
@@ -946,6 +1028,7 @@ def generate_exact_templates(
     base_params: Mapping[str, Any],
     profile: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
+    _require_legacy_repair_compatibility(problem)
     base = np.asarray(anchor_coordinate, dtype=float)
     output: list[dict[str, Any]] = []
     seen: set[str] = set()

@@ -143,6 +143,15 @@ def test_exact_anchor_replay_and_legacy_path_rejection() -> None:
     problem = correction.exact_goal_repair_problem(
         core_lamination_factor=0.85
     )
+    assert problem.geometry_constraint_profile is None
+    assert problem.geometry_constraint_profile_sha256 is None
+    assert problem.launch_eligible is False
+    assert problem.legacy_repair_compatibility == (
+        correction.LEGACY_REPAIR_COMPATIBILITY
+    )
+    assert problem.legacy_repair_compatibility_sha256 == (
+        correction.LEGACY_REPAIR_COMPATIBILITY_SHA256
+    )
 
     row, evidence = correction.attest_anchor_replay(
         problem=problem,
@@ -170,6 +179,25 @@ def test_exact_anchor_replay_and_legacy_path_rejection() -> None:
         "sealed_candidate": 1.13,
         "legacy_raw_decode": 4.55,
     }
+
+
+def test_legacy_repair_compatibility_fails_closed_on_profile_drift() -> None:
+    problem = correction.exact_goal_repair_problem(
+        core_lamination_factor=0.85
+    )
+    problem.geometry_constraint_profile = copy.deepcopy(
+        correction.goal_repair.GOAL_OFFICIAL_GEOMETRY_CONSTRAINT_PROFILE
+    )
+
+    with pytest.raises(
+        correction.ContractError,
+        match="legacy repair compatibility",
+    ):
+        correction.attest_anchor_replay(
+            problem=problem,
+            anchor_coordinate=ANCHOR_UNIT,
+            base_params=_base_params(),
+        )
 
 
 def test_a_b_c_d_templates_use_exact_goal_repair_and_frozen_contract() -> None:
