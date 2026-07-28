@@ -409,6 +409,8 @@ def _v2_receipt(adapter: dict, *, repair_ready: bool) -> dict:
         "hard_constraint_contract_sha256": (
             generation_adapter.CURRENT_STAGE_HARD_CONTRACT_SHA256
         ),
+        "geometry_constraint_profile": None,
+        "geometry_constraint_profile_sha256": None,
         "constraint_names": list(generation_preflight.CURRENT7_CONSTRAINT_NAMES),
         "constraint_count": len(generation_preflight.CURRENT7_CONSTRAINT_NAMES),
         "base_constraint_count": len(generation_preflight.BASE_CONSTRAINT_NAMES),
@@ -417,6 +419,8 @@ def _v2_receipt(adapter: dict, *, repair_ready: bool) -> dict:
         ),
         "base_secondary_vertical_insulation_retained": True,
         "minimum_physical_insulation_is_authoritative_superset": True,
+        "primary_axial_clearance_h_gap1_included": True,
+        "winding_height_alignment_mode": "off",
         "variable_cooling_dimensions": list(
             generation_preflight.VARIABLE_COOLING_DIMENSIONS
         ),
