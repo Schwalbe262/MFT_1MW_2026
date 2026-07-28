@@ -56,6 +56,70 @@ def _task(contract: collector.Contract, *, status: str, exit_code: int | None):
     }
 
 
+def test_tracked_blob_fallback_requires_a_clean_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sealed = tmp_path / "sealed.json"
+    sealed.write_text('{"checkout":"projection"}\n', encoding="utf-8")
+    expected = hashlib.sha256(b'{"sealed":"blob"}\n').hexdigest()
+
+    monkeypatch.setattr(
+        collector,
+        "_verify_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            collector.CollectorError("checkout drift")
+        ),
+    )
+    monkeypatch.setattr(
+        collector.subprocess,
+        "run",
+        lambda *_args, **_kwargs: collector.subprocess.CompletedProcess(
+            _args[0], 1, stdout=b"", stderr=b"dirty"
+        ),
+    )
+
+    with pytest.raises(collector.CollectorError, match="checkout drift"):
+        collector._verify_tracked_file(tmp_path, sealed, expected)
+
+
+def test_tracked_blob_fallback_reads_only_the_exact_head_blob(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sealed = tmp_path / "sealed.json"
+    sealed.write_text('{"checkout":"projection"}\n', encoding="utf-8")
+    payload = b'{"sealed":"blob"}\n'
+    expected = hashlib.sha256(payload).hexdigest()
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        collector,
+        "_verify_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            collector.CollectorError("checkout drift")
+        ),
+    )
+
+    def run(command: list[str], **_kwargs: Any):
+        calls.append(command)
+        return collector.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=payload if command[-2] == "show" else b"",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(collector.subprocess, "run", run)
+
+    assert collector._verify_tracked_file(tmp_path, sealed, expected) == payload
+    assert calls[0][-5:] == ["diff", "--quiet", "HEAD", "--", "sealed.json"]
+    assert calls[1][-2:] == ["show", "HEAD:sealed.json"]
+    assert any(
+        item == f"safe.directory={tmp_path.as_posix()}" for item in calls[0]
+    )
+
+
 class FakeGetClient:
     def __init__(self, task: dict[str, Any], task_sh: bytes):
         self.task = task

@@ -31,6 +31,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import subprocess
 import sys
 import time
 from typing import Any, Mapping
@@ -116,6 +117,48 @@ def _verify_file(path: Path, expected_sha256: str) -> bytes:
             f"sealed local file drifted: {path}: {observed} != {expected_sha256}"
         )
     return data
+
+
+def _verify_tracked_file(
+    repo_root: Path,
+    path: Path,
+    expected_sha256: str,
+) -> bytes:
+    """Read one exact sealed blob despite a clean CRLF checkout projection."""
+
+    try:
+        return _verify_file(path, expected_sha256)
+    except CollectorError as checkout_error:
+        try:
+            root = repo_root.resolve(strict=True)
+            resolved = path.resolve(strict=True)
+            relative = resolved.relative_to(root).as_posix()
+        except (OSError, ValueError) as error:
+            raise checkout_error from error
+        if path.is_symlink():
+            raise checkout_error
+        git_prefix = [
+            "git",
+            "-c",
+            f"safe.directory={root.as_posix()}",
+            "-C",
+            str(root),
+        ]
+        clean = subprocess.run(
+            [*git_prefix, "diff", "--quiet", "HEAD", "--", relative],
+            check=False,
+            capture_output=True,
+        )
+        if clean.returncode != 0:
+            raise checkout_error
+        blob = subprocess.run(
+            [*git_prefix, "show", f"HEAD:{relative}"],
+            check=False,
+            capture_output=True,
+        )
+        if blob.returncode != 0 or _sha256(blob.stdout) != expected_sha256:
+            raise checkout_error
+        return blob.stdout
 
 
 def _verify_embedded_digest(
@@ -351,7 +394,7 @@ def _full_contract(repo_root: Path) -> Contract:
     local: dict[str, dict[str, Any]] = {}
     parsed: dict[str, dict[str, Any]] = {}
     for label, (path, digest) in paths.items():
-        data = _verify_file(path, digest)
+        data = _verify_tracked_file(repo_root, path, digest)
         value = json.loads(data)
         if not isinstance(value, dict):
             raise CollectorError(f"Full {label} root is not an object")
