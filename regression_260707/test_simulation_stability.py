@@ -3224,11 +3224,30 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
                 module = getattr(self, "_oanalysis", None)
                 return list(module.GetSetups()) if module else []
 
+        setup_props = {
+            "Enabled": enabled,
+            "Flow Regime": "Turbulent",
+            "Convergence Criteria - Max Iterations": 250,
+            "Convergence Criteria - Flow": "0.001",
+            "Convergence Criteria - Energy": "1e-07",
+            "Solution Initialization - Use Model Based Flow Initialization": False,
+            "Under-relaxation - Pressure": "0.7",
+            "Sequential Solve of Flow and Energy Equations": False,
+            "Include Gravity": False,
+        }
+        native_setup_child = SimpleNamespace(
+            GetPropNames=Mock(return_value=list(setup_props)),
+            GetPropValue=Mock(side_effect=setup_props.__getitem__),
+        )
+        native_analysis_child = SimpleNamespace(
+            GetChildObject=Mock(return_value=native_setup_child),
+        )
         analysis = SimpleNamespace(GetSetups=Mock(return_value=list(setups)))
         native_design = SimpleNamespace(
             GetName=Mock(return_value="icepak_thermal"),
             GetDesignType=Mock(return_value="Icepak"),
             GetModule=Mock(return_value=analysis),
+            GetChildObject=Mock(return_value=native_analysis_child),
         )
         native_project = SimpleNamespace(
             GetName=Mock(return_value="simulation_test"),
@@ -3290,11 +3309,9 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             aedt_native_solve_window=lambda: nullcontext(),
             aedt_automation_transaction=lambda: nullcontext(),
         )
-        setup = SimpleNamespace(name="ThermalSetup", props={
-            "Enabled": enabled,
-            "Convergence Criteria - Flow": "0.001",
-            "Convergence Criteria - Energy": "1e-07",
-        })
+        setup = SimpleNamespace(
+            name="ThermalSetup", props=dict(setup_props)
+        )
         return simulation, ipk, setup, analyze, rebind
 
     def test_stale_pyaedt_analysis_cache_is_rebound_before_native_dispatch(self):
@@ -3310,7 +3327,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             # the requested name is absent from its cached setup_names.
             self.assertEqual(
                 (cores, tasks, gpus, use_auto_settings),
-                (4, 4, 0, False),
+                (4, 1, 0, False),
             )
             if setup in native_solver.setup_names:
                 return native_solver._odesign.Analyze(setup, blocking)
@@ -3358,7 +3375,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             )
 
         analyze.assert_called_once_with(
-            setup="ThermalSetup", cores=4, tasks=4, gpus=0,
+            setup="ThermalSetup", cores=4, tasks=1, gpus=0,
             use_auto_settings=False, blocking=True
         )
         rebind.assert_called_once_with()
@@ -3487,7 +3504,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             self.assertEqual(call.kwargs, {
                 "setup": "ThermalSetup",
                 "cores": 4,
-                "tasks": 4,
+                "tasks": 1,
                 "gpus": 0,
                 "use_auto_settings": False,
                 "blocking": True,
@@ -3526,7 +3543,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             )
 
         analyze.assert_called_once_with(
-            setup="ThermalSetup", cores=4, tasks=4, gpus=0,
+            setup="ThermalSetup", cores=4, tasks=1, gpus=0,
             use_auto_settings=False, blocking=True
         )
         rebind.assert_called_once_with()
@@ -3583,7 +3600,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             )
 
         analyze.assert_called_once_with(
-            setup="ThermalSetup", cores=4, tasks=4, gpus=0,
+            setup="ThermalSetup", cores=4, tasks=1, gpus=0,
             use_auto_settings=False, blocking=True
         )
         rebind.assert_called_once_with()
