@@ -62,10 +62,11 @@ def test_active_truth_cards_publish_current_contract_and_boundaries(tmp_path):
 
     rendered = json.dumps(cards, ensure_ascii=False)
     assert "1200×900×750" in rendered
-    assert "gap2 0.350" in rendered
-    assert "1차≤110°C" in rendered
-    assert "2차≤130°C" in rendered
-    assert "20T/20T" in rendered
+    assert "gap2 0.35-2.00" in rendered
+    assert "gap2=0.350" in rendered
+    assert "temperature_C: primary<=110 / secondary<=130 / core<=130" in rendered
+    assert "core cooling plate thickness=20.0mm exactly" in rendered
+    assert "winding cold-plate thickness=20.0mm exactly" in rendered
     assert "LOGICAL 0" in rendered
     assert "ATTEMPTS 0" in rendered
     assert "RAW 2-NET METRIC IS PROVISIONAL" in rendered
