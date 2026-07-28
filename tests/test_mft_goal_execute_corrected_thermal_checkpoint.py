@@ -741,6 +741,15 @@ def test_retained_output_quota_admission_accounts_for_clone_and_growth(
         ),
         raising=False,
     )
+    monkeypatch.setattr(
+        executor.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(
+            total=400 * gib,
+            used=100 * gib,
+            free=300 * gib,
+        ),
+    )
     result = executor.admit_retained_output_storage(
         authenticated, plan, tmp_path / "scratch"
     )
@@ -754,6 +763,45 @@ def test_retained_output_quota_admission_accounts_for_clone_and_growth(
     assert result["scratch_required_bytes"] > (
         executor.MINIMUM_SCRATCH_WORKING_SHADOW_BYTES
     )
+
+
+def test_retained_output_quota_rejects_insufficient_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint, _manifest = _checkpoint(tmp_path)
+    authenticated = executor.authenticate_checkpoint(checkpoint)
+    plan_path = _execution_plan(tmp_path / "plan.json", authenticated)
+    plan = executor.authenticate_execution_plan(plan_path, authenticated)
+    gib = 1024**3
+    monkeypatch.setattr(
+        executor.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(
+            f_bavail=100 * gib // 4096,
+            f_frsize=4096,
+            f_flag=0,
+            f_fsid=authenticated["filesystem_evidence"]["after_copy"][
+                "fsid"
+            ],
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        executor.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(
+            total=400 * gib,
+            used=144 * gib,
+            free=256 * gib,
+        ),
+    )
+
+    with pytest.raises(
+        executor.ContinuationError, match="scratch is insufficient"
+    ):
+        executor.admit_retained_output_storage(
+            authenticated, plan, tmp_path / "scratch"
+        )
 
 
 @pytest.mark.parametrize(
@@ -789,6 +837,16 @@ def test_retained_output_statvfs_fails_closed(
             f_fsid=expected_fsid + fsid_delta,
         ),
         raising=False,
+    )
+    gib = 1024**3
+    monkeypatch.setattr(
+        executor.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(
+            total=400 * gib,
+            used=100 * gib,
+            free=300 * gib,
+        ),
     )
     with pytest.raises(executor.ContinuationError, match=message):
         executor.admit_retained_output_storage(
