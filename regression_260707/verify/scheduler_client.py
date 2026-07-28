@@ -50,9 +50,12 @@ MFT_PROJECT_MAX_ACTIVE_TASKS = 300
 MFT_PROJECT_MAX_ACTIVE_TASKS_CEILING = 600
 MFT_ACTIVE_STATUSES = ("queued", "attaching", "running")
 LEGACY_MFT_NAME_PREFIX = "mft-"
+MFT_SOLVER_REPOSITORY_URL = (
+    "https://github.com/Schwalbe262/MFT_1MW_2026.git"
+)
 MFT_PROJECT_REPOS = [
     {
-        "url": "https://github.com/Schwalbe262/MFT_1MW_2026.git",
+        "url": MFT_SOLVER_REPOSITORY_URL,
         "ref": "main",
         "subdir": "MFT_1MW_2026",
     },
@@ -1678,7 +1681,7 @@ def _submit_verification_locked(
         + f"mkdir -p {quoted_workdir} && "
         + lib_clone
         + f"([ -d {quoted_repo}/.git ] || git clone -q --depth 1 "
-          f"https://github.com/Schwalbe262/MFT_1MW_2026.git {quoted_repo}) && "
+          f"{MFT_SOLVER_REPOSITORY_URL} {quoted_repo}) && "
         + f"cd {quoted_repo} && git fetch -q origin {solver_revision} && "
         + f"git checkout -q --detach {solver_revision} && "
         + "git diff --quiet HEAD -- && git clean -q -ffd && git clean -q -ffdX && "

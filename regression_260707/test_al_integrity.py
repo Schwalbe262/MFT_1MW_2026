@@ -911,10 +911,18 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             f"{TEST_LIBRARY_REVISION}", command)
         self.assertIn(f"MFT_LIBRARY_GIT_HASH {TEST_LIBRARY_REVISION}", command)
         self.assertIn(
+            "git clone -q --depth 1 "
+            f"{scheduler_client.MFT_SOLVER_REPOSITORY_URL} "
+            '"${MFT_WORKDIR}/repo"',
+            command,
+        )
+        self.assertIn(
             f"cd \"${{MFT_WORKDIR}}/repo\" && git fetch -q origin {TEST_REVISION}",
             command)
         self.assertIn(f"git checkout -q --detach {TEST_REVISION}", command)
         self.assertIn(f'test "$(git rev-parse HEAD)" = "{TEST_REVISION}"', command)
+        self.assertNotIn("refs/heads/fix/mft-rx-block-fastpath-260712", command)
+        self.assertNotIn("refs/heads/stabilize/mft-sim-260710", command)
         self.assertIn("git diff --quiet HEAD -- && git clean -q -ffd", command)
         self.assertIn("git clean -q -ffdX", command)
         self.assertLess(

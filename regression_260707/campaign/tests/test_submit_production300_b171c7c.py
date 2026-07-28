@@ -31,6 +31,36 @@ class Production300RemoteRefCompatibilityTests(unittest.TestCase):
             planner.HISTORICAL_RECOVERY_SOLVER_DEPLOYMENT_REFS,
         )
 
+    def test_solver_origin_contract_matches_project_and_worker_clone(self):
+        self.assertEqual(
+            submitter.OFFICIAL_SOLVER_ORIGIN_URL,
+            submitter.scheduler_client.MFT_SOLVER_REPOSITORY_URL,
+        )
+        self.assertEqual(
+            submitter.scheduler_client.MFT_PROJECT_REPOS[0],
+            submitter.EXPECTED_SOLVER_PROJECT_REPOSITORY,
+        )
+
+    def test_solver_origin_contract_drift_fails_before_git_or_network(self):
+        drifted = [
+            {
+                **submitter.EXPECTED_SOLVER_PROJECT_REPOSITORY,
+                "ref": "integration/mft-goal-20260726",
+            }
+        ]
+        with mock.patch.object(
+            submitter.scheduler_client, "MFT_PROJECT_REPOS", drifted
+        ), mock.patch.object(
+            submitter, "_git"
+        ) as git, mock.patch.object(
+            submitter.deployment_gate, "advertised_heads"
+        ) as advertised:
+            with self.assertRaisesRegex(RuntimeError, "repository contract drifted"):
+                submitter._require_solver_main_deployment(CAMPAIGN_DIR)
+
+        git.assert_not_called()
+        advertised.assert_not_called()
+
     def test_clean_solver_deployment_root_selects_current_main(self):
         main_head = "c" * 40
         with tempfile.TemporaryDirectory() as tmp:
@@ -56,7 +86,7 @@ class Production300RemoteRefCompatibilityTests(unittest.TestCase):
                     return main_head
                 if args == ("symbolic-ref", "--quiet", "HEAD"):
                     return submitter.CURRENT_SOLVER_DEPLOYMENT_REF
-                if args == ("status", "--porcelain", "--untracked-files=no"):
+                if args == ("status", "--porcelain", "--untracked-files=all"):
                     return ""
                 raise AssertionError((repo, args))
 
@@ -66,10 +96,42 @@ class Production300RemoteRefCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(selected, main.resolve())
 
+    def test_clean_solver_deployment_root_rejects_untracked_contamination(self):
+        main_head = "c" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp) / "main"
+            records = (
+                f"worktree {main}\nHEAD {main_head}\n"
+                f"branch {submitter.CURRENT_SOLVER_DEPLOYMENT_REF}\n"
+            )
+
+            def fake_git(_repo, *args):
+                if args == (
+                    "rev-parse",
+                    submitter.CURRENT_SOLVER_DEPLOYMENT_REF,
+                ):
+                    return main_head
+                if args == ("worktree", "list", "--porcelain"):
+                    return records
+                if args == ("rev-parse", "HEAD"):
+                    return main_head
+                if args == ("symbolic-ref", "--quiet", "HEAD"):
+                    return submitter.CURRENT_SOLVER_DEPLOYMENT_REF
+                if args == ("status", "--porcelain", "--untracked-files=all"):
+                    return "?? regression_260707/scheduler_client.py"
+                raise AssertionError(args)
+
+            with mock.patch.dict(submitter.os.environ, {}, clear=True), \
+                    mock.patch.object(submitter, "_git", side_effect=fake_git):
+                with self.assertRaisesRegex(RuntimeError, "no clean exact-main"):
+                    submitter._clean_solver_deployment_root()
+
     def test_solver_deployment_requires_pinned_revision_in_main_history(self):
         main_head = "c" * 40
 
         def fake_git(_repo, *args):
+            if args == ("remote", "get-url", "--all", "origin"):
+                return submitter.OFFICIAL_SOLVER_ORIGIN_URL
             if args == ("rev-parse", "HEAD"):
                 return main_head
             if args == (
@@ -93,11 +155,78 @@ class Production300RemoteRefCompatibilityTests(unittest.TestCase):
         )
         self.assertEqual(deployed["advertised_ref_head"], main_head)
         self.assertEqual(deployed["revision"], submitter.SOLVER)
+        self.assertEqual(
+            deployed["origin_url"], submitter.OFFICIAL_SOLVER_ORIGIN_URL
+        )
+
+    def test_solver_deployment_fails_before_network_for_wrong_origin(self):
+        wrong_origins = (
+            "https://github.com/Schwalbe262/MFT_1MW_2026",
+            "git@github.com:Schwalbe262/MFT_1MW_2026.git",
+            "https://github.com/fork/MFT_1MW_2026.git",
+        )
+        for wrong_origin in wrong_origins:
+            with self.subTest(origin=wrong_origin), mock.patch.object(
+                submitter, "_git", return_value=wrong_origin
+            ) as git, mock.patch.object(
+                submitter.deployment_gate, "advertised_heads"
+            ) as advertised, mock.patch.object(
+                submitter.requests, "get"
+            ) as scheduler_get, mock.patch.object(
+                submitter.requests, "post"
+            ) as scheduler_post, mock.patch.object(
+                submitter.scheduler_client, "submit_verification"
+            ) as submit:
+                with self.assertRaisesRegex(RuntimeError, "exact worker repository"):
+                    submitter._require_solver_main_deployment(CAMPAIGN_DIR)
+
+                git.assert_called_once_with(
+                    CAMPAIGN_DIR.resolve(),
+                    "remote",
+                    "get-url",
+                    "--all",
+                    "origin",
+                )
+                advertised.assert_not_called()
+                scheduler_get.assert_not_called()
+                scheduler_post.assert_not_called()
+                submit.assert_not_called()
+
+    def test_solver_deployment_fails_for_stale_local_main_without_mutation(self):
+        advertised_main = "c" * 40
+
+        def fake_git(_repo, *args):
+            if args == ("remote", "get-url", "--all", "origin"):
+                return submitter.OFFICIAL_SOLVER_ORIGIN_URL
+            if args == ("rev-parse", "HEAD"):
+                return "d" * 40
+            raise AssertionError(args)
+
+        with mock.patch.object(
+            submitter.deployment_gate,
+            "advertised_heads",
+            return_value={
+                submitter.CURRENT_SOLVER_DEPLOYMENT_REF: advertised_main
+            },
+        ), mock.patch.object(
+            submitter, "_git", side_effect=fake_git
+        ), mock.patch.object(
+            submitter.requests, "post"
+        ) as scheduler_post, mock.patch.object(
+            submitter.scheduler_client, "submit_verification"
+        ) as submit:
+            with self.assertRaisesRegex(RuntimeError, "local main.*stale"):
+                submitter._require_solver_main_deployment(CAMPAIGN_DIR)
+
+        scheduler_post.assert_not_called()
+        submit.assert_not_called()
 
     def test_solver_deployment_fails_when_pinned_revision_left_main(self):
         main_head = "c" * 40
 
         def fake_git(_repo, *args):
+            if args == ("remote", "get-url", "--all", "origin"):
+                return submitter.OFFICIAL_SOLVER_ORIGIN_URL
             if args == ("rev-parse", "HEAD"):
                 return main_head
             if args[0:2] == ("merge-base", "--is-ancestor"):
@@ -119,10 +248,55 @@ class Production300RemoteRefCompatibilityTests(unittest.TestCase):
             return_value={
                 "refs/heads/fix/mft-rx-block-fastpath-260712": submitter.SOLVER
             },
-        ), mock.patch.object(submitter, "_git") as git:
+        ), mock.patch.object(
+            submitter,
+            "_git",
+            return_value=submitter.OFFICIAL_SOLVER_ORIGIN_URL,
+        ) as git:
             with self.assertRaisesRegex(RuntimeError, "advertise.*main"):
                 submitter._require_solver_main_deployment(CAMPAIGN_DIR)
-        git.assert_not_called()
+        git.assert_called_once_with(
+            CAMPAIGN_DIR.resolve(), "remote", "get-url", "--all", "origin"
+        )
+
+    def test_execute_deployment_failure_precedes_lock_and_scheduler_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate_path = Path(tmp) / "terminal-gate.json"
+            gate_path.write_text("{}\n", encoding="utf-8")
+            bundle = {"recovery_submission": {"tasks": []}}
+            with mock.patch.object(submitter, "GATE_PATH", gate_path), \
+                    mock.patch.object(
+                        submitter, "static_audit", return_value=bundle
+                    ), mock.patch.object(
+                        submitter,
+                        "_load_gate",
+                        return_value={"gate_sha256": "a" * 64},
+                    ), mock.patch.object(
+                        submitter,
+                        "deployment_audit",
+                        side_effect=RuntimeError("clean local main deployment is stale"),
+                    ) as deployment, mock.patch.object(
+                        submitter.scheduler_client, "campaign_mutation_lock"
+                    ) as lock, mock.patch.object(
+                        submitter.requests, "get"
+                    ) as scheduler_get, mock.patch.object(
+                        submitter.requests, "post"
+                    ) as scheduler_post, mock.patch.object(
+                        submitter.scheduler_client, "submit_verification"
+                    ) as submit:
+                with self.assertRaisesRegex(RuntimeError, "local main.*stale"):
+                    submitter.execute(
+                        submitter.PLAN_PATH,
+                        submitter.PLAN_SHA256,
+                        gate_path,
+                        "a" * 64,
+                    )
+
+        deployment.assert_called_once_with()
+        lock.assert_not_called()
+        scheduler_get.assert_not_called()
+        scheduler_post.assert_not_called()
+        submit.assert_not_called()
 
 
 @unittest.skip(
@@ -215,7 +389,7 @@ class Production300SubmitterTests(unittest.TestCase):
                     return main_head
                 if args == ("symbolic-ref", "--quiet", "HEAD"):
                     return submitter.CURRENT_SOLVER_DEPLOYMENT_REF
-                if args == ("status", "--porcelain", "--untracked-files=no"):
+                if args == ("status", "--porcelain", "--untracked-files=all"):
                     return ""
                 raise AssertionError((repo, args))
 
@@ -246,7 +420,7 @@ class Production300SubmitterTests(unittest.TestCase):
                     return main_head
                 if args == ("symbolic-ref", "--quiet", "HEAD"):
                     return submitter.CURRENT_SOLVER_DEPLOYMENT_REF
-                if args == ("status", "--porcelain", "--untracked-files=no"):
+                if args == ("status", "--porcelain", "--untracked-files=all"):
                     return " M user.ipynb"
                 raise AssertionError((repo, args))
 

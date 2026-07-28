@@ -86,6 +86,14 @@ SEALED_OLD_MANIFEST_PROVENANCE_PATH = (
     r"\replacement-s754923c-le6b9b9d-seed260710-cursor1843.json")
 LIBRARY_ROOT = REPO_ROOT.parent / "pyaedt_library_mft_clean"
 CURRENT_SOLVER_DEPLOYMENT_REF = "refs/heads/main"
+OFFICIAL_SOLVER_ORIGIN_URL = (
+    "https://github.com/Schwalbe262/MFT_1MW_2026.git"
+)
+EXPECTED_SOLVER_PROJECT_REPOSITORY = {
+    "url": OFFICIAL_SOLVER_ORIGIN_URL,
+    "ref": "main",
+    "subdir": "MFT_1MW_2026",
+}
 LIBRARY_REFS = ("refs/heads/pyaedt_022",)
 
 COUNT = 300
@@ -187,6 +195,18 @@ def _git(repo, *args):
     ).strip()
 
 
+def _require_worker_solver_repository_contract():
+    """Keep the audit remote identical to the Scheduler worker clone remote."""
+
+    repos = scheduler_client.MFT_PROJECT_REPOS
+    if scheduler_client.MFT_SOLVER_REPOSITORY_URL != OFFICIAL_SOLVER_ORIGIN_URL \
+            or not isinstance(repos, list) \
+            or not repos \
+            or repos[0] != EXPECTED_SOLVER_PROJECT_REPOSITORY:
+        raise RuntimeError("worker solver repository contract drifted")
+    return OFFICIAL_SOLVER_ORIGIN_URL
+
+
 def _clean_solver_deployment_root():
     main_head = _git(REPO_ROOT, "rev-parse", CURRENT_SOLVER_DEPLOYMENT_REF)
     if not GIT_SHA.fullmatch(main_head):
@@ -219,7 +239,7 @@ def _clean_solver_deployment_root():
                 candidate, "symbolic-ref", "--quiet", "HEAD",
             ) == CURRENT_SOLVER_DEPLOYMENT_REF
             clean = not _git(
-                candidate, "status", "--porcelain", "--untracked-files=no",
+                candidate, "status", "--porcelain", "--untracked-files=all",
             )
         except (OSError, subprocess.CalledProcessError):
             continue
@@ -232,6 +252,15 @@ def _require_solver_main_deployment(solver_root):
     """Bind the pinned solver commit to the advertised current main history."""
 
     solver_root = Path(solver_root).resolve()
+    official_origin = _require_worker_solver_repository_contract()
+    try:
+        origin_urls = _git(
+            solver_root, "remote", "get-url", "--all", "origin",
+        ).splitlines()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("solver origin URL is unavailable") from exc
+    if origin_urls != [official_origin]:
+        raise RuntimeError("solver origin URL is not the exact worker repository")
     heads = deployment_gate.advertised_heads(solver_root)
     advertised_main = heads.get(CURRENT_SOLVER_DEPLOYMENT_REF)
     if not isinstance(advertised_main, str) \
@@ -256,6 +285,7 @@ def _require_solver_main_deployment(solver_root):
         "revision": SOLVER,
         "refs": [CURRENT_SOLVER_DEPLOYMENT_REF],
         "repo_root": str(solver_root),
+        "origin_url": official_origin,
         "advertised_ref_head": advertised_main,
         "revision_relation": "ancestor_or_equal",
     }
