@@ -52,6 +52,28 @@ def test_live_official_contract_reauthenticates_exact_files() -> None:
     assert contract["retained"]["root"] == "goal-fea-retained/a05448710be08cc2"
 
 
+def test_historical_scheduler_payload_compatibility_is_exact() -> None:
+    plan = json.loads(collector.DEFAULT_PLAN.read_text("utf-8"))
+    _, params = official.authenticate_official_candidate()
+    current, _environment, _retained = official._capture_scheduler_payload(
+        params, official.reviewed_profile()
+    )
+
+    assert official._scheduler_payload_matches_reviewed_plan(plan, current)
+
+    drifted = copy.deepcopy(current)
+    drifted["command"] += " true;"
+    assert not official._scheduler_payload_matches_reviewed_plan(
+        plan, drifted
+    )
+
+    unsealed = copy.deepcopy(plan)
+    unsealed["scheduler_payload_sha256"] = "0" * 64
+    assert not official._scheduler_payload_matches_reviewed_plan(
+        unsealed, current
+    )
+
+
 def test_live_task_get_requires_exact_bound_slurm_identity() -> None:
     contract = collector.load_contract(
         plan_path=collector.DEFAULT_PLAN,
