@@ -3145,6 +3145,7 @@ class ArtifactService:
         self.cache = SafeArtifactCache()
         self.scheduler = scheduler or SchedulerReader()
         self.refill_controller = refill_controller or RefillControllerReader()
+        self._continuous_pipeline_was_supplied = continuous_pipeline is not None
         self.continuous_pipeline = (
             continuous_pipeline or ContinuousPipelineReader()
         )
@@ -6130,6 +6131,8 @@ class ArtifactService:
 
     def _model_training_root(self) -> Path:
         """Prefer the live canonical registry without pinning a generation."""
+        if not self._continuous_pipeline_was_supplied:
+            return self.root / "training"
         pipeline_root = getattr(self.continuous_pipeline, "root", None)
         if pipeline_root is not None:
             try:

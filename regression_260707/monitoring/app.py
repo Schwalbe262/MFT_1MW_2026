@@ -46,6 +46,7 @@ from .deadline_local_gui_runner import (
 from .deadline_design import DEADLINE_LOCAL_GUI_RUNNER_SHA256
 from .compute_campaign_status import ComputeCampaignStatusReader
 from .codex_status import CodexWorkStatusReader
+from .pipeline_status import ContinuousPipelineReader
 
 
 HERE = Path(__file__).resolve().parent
@@ -870,6 +871,7 @@ def create_app(
         service = ArtifactService(
             root,
             scheduler=scheduler,
+            continuous_pipeline=ContinuousPipelineReader(),
             record_runtime=os.environ.get("MFT_MONITOR_DISABLE_HISTORY", "0") != "1",
         )
 
