@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,31 @@ GROUP_STATE = {
     "completed": {"completed"},
     "attention": {"attention", "blocked"},
 }
+DEADLINE_CAMPAIGN_ITEM_ID = "fea-handoff"
+DEADLINE_CAMPAIGN_ALLOCATION_JOBS_PATTERN = re.compile(
+    r"\bALLOC(?:ATION)?\s+JOBS?\s+(\d+)(?!\d)",
+    re.IGNORECASE,
+)
+DEADLINE_CAMPAIGN_SUBMITTED_PATTERN = re.compile(
+    r"\bSUBMITTED\s+(\d+)(?!\d)",
+    re.IGNORECASE,
+)
+DEADLINE_CAMPAIGN_RUNNING_PATTERN = re.compile(
+    r"\bRUNNING\s+(\d+)(?!\d)",
+    re.IGNORECASE,
+)
+DEADLINE_CAMPAIGN_EXACT_RUNNING_PATTERN = re.compile(
+    r"\bEXACT\s+RUNNING\s+(\d+)(?!\d)",
+    re.IGNORECASE,
+)
+DEADLINE_CAMPAIGN_SUPPLEMENTAL_RUNNING_PATTERN = re.compile(
+    r"\bSUPPLEMENTAL\s+RUNNING\s+(\d+)(?!\d)",
+    re.IGNORECASE,
+)
+DEADLINE_CAMPAIGN_COLLECTIONS_PATTERN = re.compile(
+    r"\bCOLLECTIONS?\s+(\d+)(?!\d)",
+    re.IGNORECASE,
+)
 
 
 class CodexStatusError(ValueError):
@@ -97,6 +123,106 @@ def _item(payload: Any, group: str, index: int) -> dict[str, Any]:
     }
 
 
+def _unique_count(pattern: re.Pattern[str], text: str) -> int | None:
+    values = {int(value) for value in pattern.findall(text)}
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _deadline_campaign(
+    current: list[dict[str, Any]],
+    summary: str = "",
+) -> dict[str, Any]:
+    """Project explicit campaign counters without consulting Scheduler state."""
+
+    source = next(
+        (
+            item
+            for item in current
+            if item.get("id") == DEADLINE_CAMPAIGN_ITEM_ID
+        ),
+        None,
+    )
+    unavailable = {
+        "available": False,
+        "integrity_verified": False,
+        "scope": "codex_deadline_campaign",
+        "source_item_id": DEADLINE_CAMPAIGN_ITEM_ID,
+        "allocation_jobs_active": None,
+        "submitted_total": None,
+        "running": None,
+        "collections": None,
+        "collection_zero_means_submission_zero": False,
+    }
+    if source is None:
+        return {
+            **unavailable,
+            "error": "explicit deadline campaign status item is unavailable",
+        }
+    title = source["title"]
+    allocation_jobs_active = _unique_count(
+        DEADLINE_CAMPAIGN_ALLOCATION_JOBS_PATTERN,
+        title,
+    )
+    submitted_total = _unique_count(
+        DEADLINE_CAMPAIGN_SUBMITTED_PATTERN,
+        title,
+    )
+    exact_running = _unique_count(
+        DEADLINE_CAMPAIGN_EXACT_RUNNING_PATTERN,
+        title,
+    )
+    if exact_running is None:
+        running = _unique_count(DEADLINE_CAMPAIGN_RUNNING_PATTERN, title)
+    else:
+        supplemental_running = _unique_count(
+            DEADLINE_CAMPAIGN_SUPPLEMENTAL_RUNNING_PATTERN,
+            title,
+        )
+        running = exact_running + (supplemental_running or 0)
+    collections = _unique_count(
+        DEADLINE_CAMPAIGN_COLLECTIONS_PATTERN,
+        title,
+    )
+    if collections is None:
+        collections = _unique_count(
+            DEADLINE_CAMPAIGN_COLLECTIONS_PATTERN,
+            summary,
+        )
+    if (
+        allocation_jobs_active is None
+        or submitted_total is None
+        or running is None
+        or collections is None
+    ):
+        return {
+            **unavailable,
+            "observed_at": source["updated_at"],
+            "error": "deadline campaign counters are unavailable in the status item",
+        }
+    if (
+        running > submitted_total
+        or collections > submitted_total
+        or (running > 0 and allocation_jobs_active == 0)
+    ):
+        return {
+            **unavailable,
+            "observed_at": source["updated_at"],
+            "error": "deadline campaign counters are internally inconsistent",
+        }
+    return {
+        "available": True,
+        "integrity_verified": True,
+        "scope": "codex_deadline_campaign",
+        "source_item_id": DEADLINE_CAMPAIGN_ITEM_ID,
+        "observed_at": source["updated_at"],
+        "allocation_jobs_active": allocation_jobs_active,
+        "submitted_total": submitted_total,
+        "running": running,
+        "collections": collections,
+        "collection_zero_means_submission_zero": False,
+    }
+
+
 class CodexWorkStatusReader:
     """Load and validate the configured Codex work-status artifact per request."""
 
@@ -140,6 +266,7 @@ class CodexWorkStatusReader:
             "completed": [],
             "attention": [],
             "counts": {"current": 0, "completed": 0, "attention": 0},
+            "deadline_campaign": _deadline_campaign([]),
             "stale": True,
         }
 
@@ -207,6 +334,11 @@ class CodexWorkStatusReader:
                     ).total_seconds()
                 ),
             )
+            summary = _text(
+                payload.get("summary"),
+                "summary",
+                maximum=1000,
+            )
             return {
                 "schema_version": SCHEMA_VERSION,
                 "configured": True,
@@ -222,16 +354,16 @@ class CodexWorkStatusReader:
                 "generated_at": generated_at.isoformat(timespec="seconds"),
                 "deadline_at": deadline_at.isoformat(timespec="seconds"),
                 "owner": _text(payload.get("owner"), "owner", maximum=100),
-                "summary": _text(
-                    payload.get("summary"),
-                    "summary",
-                    maximum=1000,
-                ),
+                "summary": summary,
                 **groups,
                 "counts": {
                     group: len(values)
                     for group, values in groups.items()
                 },
+                "deadline_campaign": _deadline_campaign(
+                    groups["current"],
+                    summary,
+                ),
                 "age_seconds": age_seconds,
                 "stale_after_seconds": self.stale_after_seconds,
                 "stale": age_seconds > self.stale_after_seconds,

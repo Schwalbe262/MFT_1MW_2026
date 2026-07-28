@@ -75,6 +75,117 @@ def test_reader_accepts_explicit_timestamped_artifact(tmp_path):
     assert snapshot["stale"] is False
 
 
+def test_reader_projects_authoritative_deadline_campaign_counts(tmp_path):
+    now = datetime.now(timezone.utc)
+    payload = _payload(now)
+    payload["current"][0].update({
+        "id": "fea-handoff",
+        "title": (
+            "SLURM · ALLOC JOBS 6 · SUBMITTED 59 · RUNNING 30 · "
+            "COLLECTIONS 0 · NSGA 512 COMPLETED"
+        ),
+    })
+    path = tmp_path / "codex-work-status.json"
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    snapshot = CodexWorkStatusReader(path).snapshot()
+
+    assert snapshot["deadline_campaign"] == {
+        "available": True,
+        "integrity_verified": True,
+        "scope": "codex_deadline_campaign",
+        "source_item_id": "fea-handoff",
+        "observed_at": now.isoformat(timespec="seconds"),
+        "allocation_jobs_active": 6,
+        "submitted_total": 59,
+        "running": 30,
+        "collections": 0,
+        "collection_zero_means_submission_zero": False,
+    }
+
+
+def test_reader_projects_exact_and_supplemental_running_counts(tmp_path):
+    now = datetime.now(timezone.utc)
+    payload = _payload(now)
+    payload["summary"] = "COLLECTIONS 0"
+    payload["current"][0].update({
+        "id": "fea-handoff",
+        "title": (
+            "SLURM · ALLOCATION JOBS 6 · SUBMITTED 59 · "
+            "EXACT RUNNING 24 · SUPPLEMENTAL RUNNING 6"
+        ),
+    })
+    path = tmp_path / "codex-work-status.json"
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    snapshot = CodexWorkStatusReader(path).snapshot()
+
+    assert snapshot["deadline_campaign"]["available"] is True
+    assert snapshot["deadline_campaign"]["running"] == 30
+    assert snapshot["deadline_campaign"]["collections"] == 0
+
+
+def test_reader_refuses_ambiguous_deadline_campaign_counts(tmp_path):
+    now = datetime.now(timezone.utc)
+    payload = _payload(now)
+    payload["current"][0].update({
+        "id": "fea-handoff",
+        "title": (
+            "ALLOC JOBS 6 · SUBMITTED 59 · SUBMITTED 60 · "
+            "RUNNING 30 · COLLECTIONS 0"
+        ),
+    })
+    path = tmp_path / "codex-work-status.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    snapshot = CodexWorkStatusReader(path).snapshot()
+
+    assert snapshot["deadline_campaign"]["available"] is False
+    assert snapshot["deadline_campaign"]["integrity_verified"] is False
+    assert "unavailable" in snapshot["deadline_campaign"]["error"]
+
+
+def test_reader_refuses_inconsistent_deadline_campaign_projection(tmp_path):
+    now = datetime.now(timezone.utc)
+    payload = _payload(now)
+    payload["current"][0].update({
+        "id": "fea-handoff",
+        "title": (
+            "SLURM · ALLOC JOBS 1 · SUBMITTED 2 · "
+            "RUNNING 3 · COLLECTIONS 0"
+        ),
+    })
+    path = tmp_path / "codex-work-status.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    snapshot = CodexWorkStatusReader(path).snapshot()
+
+    assert snapshot["available"] is True
+    assert snapshot["deadline_campaign"]["available"] is False
+    assert snapshot["deadline_campaign"]["integrity_verified"] is False
+    assert "internally inconsistent" in snapshot["deadline_campaign"]["error"]
+
+
+def test_reader_always_exposes_deadline_campaign_contract(tmp_path):
+    unavailable = CodexWorkStatusReader(
+        tmp_path / "missing.json",
+    ).snapshot()
+    assert unavailable["deadline_campaign"]["available"] is False
+
+    now = datetime.now(timezone.utc)
+    path = tmp_path / "codex-work-status.json"
+    path.write_text(json.dumps(_payload(now)), encoding="utf-8")
+    available = CodexWorkStatusReader(path).snapshot()
+    assert available["deadline_campaign"]["available"] is False
+    assert available["deadline_campaign"]["source_item_id"] == "fea-handoff"
+
+
 def test_reader_fails_closed_for_cross_group_state(tmp_path):
     now = datetime.now(timezone.utc)
     payload = _payload(now)
