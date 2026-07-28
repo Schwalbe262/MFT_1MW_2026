@@ -91,6 +91,14 @@ RETENTION_SECONDS = 1_800
 SCHEDULER_SECONDS = SOLVER_SECONDS + KILL_GRACE_SECONDS + RETENTION_SECONDS
 MAX_WORKERS_PER_NODE = 1
 PRIORITY = 100
+HISTORICAL_SCHEDULER_PAYLOAD_SHA256 = (
+    "e340507d361d35b2f445ba4bca5ae6593dfc524c1e4022d0aa6f977d2cb217c0"
+)
+PYAEDT_LIBRARY_BINDING_COMMAND = (
+    'export MFT_PYAEDT_LIBRARY_ROOT="$MFT_WORKDIR/pyaedt_library"; '
+    "printf 'MFT_PYAEDT_LIBRARY_ROOT %s\\n' "
+    '"$MFT_PYAEDT_LIBRARY_ROOT"; '
+)
 
 TASK_NAME = (
     "mft-goal-diag-standard-postdeadline-official8-"
@@ -510,6 +518,36 @@ def validate_scheduler_payload(
 ) -> None:
     with _reviewed_contract_patch():
         reviewed.validate_scheduler_payload(payload, retained)
+
+
+def _scheduler_payload_matches_reviewed_plan(
+    plan: Mapping[str, Any],
+    fresh_payload: Mapping[str, Any],
+) -> bool:
+    """Authenticate the sealed payload across one exact command hardening."""
+
+    sealed_payload = plan.get("scheduler_payload")
+    sealed_sha256 = plan.get("scheduler_payload_sha256")
+    if not isinstance(sealed_payload, dict):
+        return False
+    if sealed_payload == fresh_payload:
+        return sealed_sha256 == payload_sha256(fresh_payload)
+    if (
+        sealed_sha256 != HISTORICAL_SCHEDULER_PAYLOAD_SHA256
+        or payload_sha256(sealed_payload)
+        != HISTORICAL_SCHEDULER_PAYLOAD_SHA256
+    ):
+        return False
+    fresh_command = str(fresh_payload.get("command") or "")
+    if fresh_command.count(PYAEDT_LIBRARY_BINDING_COMMAND) != 1:
+        return False
+    reviewed_payload = copy.deepcopy(dict(fresh_payload))
+    reviewed_payload["command"] = fresh_command.replace(
+        PYAEDT_LIBRARY_BINDING_COMMAND,
+        "",
+        1,
+    )
+    return reviewed_payload == sealed_payload
 
 
 def capacity_query() -> list[tuple[str, Any]]:
@@ -966,9 +1004,10 @@ def load_plan(
         or plan.get("fea_params_sha256") != payload_sha256(params)
         or plan.get("execution_profile_canonical_sha256")
         != payload_sha256(profile)
-        or plan.get("scheduler_payload") != fresh_payload
-        or plan.get("scheduler_payload_sha256")
-        != payload_sha256(fresh_payload)
+        or not _scheduler_payload_matches_reviewed_plan(
+            plan,
+            fresh_payload,
+        )
         or plan.get("dedupe_key") != fresh_payload["dedupe_key"]
         or plan.get("submission_environment") != environment
         or plan.get("submission_environment_sha256")

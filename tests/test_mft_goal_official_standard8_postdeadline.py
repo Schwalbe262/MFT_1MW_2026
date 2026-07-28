@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
@@ -12,6 +13,52 @@ from tools import mft_goal_official_standard8_postdeadline as official8
 
 
 OBSERVED = datetime(2026, 7, 26, 11, 15, tzinfo=timezone.utc)
+
+
+def test_historical_scheduler_payload_compatibility_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = {
+        "command": (
+            "before; "
+            f"{official8.PYAEDT_LIBRARY_BINDING_COMMAND}"
+            "after;"
+        ),
+        "dedupe_key": "sealed-dedupe",
+        "cpus": 8,
+    }
+    sealed = copy.deepcopy(fresh)
+    sealed["command"] = sealed["command"].replace(
+        official8.PYAEDT_LIBRARY_BINDING_COMMAND,
+        "",
+        1,
+    )
+    sealed_sha256 = official8.payload_sha256(sealed)
+    monkeypatch.setattr(
+        official8,
+        "HISTORICAL_SCHEDULER_PAYLOAD_SHA256",
+        sealed_sha256,
+    )
+    plan = {
+        "scheduler_payload": sealed,
+        "scheduler_payload_sha256": sealed_sha256,
+    }
+
+    assert official8._scheduler_payload_matches_reviewed_plan(plan, fresh)
+
+    drifted = copy.deepcopy(fresh)
+    drifted["command"] += " true;"
+    assert not official8._scheduler_payload_matches_reviewed_plan(
+        plan,
+        drifted,
+    )
+
+    unsealed = copy.deepcopy(plan)
+    unsealed["scheduler_payload_sha256"] = "0" * 64
+    assert not official8._scheduler_payload_matches_reviewed_plan(
+        unsealed,
+        fresh,
+    )
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> Path:
