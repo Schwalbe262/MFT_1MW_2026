@@ -31,8 +31,77 @@ from tools import mft_goal_diagnostic_compact_slurm as offload  # noqa: E402
 
 
 OVERLAY_SCHEMA = "mft-goal-diagnostic-compact-logical-seed-overlay-v2"
-EXPECTED_RETRY1_COUNT = overlay1.EXPECTED_RETRY_COUNT
 EXPECTED_RETRY2_COUNT = len(retry2.EXPECTED_SEEDS)
+
+
+def _validated_prior_retry_count(
+    prior_authority: Mapping[str, Any],
+) -> int:
+    """Return the sealed ignored retry1 count after exact accounting checks."""
+
+    required_count_names = (
+        "logical_seed_count",
+        "physical_submitted_attempt_count",
+        "selected_physical_attempt_count",
+        "ignored_infrastructure_prestart_attempt_count",
+    )
+    counts: dict[str, int] = {}
+    for name in required_count_names:
+        value = prior_authority.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RuntimeError(
+                "retry2 collector prior authority count type mismatch: "
+                f"{name}"
+            )
+        counts[name] = value
+
+    logical_count = counts["logical_seed_count"]
+    physical_count = counts["physical_submitted_attempt_count"]
+    selected_count = counts["selected_physical_attempt_count"]
+    retry_count = counts[
+        "ignored_infrastructure_prestart_attempt_count"
+    ]
+    has_selected_retry_count = (
+        "selected_retry_attempt_count" in prior_authority
+    )
+    selected_retry_count = prior_authority.get(
+        "selected_retry_attempt_count"
+    )
+    if (
+        has_selected_retry_count
+        and (
+            isinstance(selected_retry_count, bool)
+            or not isinstance(selected_retry_count, int)
+        )
+    ):
+        raise RuntimeError(
+            "retry2 collector prior authority count type mismatch: "
+            "selected_retry_attempt_count"
+        )
+    if (
+        logical_count != offload.EXACT_TASK_COUNT
+        or not 1 <= retry_count <= logical_count
+        or not logical_count <= physical_count <= 2 * logical_count
+        or (
+            has_selected_retry_count
+            and not 1 <= selected_retry_count <= logical_count
+        )
+    ):
+        raise RuntimeError(
+            "retry2 collector prior authority count range mismatch"
+        )
+    if (
+        selected_count != logical_count
+        or physical_count != logical_count + retry_count
+        or (
+            has_selected_retry_count
+            and selected_retry_count != retry_count
+        )
+    ):
+        raise RuntimeError(
+            "retry2 collector prior authority count accounting mismatch"
+        )
+    return retry_count
 
 
 def _validate_retry2_receipt(
@@ -203,7 +272,7 @@ def authenticate_overlay_context(
     authority_path: Path,
     scheduler_url: str,
 ) -> dict[str, Any]:
-    """Authenticate the 152 submitted attempts and select exact logical100."""
+    """Authenticate all submitted attempts and select exact logical100."""
 
     prior = overlay1.authenticate_overlay_context(
         plan_path=plan_path,
@@ -217,6 +286,7 @@ def authenticate_overlay_context(
         collector._read_json(prior_authority_path),
         schema=overlay1.OVERLAY_SCHEMA,
     )
+    expected_retry1_count = _validated_prior_retry_count(prior_authority)
     retry2_plan, retry2_receipt = _validate_retry2_receipt(
         retry2_plan_path=retry2_plan_path,
         retry2_receipt_path=retry2_receipt_path,
@@ -230,10 +300,6 @@ def authenticate_overlay_context(
         != retry2._record(retry1_plan_path)
         or retry2_plan.get("retry1_receipt")
         != retry2._record(retry1_receipt_path)
-        or prior_authority.get("physical_submitted_attempt_count")
-        != offload.EXACT_TASK_COUNT + EXPECTED_RETRY1_COUNT
-        or prior_authority.get("selected_physical_attempt_count")
-        != offload.EXACT_TASK_COUNT
     ):
         raise RuntimeError("retry2 collector prior authority drifted")
 
@@ -282,14 +348,14 @@ def authenticate_overlay_context(
             "logical_seed_count": offload.EXACT_TASK_COUNT,
             "physical_submitted_attempt_count": (
                 offload.EXACT_TASK_COUNT
-                + EXPECTED_RETRY1_COUNT
+                + expected_retry1_count
                 + EXPECTED_RETRY2_COUNT
             ),
             "selected_physical_attempt_count": offload.EXACT_TASK_COUNT,
-            "selected_retry1_attempt_count": EXPECTED_RETRY1_COUNT,
+            "selected_retry1_attempt_count": expected_retry1_count,
             "selected_retry2_attempt_count": EXPECTED_RETRY2_COUNT,
             "ignored_infrastructure_prestart_attempt_count": (
-                EXPECTED_RETRY1_COUNT
+                expected_retry1_count
             ),
             "ignored_runtime_exit1_attempt_count": EXPECTED_RETRY2_COUNT,
             "ignored_runtime_exit1_task_ids": runtime_ignored,
@@ -314,7 +380,7 @@ def authenticate_overlay_context(
     collector._immutable_json(authority_path, authority)
     physical_attempt_count = (
         offload.EXACT_TASK_COUNT
-        + EXPECTED_RETRY1_COUNT
+        + expected_retry1_count
         + EXPECTED_RETRY2_COUNT
     )
     return {
@@ -334,9 +400,9 @@ def authenticate_overlay_context(
             "logical_seed_count": offload.EXACT_TASK_COUNT,
             "physical_submitted_attempt_count": physical_attempt_count,
             "selected_retry_attempt_count": (
-                EXPECTED_RETRY1_COUNT + EXPECTED_RETRY2_COUNT
+                expected_retry1_count + EXPECTED_RETRY2_COUNT
             ),
-            "selected_retry1_attempt_count": EXPECTED_RETRY1_COUNT,
+            "selected_retry1_attempt_count": expected_retry1_count,
             "selected_retry2_attempt_count": EXPECTED_RETRY2_COUNT,
             "one_selected_physical_attempt_per_logical_seed": True,
             "duplicate_physical_result_collection_allowed": False,

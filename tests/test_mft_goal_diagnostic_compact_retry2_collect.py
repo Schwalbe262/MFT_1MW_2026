@@ -7,7 +7,11 @@ import pytest
 from tools import mft_goal_diagnostic_compact_retry2_collect as overlay2
 
 
-def _prior_context_and_authority():
+def _prior_context_and_authority(
+    retry_count=47,
+    *,
+    include_selected_retry_count=False,
+):
     entries = []
     selections = []
     for ordinal, seed in enumerate(overlay2.offload.EXACT_SEEDS):
@@ -33,7 +37,17 @@ def _prior_context_and_authority():
                 "ignored_original_task_id": None,
             }
         )
-    return {"entries": entries}, {"selections": selections}
+    logical_count = len(entries)
+    authority = {
+        "logical_seed_count": logical_count,
+        "physical_submitted_attempt_count": logical_count + retry_count,
+        "selected_physical_attempt_count": logical_count,
+        "ignored_infrastructure_prestart_attempt_count": retry_count,
+        "selections": selections,
+    }
+    if include_selected_retry_count:
+        authority["selected_retry_attempt_count"] = retry_count
+    return {"entries": entries}, authority
 
 
 def _retry2_plan_and_receipt(prior_context):
@@ -127,6 +141,93 @@ def test_upgrade_fails_closed_if_retry2_targets_retry1_selection():
             retry2_plan=retry2_plan,
             retry2_receipt=retry2_receipt,
         )
+
+
+def test_prior_retry_count_is_read_dynamically_from_sealed_authority():
+    _, prior_authority = _prior_context_and_authority(retry_count=23)
+
+    assert "selected_retry_attempt_count" not in prior_authority
+    assert overlay2._validated_prior_retry_count(prior_authority) == 23
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "logical_seed_count",
+        "physical_submitted_attempt_count",
+        "selected_physical_attempt_count",
+        "ignored_infrastructure_prestart_attempt_count",
+    ],
+)
+def test_prior_retry_count_rejects_boolean_counts(field):
+    _, prior_authority = _prior_context_and_authority()
+    prior_authority[field] = True
+
+    with pytest.raises(RuntimeError, match="count type mismatch"):
+        overlay2._validated_prior_retry_count(prior_authority)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "logical_seed_count",
+        "physical_submitted_attempt_count",
+        "selected_physical_attempt_count",
+        "ignored_infrastructure_prestart_attempt_count",
+    ],
+)
+def test_prior_retry_count_rejects_missing_required_counts(field):
+    _, prior_authority = _prior_context_and_authority()
+    prior_authority.pop(field)
+
+    with pytest.raises(RuntimeError, match="count type mismatch"):
+        overlay2._validated_prior_retry_count(prior_authority)
+
+
+@pytest.mark.parametrize("retry_count", [0, 101])
+def test_prior_retry_count_rejects_out_of_range_values(retry_count):
+    _, prior_authority = _prior_context_and_authority()
+    prior_authority[
+        "ignored_infrastructure_prestart_attempt_count"
+    ] = retry_count
+
+    with pytest.raises(RuntimeError, match="count range mismatch"):
+        overlay2._validated_prior_retry_count(prior_authority)
+
+
+def test_prior_retry_count_rejects_boolean_optional_selected_count():
+    _, prior_authority = _prior_context_and_authority(
+        include_selected_retry_count=True
+    )
+    prior_authority["selected_retry_attempt_count"] = True
+
+    with pytest.raises(RuntimeError, match="count type mismatch"):
+        overlay2._validated_prior_retry_count(prior_authority)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("physical_submitted_attempt_count", 148),
+        ("selected_physical_attempt_count", 99),
+    ],
+)
+def test_prior_retry_count_rejects_cross_count_mismatch(field, value):
+    _, prior_authority = _prior_context_and_authority()
+    prior_authority[field] = value
+
+    with pytest.raises(RuntimeError, match="count accounting mismatch"):
+        overlay2._validated_prior_retry_count(prior_authority)
+
+
+def test_prior_retry_count_rejects_optional_selected_count_mismatch():
+    _, prior_authority = _prior_context_and_authority(
+        include_selected_retry_count=True
+    )
+    prior_authority["selected_retry_attempt_count"] = 46
+
+    with pytest.raises(RuntimeError, match="count accounting mismatch"):
+        overlay2._validated_prior_retry_count(prior_authority)
 
 
 def test_retry2_overlay_has_no_scheduler_mutation_client():
