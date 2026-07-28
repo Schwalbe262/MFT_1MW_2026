@@ -190,7 +190,7 @@ EXECUTOR_ENTRYPOINT = "tools/mft_goal_execute_corrected_thermal_checkpoint.py"
 STAGE_ENTRYPOINT = "tools/mft_goal_corrected_thermal_continuation.py"
 SUBMISSION_ENTRYPOINT = "tools/mft_goal_corrected_thermal_submission.py"
 EXECUTOR_REPOSITORY = "https://github.com/Schwalbe262/MFT_1MW_2026.git"
-EXECUTOR_REMOTE_REF = "refs/heads/integration/mft-goal-20260726"
+EXECUTOR_REMOTE_REF = "refs/heads/main"
 LIBRARY_REPOSITORY = "https://github.com/Schwalbe262/pyaedt_library.git"
 MUTATION_LOCK_NAME = "campaign-mutation.lock"
 
@@ -541,7 +541,7 @@ def resolve_executor_identity(repo_root: Path = REPO_ROOT) -> dict[str, Any]:
         or remote_rows != [[head, EXECUTOR_REMOTE_REF]]
     ):
         raise CorrectedThermalError(
-            "executor HEAD is not the exact pushed integration ref"
+            "executor HEAD is not the exact pushed main ref"
         )
     return {
         "revision": head,

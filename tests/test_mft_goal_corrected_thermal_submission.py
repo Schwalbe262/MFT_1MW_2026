@@ -199,6 +199,78 @@ def _plan(tmp_path: Path) -> tuple[dict, Path]:
     return value, path
 
 
+def test_executor_resolution_requires_exact_pushed_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head = "b" * 40
+    payloads: dict[str, bytes] = {}
+    for relative in (
+        submission.STAGE_ENTRYPOINT,
+        submission.EXECUTOR_ENTRYPOINT,
+        submission.SUBMISSION_ENTRYPOINT,
+    ):
+        payload = f"{relative}\n".encode()
+        payloads[relative] = payload
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(
+        repo: Path,
+        *arguments: str,
+        check: bool = True,
+        text: bool = True,
+    ) -> SimpleNamespace:
+        del repo, check
+        calls.append(arguments)
+        if arguments == ("rev-parse", "HEAD"):
+            return SimpleNamespace(returncode=0, stdout=f"{head}\n", stderr="")
+        if arguments[:2] == ("merge-base", "--is-ancestor"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if arguments in (
+            ("diff", "--quiet"),
+            ("diff", "--cached", "--quiet"),
+        ):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if arguments[:2] == ("ls-files", "--error-unmatch"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if arguments[0] == "show":
+            relative = arguments[1].split(":", 1)[1]
+            assert text is False
+            return SimpleNamespace(
+                returncode=0,
+                stdout=payloads[relative],
+                stderr=b"",
+            )
+        if arguments[0] == "rev-parse" and ":" in arguments[1]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{'c' * 40}\n",
+                stderr="",
+            )
+        if arguments[:2] == ("ls-remote", "--heads"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{head}\trefs/heads/main\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected git invocation: {arguments!r}")
+
+    monkeypatch.setattr(submission, "_git", fake_git)
+    identity = submission.resolve_executor_identity(tmp_path)
+
+    assert identity["remote_ref"] == "refs/heads/main"
+    assert (
+        "ls-remote",
+        "--heads",
+        submission.EXECUTOR_REPOSITORY,
+        "refs/heads/main",
+    ) in calls
+
+
 def _license() -> dict:
     return {
         "server_up": True,
@@ -432,6 +504,15 @@ def test_plan_binds_fresh_executor_and_two_tier_storage(tmp_path: Path) -> None:
     plan, path = _plan(tmp_path)
     loaded = submission.load_plan(path, verify_local_files=False)
     assert loaded == plan
+    assert submission.EXECUTOR_REMOTE_REF == "refs/heads/main"
+    assert plan["executor"]["remote_ref"] == "refs/heads/main"
+    assert (
+        "fetch -q --depth=128 origin 'refs/heads/main'"
+        in plan["canonical_command"]
+    )
+    assert "refs/heads/integration/mft-goal-20260726" not in (
+        plan["canonical_command"]
+    )
     assert plan["executor"]["revision"] == "b" * 40
     assert plan["submission_profile"]["cpus"] == 8
     assert plan["submission_profile"]["memory_mb"] == 294912
@@ -473,6 +554,26 @@ def test_plan_binds_fresh_executor_and_two_tier_storage(tmp_path: Path) -> None:
         in plan["canonical_command"]
     )
     assert "--execution-plan" in plan["canonical_command"]
+
+
+def test_new_plan_rejects_retired_executor_feature_ref(tmp_path: Path) -> None:
+    executor_identity = _executor_identity()
+    executor_identity["remote_ref"] = (
+        "refs/heads/integration/mft-goal-20260726"
+    )
+    with pytest.raises(
+        submission.CorrectedThermalError,
+        match="clean/pushed authority",
+    ):
+        submission.build_plan(
+            checkpoint_manifest=_checkpoint_manifest(
+                tmp_path / "checkpoint.json"
+            ),
+            claim_root=tmp_path / "claims",
+            runtime_quota_snapshot=_quota(),
+            executor_identity=executor_identity,
+            now=NOW,
+        )
 
 
 def test_deadline_relative_timeout_fails_closed() -> None:
