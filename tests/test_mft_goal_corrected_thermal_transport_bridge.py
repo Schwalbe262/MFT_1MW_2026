@@ -460,6 +460,31 @@ def test_ready_plan_is_unsubmitted_and_exactly_bounded(
     assert plan["transport"]["maximum_encoded_chunk_bytes"] == 512_000
     assert bridge.SOURCE_RETAINED_ROOT.as_posix() in plan["canonical_command"]
     assert "mft_goal_corrected_thermal_transport_bridge.py" in plan["canonical_command"]
+    assert plan["remote_ref"] == bridge.BRIDGE_REMOTE_REF == "refs/heads/main"
+    fetch_commands = [
+        line
+        for line in plan["canonical_command"].splitlines()
+        if line.startswith('git -C "$toolroot" fetch ')
+    ]
+    assert fetch_commands == [bridge.BRIDGE_FETCH_COMMAND]
+    assert "refs/heads/integration/mft-goal-20260726" not in plan["canonical_command"]
+
+    with pytest.raises(bridge.BridgeError, match="bridge remote ref drifted"):
+        bridge.build_bridge_plan(
+            authority=fixture["authority"],
+            executor_revision="c" * 40,
+            publisher_sha256="d" * 64,
+            orchestration_root=tmp_path / "legacy-orchestration",
+            source_plan_path=fixture["plan"],
+            source_submission_path=fixture["submission"],
+            remote_ref="refs/heads/integration/mft-goal-20260726",
+        )
+
+    legacy_plan = dict(plan)
+    legacy_plan.pop("payload_sha256")
+    legacy_plan["remote_ref"] = "refs/heads/integration/mft-goal-20260726"
+    with pytest.raises(bridge.BridgeError, match="bridge submission plan drifted"):
+        bridge._verify_bridge_plan(bridge.sealed(legacy_plan))
 
 
 class _BridgeGetClient:

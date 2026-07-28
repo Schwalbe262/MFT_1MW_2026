@@ -37,6 +37,11 @@ from urllib import error, parse, request
 
 AUTHORITY_SCHEMA = "mft-corrected-thermal-terminal-success-authority-v1"
 PLAN_SCHEMA = "mft-corrected-thermal-terminal-transport-plan-v1"
+BRIDGE_REMOTE_REF = "refs/heads/main"
+BRIDGE_FETCH_COMMAND = (
+    'git -C "$toolroot" fetch -q --depth=64 '
+    f"origin '{BRIDGE_REMOTE_REF}'"
+)
 TRANSPORT_SCHEMA = "mft-corrected-thermal-terminal-transport-v1"
 TRANSPORT_RESULT_SCHEMA = "mft-corrected-thermal-terminal-transport-result-v1"
 PENDING_SCHEMA = "mft-corrected-thermal-terminal-transport-pending-v1"
@@ -1614,13 +1619,13 @@ def build_bridge_plan(
     orchestration_root: Path = DEFAULT_ORCHESTRATION_ROOT,
     source_plan_path: Path,
     source_submission_path: Path,
-    remote_ref: str = "refs/heads/integration/mft-goal-20260726",
+    remote_ref: str = BRIDGE_REMOTE_REF,
 ) -> dict[str, Any]:
     """Build a deterministic one-task submission plan without submitting it."""
     source = _verify_authority(authority)
     revision = _git_revision(executor_revision, "bridge executor revision")
     tool_sha = _sha(publisher_sha256, "bridge publisher SHA")
-    if remote_ref != "refs/heads/integration/mft-goal-20260726":
+    if remote_ref != BRIDGE_REMOTE_REF:
         raise BridgeError("bridge remote ref drifted")
     root = orchestration_root.absolute()
     source_plan_record = _file_record(source_plan_path)
@@ -1651,7 +1656,7 @@ def build_bridge_plan(
             'git -C "$toolroot" init -q',
             'git -C "$toolroot" remote add origin '
             "'https://github.com/Schwalbe262/MFT_1MW_2026.git'",
-            f"git -C \"$toolroot\" fetch -q --depth=64 origin '{remote_ref}'",
+            BRIDGE_FETCH_COMMAND,
             f"git -C \"$toolroot\" checkout -q --detach '{revision}'",
             f'test "$(git -C "$toolroot" rev-parse HEAD)" = \'{revision}\'',
             f"printf '%s  %s\\n' '{tool_sha}' "
@@ -1885,6 +1890,11 @@ def _verify_bridge_plan(value: Mapping[str, Any]) -> dict[str, Any]:
         "collection_seal_path": root / "collection_seal.json",
     }
     command = str(plan.get("canonical_command") or "")
+    fetch_commands = [
+        line
+        for line in command.splitlines()
+        if line.startswith('git -C "$toolroot" fetch ')
+    ]
     if (
         plan.get("diagnostic_only") is not True
         or plan.get("canonical") is not False
@@ -1892,6 +1902,8 @@ def _verify_bridge_plan(value: Mapping[str, Any]) -> dict[str, Any]:
         or plan.get("source_terminal_success_required") is not True
         or plan.get("source_task", {}).get("task_id") != SOURCE_TASK_ID
         or plan.get("source_plan") != _plan_exact_fields()
+        or plan.get("remote_ref") != BRIDGE_REMOTE_REF
+        or fetch_commands != [BRIDGE_FETCH_COMMAND]
         or local.get("plan", {}).get("sha256") != SOURCE_PLAN_FILE_SHA256
         or local.get("submission", {}).get("sha256") != SOURCE_SUBMISSION_FILE_SHA256
         or plan.get("canonical_command_sha256") != sha256_bytes(command.encode("utf-8"))
