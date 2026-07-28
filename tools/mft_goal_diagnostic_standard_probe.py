@@ -660,6 +660,31 @@ def _live_launcher_identity(
     }
 
 
+def _reviewed_strict_launcher_identity(
+    cutover_receipt_path: Path,
+    *,
+    scheduler_pin: Mapping[str, Any],
+) -> dict[str, Any]:
+    candidate = _absolute_regular_file(
+        cutover_receipt_path.parent
+        / (
+            "start_web_y."
+            f"{str(scheduler_pin['revision'])[:7]}.candidate.cmd"
+        ),
+        "Scheduler reviewed strict-node candidate launcher",
+    )
+    digest = production._sha256_file(candidate)
+    if digest != scheduler_pin["launcher_sha256"]:
+        raise HandoffContractError(
+            "Scheduler reviewed strict-node candidate launcher drifted"
+        )
+    return {
+        "path": str(candidate),
+        "sha256": digest,
+        "size_bytes": candidate.stat().st_size,
+    }
+
+
 def _legacy_e542_strict_node_scheduler_pin() -> dict[str, Any]:
     return {
         "pin_generation": "scheduler-strict-node-e542-v2",
@@ -1008,14 +1033,30 @@ def _validate_strict_scheduler_cutover_receipt(
         "payload_sha256": canonical_sha256(raw),
         "cutover_receipt_file_sha256": production._sha256_file(resolved),
     }
-    launcher_identity = (
-        _live_launcher_identity(
-            normalized,
-            expected_sha256=pin["launcher_sha256"],
-        )
-        if verify_live_launcher
-        else None
-    )
+    launcher_identity = None
+    if verify_live_launcher:
+        try:
+            launcher_identity = _live_launcher_identity(
+                normalized,
+                expected_sha256=pin["launcher_sha256"],
+            )
+        except HandoffContractError:
+            # A later Scheduler cutover may legitimately replace the mutable
+            # live path.  Read-only validation of this exact 4fac receipt can
+            # still authenticate its immutable reviewed candidate.  Any path
+            # that can submit sets require_active=True (or supplies a plan
+            # contract) and therefore continues to fail closed on live drift.
+            if (
+                require_active
+                or strict_node_contract is not None
+                or pin["pin_generation"]
+                != "scheduler-strict-node-4fac-v4"
+            ):
+                raise
+            launcher_identity = _reviewed_strict_launcher_identity(
+                resolved,
+                scheduler_pin=pin,
+            )
     return normalized, launcher_identity
 
 

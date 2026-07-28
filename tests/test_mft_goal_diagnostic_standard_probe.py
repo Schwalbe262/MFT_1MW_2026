@@ -3648,6 +3648,49 @@ def test_scheduler_launcher_identity_accepts_same_resolved_path_alias(
     )
 
 
+def test_read_only_strict_cutover_uses_reviewed_candidate_after_successor(
+    tmp_path, monkeypatch
+):
+    cutover_path = _strict_scheduler_cutover(tmp_path, monkeypatch)
+    cutover = json.loads(cutover_path.read_text(encoding="utf-8-sig"))
+    live_launcher = Path(cutover["live_launcher"])
+    reviewed_bytes = live_launcher.read_bytes()
+    candidate = (
+        cutover_path.parent
+        / (
+            "start_web_y."
+            f"{probe.SCHEDULER_STRICT_NODE_REVISION[:7]}.candidate.cmd"
+        )
+    )
+    candidate.write_bytes(reviewed_bytes)
+    live_launcher.write_bytes(b"reviewed-successor-launcher")
+
+    receipt, launcher = probe._validate_scheduler_cutover_receipt(
+        cutover_path,
+        verify_live_launcher=True,
+        require_strict_node=True,
+    )
+    assert receipt["candidate_revision"] == (
+        probe.SCHEDULER_STRICT_NODE_REVISION
+    )
+    assert launcher == {
+        "path": str(candidate.resolve()),
+        "sha256": probe.SCHEDULER_STRICT_NODE_LAUNCHER_SHA256,
+        "size_bytes": len(reviewed_bytes),
+    }
+
+    with pytest.raises(
+        production.HandoffContractError,
+        match="live launcher",
+    ):
+        probe._validate_scheduler_cutover_receipt(
+            cutover_path,
+            verify_live_launcher=True,
+            require_strict_node=True,
+            require_active_strict=True,
+        )
+
+
 def test_submit_freshly_reauthenticates_source_before_scheduler_mutation(
     tmp_path, monkeypatch
 ):
