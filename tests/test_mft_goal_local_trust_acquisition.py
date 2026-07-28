@@ -148,6 +148,7 @@ def test_resonance_residual_preserves_hz_constraint_units(
         physical_constraints={
             "half_magnetizing_resonance_minimum": physical_residual_hz,
             "temperature_robust_limit:T_max_Tx": -0.3601202328676294,
+            "temperature_robust_limit:T_max_Rx_main": -1.5,
             "temperature_robust_limit:T_max_core": -0.603995273604923,
         },
         normalized_constraints={
@@ -156,6 +157,7 @@ def test_resonance_residual_preserves_hz_constraint_units(
                 / local.RESONANCE_CONSTRAINT_SCALE_HZ
             ),
             "temperature_robust_limit:T_max_Tx": -0.03601202328676294,
+            "temperature_robust_limit:T_max_Rx_main": -0.15,
             "temperature_robust_limit:T_max_core": -0.0603995273604923,
             "Llt_robust_band": 0.0,
         },
@@ -165,6 +167,7 @@ def test_resonance_residual_preserves_hz_constraint_units(
         "actual_resonance_Hz": actual_resonance_hz,
         "actual_temperature_targets": {
             "T_max_Tx": {"actual_C": 99.0},
+            "T_max_Rx_main": {"actual_C": 119.0},
             "T_max_core": {"actual_C": 119.0},
         },
         "actual_dimensions_mm": {
@@ -175,7 +178,7 @@ def test_resonance_residual_preserves_hz_constraint_units(
         "source_result_json": local._file_record(result_path),  # noqa: SLF001
         "actual_volume_L": 811.8317909240001,
         "actual_total_loss_W": 5461.276475877185,
-        "actual_winding_max_C": 99.0,
+        "actual_winding_max_C": 119.0,
         "actual_core_max_C": 119.0,
     }
 
@@ -189,6 +192,12 @@ def test_resonance_residual_preserves_hz_constraint_units(
     assert measurement["actual"]["metrics"][
         "resonance_frequency_kHz"
     ] == pytest.approx(15.075)
+    assert measurement["predicted"]["metrics"]["winding_max_C"] == pytest.approx(
+        118.5
+    )
+    assert measurement["actual"]["metrics"]["winding_max_C"] == pytest.approx(
+        119.0
+    )
     assert measurement["actual"]["normalized_constraints"][
         "half_magnetizing_resonance_minimum"
     ] == pytest.approx(

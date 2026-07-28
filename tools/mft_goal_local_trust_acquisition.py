@@ -83,6 +83,10 @@ FIXED_BOUNDARY = {
     "core_plate_pad_t": 2.0,
     "wcp_pad_t": 2.0,
 }
+_WINDING_TEMPERATURE_FAMILIES = (
+    "primary_winding",
+    "secondary_winding",
+)
 
 # Exact copy of the geometry identity used by the terminal-population
 # exporter.  Keeping the same projection makes generated hashes directly
@@ -1084,14 +1088,21 @@ def _predicted_family_max(
     family: str,
 ) -> float:
     values: list[float] = []
-    limit = float(TEMPERATURE_FAMILY_LIMITS_C[family])
     prefix = "temperature_robust_limit:"
     for constraint, raw in anchor.physical_constraints.items():
         if not constraint.startswith(prefix):
             continue
         target = constraint[len(prefix) :]
-        if TEMPERATURE_TARGET_FAMILIES.get(target) == family:
-            values.append(limit + float(raw))
+        target_family = TEMPERATURE_TARGET_FAMILIES.get(target)
+        if family == "winding":
+            if target_family not in _WINDING_TEMPERATURE_FAMILIES:
+                continue
+        elif target_family != family:
+            continue
+        values.append(
+            float(TEMPERATURE_FAMILY_LIMITS_C[target_family])
+            + float(raw)
+        )
     if not values:
         raise LocalTrustContractError(
             f"anchor lacks {family} temperature predictions"
@@ -1317,7 +1328,13 @@ def _minimum_normalized_actual_margin(
         "length_mm": float(GOAL_SIZE_LIMITS_MM["L"]),
         "height_mm": float(GOAL_SIZE_LIMITS_MM["H"]),
         "resonance_Hz": 15_000.0,
-        "winding_max_C": float(TEMPERATURE_FAMILY_LIMITS_C["winding"]),
+        # The legacy observation schema exposes one aggregate winding field.
+        # Normalize it against the stricter member of the split Tx/Rx
+        # contract instead of inventing a removed "winding" family alias.
+        "winding_max_C": min(
+            float(TEMPERATURE_FAMILY_LIMITS_C[family])
+            for family in _WINDING_TEMPERATURE_FAMILIES
+        ),
         "core_max_C": float(TEMPERATURE_FAMILY_LIMITS_C["core"]),
     }
     margins: list[float] = []
