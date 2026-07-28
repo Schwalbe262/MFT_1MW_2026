@@ -56,6 +56,22 @@ PREPARE_MANIFEST_SHA256 = (
 PREPARE_MANIFEST_PAYLOAD_SHA256 = (
     "4af033eb36a64b44a2e0d788c8af11d9f35b6807fb5bed5fe9a73be229d0e9a8"
 )
+HISTORICAL_SCHEDULER_PAYLOAD_SHA256_BY_CANDIDATE = {
+    (
+        "896084a5979344670a70a65484d985f8b244de43f0975fe1023cf9020ebb5860"
+    ): "85b2ae4c03fd7b940c62b4c6b69c86da6bd9008a40c95f8d8dc75de6e73e0534",
+    (
+        "828cb282cf4febdabd8ad3db58153cefbc737da5b0826e5620a3012960aa22ab"
+    ): "bafa9c11da353c591c902e702a258078f6ed07ee28f696993f14fdc537d919f1",
+    (
+        "909d249ebe455d6f60b42d094e7916c8b3e8538e8d188e48a3906d82665ebc42"
+    ): "e729bf3e6c78a648456fedbac71401787e7f27cd41d020cf9e26407ba2e463e6",
+}
+PYAEDT_LIBRARY_BINDING_COMMAND = (
+    'export MFT_PYAEDT_LIBRARY_ROOT="$MFT_WORKDIR/pyaedt_library"; '
+    "printf 'MFT_PYAEDT_LIBRARY_ROOT %s\\n' "
+    '"$MFT_PYAEDT_LIBRARY_ROOT"; '
+)
 
 OUTPUT_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
@@ -113,6 +129,31 @@ LIVE_GATE_SCHEMA = "mft-goal-official-standard-hedge-submit-live-gate-v1"
 LIVE_LAUNCHER = Path(r"Y:\runtime\slurm_scheduler\start_web_y.cmd")
 LIVE_LAUNCHER_SHA256 = (
     "62eb3c29048b4ffc80469e975c8dbb0671feb7fc4dfc4e4b18792be08471e01f"
+)
+LIVE_LAUNCHER_SIZE_BYTES = 1_846
+HISTORICAL_LAUNCHER_ARCHIVE = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\deployment_candidates"
+    r"\4facdfe36f74-strict-demand-pool-retention-20260725"
+    r"\start_web_y.4facdfe.candidate.cmd"
+)
+CURRENT_LIVE_LAUNCHER_SHA256 = (
+    "07cd56bb68bb7912277469529a75821febcb9dce6eaa2aef45e8fd13d9020383"
+)
+CURRENT_DEPLOYED_COMMIT = "724d38d87f1a183112d86e7364fe08c6c183e4ff"
+CURRENT_DEPLOYED_ROOT = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\deployments\724d38d87f1a"
+)
+CURRENT_DEPLOYED_CONFIG_PY = (
+    CURRENT_DEPLOYED_ROOT / "slurm_scheduler" / "config.py"
+)
+CURRENT_DEPLOYED_CONFIG_PY_SHA256 = (
+    "77e8d14bff644e52357ba40dbde2629982a5706c1dbb1adb830373dcec4b1912"
+)
+CURRENT_DEPLOYED_SCHEDULER_PY = (
+    CURRENT_DEPLOYED_ROOT / "slurm_scheduler" / "scheduler.py"
+)
+CURRENT_DEPLOYED_SCHEDULER_PY_SHA256 = (
+    "24e0d00677d14f47b4e6e5c67a4d6da7d7711cfadb5a51fdf2011b41bcb62615"
 )
 LIVE_CONFIG = Path(r"Y:\runtime\slurm_scheduler\config\app.yaml")
 LIVE_CONFIG_SHA256 = (
@@ -211,6 +252,42 @@ def _default_reauthenticate(
         spec, params, profile
     )
     return selected, params, profile, payload, environment, retained
+
+
+def _scheduler_payload_matches_reviewed_lane(
+    spec: CandidateSpec,
+    plan: Mapping[str, Any],
+    fresh_payload: Mapping[str, Any],
+) -> bool:
+    """Authenticate a sealed hedge payload across one exact hardening."""
+
+    sealed_payload = plan.get("scheduler_payload")
+    sealed_sha256 = plan.get("scheduler_payload_sha256")
+    if not isinstance(sealed_payload, dict):
+        return False
+    if sealed_payload == fresh_payload:
+        return sealed_sha256 == payload_sha256(fresh_payload)
+    historical_sha256 = (
+        HISTORICAL_SCHEDULER_PAYLOAD_SHA256_BY_CANDIDATE.get(
+            spec.candidate_sha256
+        )
+    )
+    if (
+        historical_sha256 is None
+        or sealed_sha256 != historical_sha256
+        or payload_sha256(sealed_payload) != historical_sha256
+    ):
+        return False
+    fresh_command = str(fresh_payload.get("command") or "")
+    if fresh_command.count(PYAEDT_LIBRARY_BINDING_COMMAND) != 1:
+        return False
+    reviewed_payload = copy.deepcopy(dict(fresh_payload))
+    reviewed_payload["command"] = fresh_command.replace(
+        PYAEDT_LIBRARY_BINDING_COMMAND,
+        "",
+        1,
+    )
+    return reviewed_payload == sealed_payload
 
 
 def _authenticate_lane_plan(
@@ -341,7 +418,11 @@ def _authenticate_lane_plan(
         selected != fresh_selected
         or params != fresh_params
         or profile != fresh_profile
-        or payload != fresh_payload
+        or not _scheduler_payload_matches_reviewed_lane(
+            spec,
+            plan,
+            fresh_payload,
+        )
         or plan.get("raw_fea_params_sha256") != payload_sha256(params)
         or plan.get("profiled_fea_params_sha256")
         != payload_sha256(prepare_only._profiled_params(params, profile))
@@ -638,12 +719,96 @@ def _authority_file(path: Path, expected_sha256: str, label: str) -> dict[str, A
     return file_record(resolved)
 
 
+def _authenticate_launcher_history() -> tuple[dict[str, Any], str]:
+    """Reauthenticate the sealed launcher through one exact successor."""
+
+    try:
+        resolved_live = LIVE_LAUNCHER.resolve(strict=True)
+    except OSError as exc:
+        raise PostdeadlineContractError(
+            "deployed Scheduler launcher is unavailable"
+        ) from exc
+    if not resolved_live.is_file():
+        raise PostdeadlineContractError(
+            "deployed Scheduler launcher is unavailable"
+        )
+    live_sha256 = sha256_file(resolved_live)
+    if live_sha256 == LIVE_LAUNCHER_SHA256:
+        historical_launcher = resolved_live
+    elif live_sha256 == CURRENT_LIVE_LAUNCHER_SHA256:
+        historical_launcher = Path(
+            _authority_file(
+                HISTORICAL_LAUNCHER_ARCHIVE,
+                LIVE_LAUNCHER_SHA256,
+                "historical launcher archive",
+            )["path"]
+        )
+        _authority_file(
+            CURRENT_DEPLOYED_CONFIG_PY,
+            CURRENT_DEPLOYED_CONFIG_PY_SHA256,
+            "current successor config.py",
+        )
+        _authority_file(
+            CURRENT_DEPLOYED_SCHEDULER_PY,
+            CURRENT_DEPLOYED_SCHEDULER_PY_SHA256,
+            "current successor scheduler.py",
+        )
+        try:
+            current_text = resolved_live.read_text(
+                encoding="utf-8",
+                errors="strict",
+            )
+        except (OSError, UnicodeError) as exc:
+            raise PostdeadlineContractError(
+                "deployed Scheduler successor launcher cannot be read"
+            ) from exc
+        if not all(
+            value in current_text
+            for value in (
+                CURRENT_DEPLOYED_COMMIT,
+                str(CURRENT_DEPLOYED_ROOT),
+                str(LIVE_CONFIG),
+                "8002",
+            )
+        ):
+            raise PostdeadlineContractError(
+                "deployed Scheduler successor launcher contract drifted"
+            )
+    else:
+        raise PostdeadlineContractError(
+            "deployed Scheduler launcher bytes drifted"
+        )
+    try:
+        historical_text = historical_launcher.read_text(
+            encoding="utf-8",
+            errors="strict",
+        )
+    except (OSError, UnicodeError) as exc:
+        raise PostdeadlineContractError(
+            "historical Scheduler launcher cannot be read"
+        ) from exc
+    return (
+        {
+            "path": str(resolved_live),
+            "sha256": LIVE_LAUNCHER_SHA256,
+            "size_bytes": LIVE_LAUNCHER_SIZE_BYTES,
+        },
+        historical_text,
+    )
+
+
+def _validate_historical_launcher_record(value: Any) -> None:
+    expected, _historical_text = _authenticate_launcher_history()
+    if value != expected:
+        raise PostdeadlineContractError(
+            "historical Scheduler launcher record drifted"
+        )
+
+
 def authenticate_runtime_walltime_contract() -> dict[str, Any]:
     """Bind the live launcher and deployed 4facdfe walltime source bytes."""
 
-    launcher = _authority_file(
-        LIVE_LAUNCHER, LIVE_LAUNCHER_SHA256, "launcher"
-    )
+    launcher, launcher_text = _authenticate_launcher_history()
     config = _authority_file(LIVE_CONFIG, LIVE_CONFIG_SHA256, "live config")
     config_py = _authority_file(
         DEPLOYED_CONFIG_PY,
@@ -659,9 +824,6 @@ def authenticate_runtime_walltime_contract() -> dict[str, Any]:
         CUTOVER_RECEIPT, CUTOVER_RECEIPT_SHA256, "cutover receipt"
     )
     try:
-        launcher_text = LIVE_LAUNCHER.read_text(
-            encoding="utf-8", errors="strict"
-        )
         config_text = LIVE_CONFIG.read_text(
             encoding="utf-8", errors="strict"
         )

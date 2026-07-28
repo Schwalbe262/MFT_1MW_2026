@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,165 @@ from tools import mft_goal_official_standard_hedge_submit as submitter
 
 
 OBSERVED = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+
+
+def test_historical_scheduler_payload_compatibility_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = submitter.CANDIDATES[0]
+    fresh = {
+        "command": (
+            "before; "
+            f"{submitter.PYAEDT_LIBRARY_BINDING_COMMAND}"
+            "after;"
+        ),
+        "dedupe_key": "sealed-dedupe",
+        "cpus": 8,
+    }
+    sealed = copy.deepcopy(fresh)
+    sealed["command"] = sealed["command"].replace(
+        submitter.PYAEDT_LIBRARY_BINDING_COMMAND,
+        "",
+        1,
+    )
+    sealed_sha256 = submitter.payload_sha256(sealed)
+    monkeypatch.setattr(
+        submitter,
+        "HISTORICAL_SCHEDULER_PAYLOAD_SHA256_BY_CANDIDATE",
+        {spec.candidate_sha256: sealed_sha256},
+    )
+    plan = {
+        "scheduler_payload": sealed,
+        "scheduler_payload_sha256": sealed_sha256,
+    }
+
+    assert submitter._scheduler_payload_matches_reviewed_lane(
+        spec,
+        plan,
+        fresh,
+    )
+
+    drifted = copy.deepcopy(fresh)
+    drifted["command"] += " true;"
+    assert not submitter._scheduler_payload_matches_reviewed_lane(
+        spec,
+        plan,
+        drifted,
+    )
+
+    unsealed = copy.deepcopy(plan)
+    unsealed["scheduler_payload_sha256"] = "0" * 64
+    assert not submitter._scheduler_payload_matches_reviewed_lane(
+        spec,
+        unsealed,
+        fresh,
+    )
+
+    assert not submitter._scheduler_payload_matches_reviewed_lane(
+        submitter.CANDIDATES[1],
+        plan,
+        fresh,
+    )
+
+
+def test_launcher_history_accepts_only_the_exact_successor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    historical = tmp_path / "historical.cmd"
+    historical.write_text("historical launcher", encoding="utf-8")
+    live_config = tmp_path / "app.yaml"
+    live_config.write_text("config", encoding="utf-8")
+    successor_root = tmp_path / "successor"
+    successor_config = successor_root / "slurm_scheduler" / "config.py"
+    successor_scheduler = (
+        successor_root / "slurm_scheduler" / "scheduler.py"
+    )
+    successor_config.parent.mkdir(parents=True)
+    successor_config.write_text("successor config", encoding="utf-8")
+    successor_scheduler.write_text("successor scheduler", encoding="utf-8")
+    current = tmp_path / "live.cmd"
+    current.write_text(
+        " ".join(
+            (
+                "successor-commit",
+                str(successor_root),
+                str(live_config),
+                "8002",
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(submitter, "LIVE_LAUNCHER", current)
+    monkeypatch.setattr(submitter, "LIVE_CONFIG", live_config)
+    monkeypatch.setattr(
+        submitter,
+        "LIVE_LAUNCHER_SHA256",
+        submitter.sha256_file(historical),
+    )
+    monkeypatch.setattr(
+        submitter,
+        "LIVE_LAUNCHER_SIZE_BYTES",
+        historical.stat().st_size,
+    )
+    monkeypatch.setattr(
+        submitter,
+        "HISTORICAL_LAUNCHER_ARCHIVE",
+        historical,
+    )
+    monkeypatch.setattr(
+        submitter,
+        "CURRENT_LIVE_LAUNCHER_SHA256",
+        submitter.sha256_file(current),
+    )
+    monkeypatch.setattr(
+        submitter,
+        "CURRENT_DEPLOYED_COMMIT",
+        "successor-commit",
+    )
+    monkeypatch.setattr(
+        submitter,
+        "CURRENT_DEPLOYED_ROOT",
+        successor_root,
+    )
+    monkeypatch.setattr(
+        submitter,
+        "CURRENT_DEPLOYED_CONFIG_PY",
+        successor_config,
+    )
+    monkeypatch.setattr(
+        submitter,
+        "CURRENT_DEPLOYED_CONFIG_PY_SHA256",
+        submitter.sha256_file(successor_config),
+    )
+    monkeypatch.setattr(
+        submitter,
+        "CURRENT_DEPLOYED_SCHEDULER_PY",
+        successor_scheduler,
+    )
+    monkeypatch.setattr(
+        submitter,
+        "CURRENT_DEPLOYED_SCHEDULER_PY_SHA256",
+        submitter.sha256_file(successor_scheduler),
+    )
+
+    record, text = submitter._authenticate_launcher_history()
+    assert record == {
+        "path": str(current.resolve()),
+        "sha256": submitter.sha256_file(historical),
+        "size_bytes": historical.stat().st_size,
+    }
+    assert text == "historical launcher"
+
+    current.write_text(
+        current.read_text(encoding="utf-8") + " arbitrary-drift",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        submitter.PostdeadlineContractError,
+        match="launcher bytes drifted",
+    ):
+        submitter._authenticate_launcher_history()
 
 
 class Lock:

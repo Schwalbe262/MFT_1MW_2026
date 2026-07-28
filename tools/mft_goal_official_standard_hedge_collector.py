@@ -162,8 +162,15 @@ def _validate_runtime_authority(
     )
     if authority != expected:
         raise CollectionError(f"{label} runtime authority drifted")
+    try:
+        submitter._validate_historical_launcher_record(
+            authority.get("launcher")
+        )
+    except prepare_only.PostdeadlineContractError as exc:
+        raise CollectionError(
+            f"{label} runtime authority launcher drifted"
+        ) from exc
     for key in (
-        "launcher",
         "live_config",
         "deployed_config_py",
         "deployed_scheduler_py",
