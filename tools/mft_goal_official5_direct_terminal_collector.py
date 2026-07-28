@@ -1093,7 +1093,9 @@ def _goal_evidence(result: Mapping[str, Any]) -> dict[str, Any]:
     )
     active_targets = []
     temperatures = {}
-    family_values: dict[str, list[float]] = {"winding": [], "core": []}
+    family_values: dict[str, list[float]] = {
+        family: [] for family in TEMPERATURE_FAMILY_LIMITS_C
+    }
     n2_side = _finite(result.get("N2_side"), "N2_side")
     for target, family in TEMPERATURE_TARGET_FAMILIES.items():
         if target in {
@@ -1104,16 +1106,21 @@ def _goal_evidence(result: Mapping[str, Any]) -> dict[str, Any]:
         value = _finite(result.get(target), target)
         limit = float(TEMPERATURE_TARGET_LIMITS_C[target])
         active_targets.append(target)
+        if family not in family_values:
+            raise CollectionError(
+                f"unknown temperature family for target {target}"
+            )
         family_values[family].append(value)
         temperatures[target] = {
             "actual_C": value,
             "limit_C": limit,
             "passed": value <= limit,
         }
-    if not family_values["winding"] or not family_values["core"]:
+    if any(not values for values in family_values.values()):
         raise CollectionError("temperature family evidence is incomplete")
-    winding_max = max(family_values["winding"])
-    core_max = max(family_values["core"])
+    family_maxima = {
+        family: max(values) for family, values in family_values.items()
+    }
     gates = {
         "width_mm": {
             "actual": width,
@@ -1139,19 +1146,14 @@ def _goal_evidence(result: Mapping[str, Any]) -> dict[str, Any]:
             "relation": ">=",
             "passed": resonance >= float(GOAL_RESONANCE_MIN_HZ),
         },
-        "winding_max_C": {
-            "actual": winding_max,
-            "limit": float(TEMPERATURE_FAMILY_LIMITS_C["winding"]),
-            "relation": "<=",
-            "passed": winding_max
-            <= float(TEMPERATURE_FAMILY_LIMITS_C["winding"]),
-        },
-        "core_max_C": {
-            "actual": core_max,
-            "limit": float(TEMPERATURE_FAMILY_LIMITS_C["core"]),
-            "relation": "<=",
-            "passed": core_max
-            <= float(TEMPERATURE_FAMILY_LIMITS_C["core"]),
+        **{
+            f"{family}_max_C": {
+                "actual": family_maxima[family],
+                "limit": float(limit),
+                "relation": "<=",
+                "passed": family_maxima[family] <= float(limit),
+            }
+            for family, limit in TEMPERATURE_FAMILY_LIMITS_C.items()
         },
     }
     for item in gates.values():
@@ -1194,6 +1196,7 @@ def _goal_evidence(result: Mapping[str, Any]) -> dict[str, Any]:
         },
         "active_temperature_targets": active_targets,
         "temperature_targets": temperatures,
+        "temperature_family_max_C": family_maxima,
         "temperature_target_gate_passed": not failed_targets,
         "gates": gates,
         "losses_W": losses,
