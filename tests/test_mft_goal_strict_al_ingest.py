@@ -295,6 +295,7 @@ def test_base_audit_defaults_only_append_only_post_capture_inputs(
         "cap_turn_graded_reverse_terminal_polarity": 0,
         "cap_turn_graded_side_polarity": 1,
         "cap_turn_graded_side2_polarity": 1,
+        "core_equal_three_leg_air_gap": 0,
     }
     assert normalization["source_dataset_mutated"] is False
     assert record["column_count"] == len(frame.columns) - len(missing)
