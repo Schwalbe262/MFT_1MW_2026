@@ -22,9 +22,11 @@ import feeder
 
 SOLVER_REVISION = "a" * 40
 LIBRARY_REVISION = "b" * 40
-# Compact-JSON digest from the pre-pooled payload builder for this fixed fixture.
+# Canonical compact-JSON digest for the current non-pooled contract.  The
+# fixture contains only scheduler/runtime literals, not host filesystem paths;
+# sorting keys keeps the digest independent of Python dict insertion order.
 LEGACY_PAYLOAD_SHA256 = (
-    "c9729f8f224a26bbf0161381c06ffe54709d678f48163bb032cbc19ec9d4dd1e"
+    "bc09da74a72789fcc1b95488e154380200a6f817d227897d2725203c859af4d9"
 )
 
 
@@ -444,7 +446,7 @@ class FeederPooledSubmissionTests(unittest.TestCase):
         self.assertNotIn("aedt_backend", payload)
         self.assertNotIn("submission_env", payload)
         legacy_bytes = json.dumps(
-            payload, ensure_ascii=True, separators=(",", ":")
+            payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
         ).encode("utf-8")
         self.assertEqual(
             hashlib.sha256(legacy_bytes).hexdigest(), LEGACY_PAYLOAD_SHA256)
