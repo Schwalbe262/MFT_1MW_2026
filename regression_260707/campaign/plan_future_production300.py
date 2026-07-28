@@ -60,7 +60,10 @@ RECOVERY_SUBMISSION_PATH = HERE / "pilot_manifests" / (
 )
 RECOVERY_TASK_IDS = (28077, 28078, 28079, 28080)
 PROJECT_HARD_CAP = 300
-SOLVER_DEPLOYMENT_REFS = (
+# Immutable recovery4 submission evidence.  These refs describe what the
+# remote advertised on 2026-07-12; they are replay data, not a live deployment
+# requirement for newly executed work.
+HISTORICAL_RECOVERY_SOLVER_DEPLOYMENT_REFS = (
     "refs/heads/fix/mft-rx-block-fastpath-260712",
     "refs/heads/stabilize/mft-sim-260710",
 )
@@ -106,7 +109,7 @@ def _validate_recovery_evidence(recovery, recovery_plan):
         "solver": {
             "repo_root": str(REPO_ROOT.resolve()),
             "revision": SOLVER,
-            "refs": list(SOLVER_DEPLOYMENT_REFS),
+            "refs": list(HISTORICAL_RECOVERY_SOLVER_DEPLOYMENT_REFS),
         },
         "library": {
             "repo_root": str(LIBRARY_REPO_ROOT.resolve()),

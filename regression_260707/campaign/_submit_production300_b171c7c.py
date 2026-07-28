@@ -85,10 +85,7 @@ SEALED_OLD_MANIFEST_PROVENANCE_PATH = (
     r"\regression_260707\campaign\pilot_manifests"
     r"\replacement-s754923c-le6b9b9d-seed260710-cursor1843.json")
 LIBRARY_ROOT = REPO_ROOT.parent / "pyaedt_library_mft_clean"
-SOLVER_REFS = (
-    "refs/heads/fix/mft-rx-block-fastpath-260712",
-    "refs/heads/stabilize/mft-sim-260710",
-)
+CURRENT_SOLVER_DEPLOYMENT_REF = "refs/heads/main"
 LIBRARY_REFS = ("refs/heads/pyaedt_022",)
 
 COUNT = 300
@@ -96,6 +93,7 @@ PROJECT_CAP = 300
 ACTIVE_STATUSES = frozenset(("queued", "attaching", "running"))
 TERMINAL_STATUSES = frozenset(("completed", "failed", "cancelled"))
 FULL_SHA = re.compile(r"^[0-9a-f]{64}$")
+GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 EXPECTED_RESOURCES = {
     "project": scheduler_client.MFT_PROJECT,
     "cpus": 4,
@@ -190,8 +188,9 @@ def _git(repo, *args):
 
 
 def _clean_solver_deployment_root():
-    if _git(REPO_ROOT, "rev-parse", "HEAD") != SOLVER:
-        raise RuntimeError("local solver HEAD is not exact SHA-b171")
+    main_head = _git(REPO_ROOT, "rev-parse", CURRENT_SOLVER_DEPLOYMENT_REF)
+    if not GIT_SHA.fullmatch(main_head):
+        raise RuntimeError("local main deployment ref is not a full Git SHA")
     override = os.environ.get("MFT_SOLVER_DEPLOYMENT_ROOT", "").strip()
     candidates = [Path(override).resolve()] if override else []
     if not override:
@@ -202,7 +201,11 @@ def _clean_solver_deployment_root():
                 key, _, value = line.partition(" ")
                 if value:
                     fields[key] = value
-            if fields.get("HEAD") == SOLVER and fields.get("worktree"):
+            if (
+                fields.get("HEAD") == main_head
+                and fields.get("branch") == CURRENT_SOLVER_DEPLOYMENT_REF
+                and fields.get("worktree")
+            ):
                 candidates.append(Path(fields["worktree"]).resolve())
     seen = set()
     for candidate in candidates:
@@ -211,15 +214,51 @@ def _clean_solver_deployment_root():
             continue
         seen.add(key)
         try:
-            exact = _git(candidate, "rev-parse", "HEAD") == SOLVER
+            exact = _git(candidate, "rev-parse", "HEAD") == main_head
+            branch = _git(
+                candidate, "symbolic-ref", "--quiet", "HEAD",
+            ) == CURRENT_SOLVER_DEPLOYMENT_REF
             clean = not _git(
                 candidate, "status", "--porcelain", "--untracked-files=no",
             )
         except (OSError, subprocess.CalledProcessError):
             continue
-        if exact and clean:
+        if exact and branch and clean:
             return candidate
-    raise RuntimeError("no clean exact-SHA-b171 solver deployment worktree")
+    raise RuntimeError("no clean exact-main solver deployment worktree")
+
+
+def _require_solver_main_deployment(solver_root):
+    """Bind the pinned solver commit to the advertised current main history."""
+
+    solver_root = Path(solver_root).resolve()
+    heads = deployment_gate.advertised_heads(solver_root)
+    advertised_main = heads.get(CURRENT_SOLVER_DEPLOYMENT_REF)
+    if not isinstance(advertised_main, str) \
+            or not GIT_SHA.fullmatch(advertised_main):
+        raise RuntimeError("origin does not advertise an exact main head")
+    local_head = _git(solver_root, "rev-parse", "HEAD")
+    if local_head != advertised_main:
+        raise RuntimeError("clean local main deployment is stale")
+    try:
+        _git(
+            solver_root,
+            "merge-base",
+            "--is-ancestor",
+            SOLVER,
+            advertised_main,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "pinned SHA-b171 solver is not reachable from advertised main"
+        ) from exc
+    return {
+        "revision": SOLVER,
+        "refs": [CURRENT_SOLVER_DEPLOYMENT_REF],
+        "repo_root": str(solver_root),
+        "advertised_ref_head": advertised_main,
+        "revision_relation": "ancestor_or_equal",
+    }
 
 
 def _load_profile(plan):
@@ -551,10 +590,15 @@ def deployment_audit():
         raise RuntimeError("local library HEAD is not exact SHA-e6b9")
     if _git(LIBRARY_ROOT, "status", "--porcelain", "--untracked-files=all"):
         raise RuntimeError("local library worktree is dirty")
-    deployed = deployment_gate.validate_deployment(
-        solver_root, SOLVER, LIBRARY_ROOT, LIBRARY,
-    )
-    if tuple(deployed.get("solver", {}).get("refs", ())) != SOLVER_REFS:
+    deployed = {
+        "solver": _require_solver_main_deployment(solver_root),
+        "library": deployment_gate.require_advertised_revision(
+            LIBRARY_ROOT, LIBRARY, "library",
+        ),
+    }
+    if tuple(deployed.get("solver", {}).get("refs", ())) != (
+        CURRENT_SOLVER_DEPLOYMENT_REF,
+    ):
         raise RuntimeError("advertised solver refs drifted")
     if tuple(deployed.get("library", {}).get("refs", ())) != LIBRARY_REFS:
         raise RuntimeError("advertised library refs drifted")

@@ -2,6 +2,7 @@ import copy
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,115 @@ CAMPAIGN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CAMPAIGN_DIR))
 
 import _submit_production300_b171c7c as submitter  # noqa: E402
+import plan_future_production300 as planner  # noqa: E402
+
+
+class Production300RemoteRefCompatibilityTests(unittest.TestCase):
+    def test_historical_recovery_refs_remain_replay_only(self):
+        self.assertEqual(
+            planner.HISTORICAL_RECOVERY_SOLVER_DEPLOYMENT_REFS,
+            (
+                "refs/heads/fix/mft-rx-block-fastpath-260712",
+                "refs/heads/stabilize/mft-sim-260710",
+            ),
+        )
+        self.assertNotIn(
+            submitter.CURRENT_SOLVER_DEPLOYMENT_REF,
+            planner.HISTORICAL_RECOVERY_SOLVER_DEPLOYMENT_REFS,
+        )
+
+    def test_clean_solver_deployment_root_selects_current_main(self):
+        main_head = "c" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = Path(tmp) / "legacy"
+            main = Path(tmp) / "main"
+            records = (
+                f"worktree {legacy}\nHEAD {submitter.SOLVER}\n"
+                "branch refs/heads/fix/mft-rx-block-fastpath-260712\n\n"
+                f"worktree {main}\nHEAD {main_head}\n"
+                f"branch {submitter.CURRENT_SOLVER_DEPLOYMENT_REF}\n"
+            )
+
+            def fake_git(repo, *args):
+                repo = Path(repo).resolve()
+                if args == (
+                    "rev-parse",
+                    submitter.CURRENT_SOLVER_DEPLOYMENT_REF,
+                ):
+                    return main_head
+                if args == ("worktree", "list", "--porcelain"):
+                    return records
+                if args == ("rev-parse", "HEAD"):
+                    return main_head
+                if args == ("symbolic-ref", "--quiet", "HEAD"):
+                    return submitter.CURRENT_SOLVER_DEPLOYMENT_REF
+                if args == ("status", "--porcelain", "--untracked-files=no"):
+                    return ""
+                raise AssertionError((repo, args))
+
+            with mock.patch.dict(submitter.os.environ, {}, clear=True), \
+                    mock.patch.object(submitter, "_git", side_effect=fake_git):
+                selected = submitter._clean_solver_deployment_root()
+
+        self.assertEqual(selected, main.resolve())
+
+    def test_solver_deployment_requires_pinned_revision_in_main_history(self):
+        main_head = "c" * 40
+
+        def fake_git(_repo, *args):
+            if args == ("rev-parse", "HEAD"):
+                return main_head
+            if args == (
+                "merge-base",
+                "--is-ancestor",
+                submitter.SOLVER,
+                main_head,
+            ):
+                return ""
+            raise AssertionError(args)
+
+        with mock.patch.object(
+            submitter.deployment_gate,
+            "advertised_heads",
+            return_value={submitter.CURRENT_SOLVER_DEPLOYMENT_REF: main_head},
+        ), mock.patch.object(submitter, "_git", side_effect=fake_git):
+            deployed = submitter._require_solver_main_deployment(CAMPAIGN_DIR)
+
+        self.assertEqual(
+            deployed["refs"], [submitter.CURRENT_SOLVER_DEPLOYMENT_REF]
+        )
+        self.assertEqual(deployed["advertised_ref_head"], main_head)
+        self.assertEqual(deployed["revision"], submitter.SOLVER)
+
+    def test_solver_deployment_fails_when_pinned_revision_left_main(self):
+        main_head = "c" * 40
+
+        def fake_git(_repo, *args):
+            if args == ("rev-parse", "HEAD"):
+                return main_head
+            if args[0:2] == ("merge-base", "--is-ancestor"):
+                raise subprocess.CalledProcessError(1, ["git", *args])
+            raise AssertionError(args)
+
+        with mock.patch.object(
+            submitter.deployment_gate,
+            "advertised_heads",
+            return_value={submitter.CURRENT_SOLVER_DEPLOYMENT_REF: main_head},
+        ), mock.patch.object(submitter, "_git", side_effect=fake_git):
+            with self.assertRaisesRegex(RuntimeError, "not reachable"):
+                submitter._require_solver_main_deployment(CAMPAIGN_DIR)
+
+    def test_solver_deployment_fails_when_origin_main_is_absent(self):
+        with mock.patch.object(
+            submitter.deployment_gate,
+            "advertised_heads",
+            return_value={
+                "refs/heads/fix/mft-rx-block-fastpath-260712": submitter.SOLVER
+            },
+        ), mock.patch.object(submitter, "_git") as git:
+            with self.assertRaisesRegex(RuntimeError, "advertise.*main"):
+                submitter._require_solver_main_deployment(CAMPAIGN_DIR)
+        git.assert_not_called()
 
 
 @unittest.skip(
@@ -81,22 +191,32 @@ class Production300SubmitterTests(unittest.TestCase):
         self.assertEqual(len({row["dedupe_key"] for row in bundle["plan_records"]}), 300)
 
     def test_clean_solver_deployment_root_selects_exact_clean_worktree(self):
+        main_head = "c" * 40
         with tempfile.TemporaryDirectory() as tmp:
             dirty = Path(tmp) / "dirty"
             clean = Path(tmp) / "clean"
             records = (
-                f"worktree {dirty}\nHEAD {submitter.SOLVER}\nbranch refs/heads/main\n\n"
-                f"worktree {clean}\nHEAD {submitter.SOLVER}\nbranch refs/heads/fix\n"
+                f"worktree {dirty}\nHEAD {submitter.SOLVER}\n"
+                "branch refs/heads/fix/mft-rx-block-fastpath-260712\n\n"
+                f"worktree {clean}\nHEAD {main_head}\n"
+                f"branch {submitter.CURRENT_SOLVER_DEPLOYMENT_REF}\n"
             )
 
             def fake_git(repo, *args):
                 repo = Path(repo).resolve()
+                if args == (
+                    "rev-parse",
+                    submitter.CURRENT_SOLVER_DEPLOYMENT_REF,
+                ):
+                    return main_head
                 if args == ("worktree", "list", "--porcelain"):
                     return records
                 if args == ("rev-parse", "HEAD"):
-                    return submitter.SOLVER
+                    return main_head
+                if args == ("symbolic-ref", "--quiet", "HEAD"):
+                    return submitter.CURRENT_SOLVER_DEPLOYMENT_REF
                 if args == ("status", "--porcelain", "--untracked-files=no"):
-                    return " M user.ipynb" if repo == dirty.resolve() else ""
+                    return ""
                 raise AssertionError((repo, args))
 
             with mock.patch.dict(submitter.os.environ, {}, clear=True), \
@@ -106,24 +226,33 @@ class Production300SubmitterTests(unittest.TestCase):
         self.assertEqual(selected, clean.resolve())
 
     def test_clean_solver_deployment_root_fails_without_exact_clean_candidate(self):
+        main_head = "c" * 40
         with tempfile.TemporaryDirectory() as tmp:
             dirty = Path(tmp) / "dirty"
             records = (
-                f"worktree {dirty}\nHEAD {submitter.SOLVER}\nbranch refs/heads/main\n"
+                f"worktree {dirty}\nHEAD {main_head}\n"
+                f"branch {submitter.CURRENT_SOLVER_DEPLOYMENT_REF}\n"
             )
 
             def fake_git(repo, *args):
+                if args == (
+                    "rev-parse",
+                    submitter.CURRENT_SOLVER_DEPLOYMENT_REF,
+                ):
+                    return main_head
                 if args == ("worktree", "list", "--porcelain"):
                     return records
                 if args == ("rev-parse", "HEAD"):
-                    return submitter.SOLVER
+                    return main_head
+                if args == ("symbolic-ref", "--quiet", "HEAD"):
+                    return submitter.CURRENT_SOLVER_DEPLOYMENT_REF
                 if args == ("status", "--porcelain", "--untracked-files=no"):
                     return " M user.ipynb"
                 raise AssertionError((repo, args))
 
             with mock.patch.dict(submitter.os.environ, {}, clear=True), \
                     mock.patch.object(submitter, "_git", side_effect=fake_git):
-                with self.assertRaisesRegex(RuntimeError, "no clean exact-SHA"):
+                with self.assertRaisesRegex(RuntimeError, "no clean exact-main"):
                     submitter._clean_solver_deployment_root()
 
     def test_default_audit_missing_gate_has_zero_scheduler_activity(self):
