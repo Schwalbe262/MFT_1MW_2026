@@ -31,6 +31,7 @@ from module.mft_goal_20260726_contract import (  # noqa: E402
     GOAL_CONTRACT_SCHEMA,
     GOAL_STAGE_SPEC,
     GOAL_STAGE_SPEC_SHA256,
+    GOAL_TEMPERATURE_CONTRACT_SHA256,
     GOAL_TEMPERATURE_TARGETS,
     PRIMARY_WINDING_TEMPERATURE_TARGETS,
     SECONDARY_WINDING_TEMPERATURE_TARGETS,
@@ -2512,6 +2513,11 @@ def _validate_task(value: Mapping[str, Any]) -> dict[str, Any]:
             )
         ):
             raise RuntimeError("diagnostic task search profile mismatch")
+    expected_temperature_contract_sha256 = (
+        GOAL_TEMPERATURE_CONTRACT_SHA256
+        if search_profile is None
+        else search_profile["temperature_contract_sha256"]
+    )
     digest_fields = (
         "train_report_sha256",
         "candidate_sha256",
@@ -2529,7 +2535,7 @@ def _validate_task(value: Mapping[str, Any]) -> dict[str, Any]:
         or task.get("stage_spec") != GOAL_STAGE_SPEC
         or task.get("stage_spec_sha256") != GOAL_STAGE_SPEC_SHA256
         or task.get("temperature_contract_sha256")
-        != search_profile["temperature_contract_sha256"]
+        != expected_temperature_contract_sha256
         or task.get("hard_constraint_contract_sha256")
         != activation["effective_hard_constraint_contract_sha256"]
         or task.get("source_identity") != activation["source_identity"]
@@ -2766,9 +2772,9 @@ def execute(args: argparse.Namespace) -> Path:
                 "train_report_sha256"
             ],
             "evaluation_spec_sha256": GOAL_STAGE_SPEC_SHA256,
-            "temperature_contract_sha256": (
-                search_profile["temperature_contract_sha256"]
-            ),
+            "temperature_contract_sha256": task[
+                "temperature_contract_sha256"
+            ],
             "hard_constraint_contract_sha256": task[
                 "hard_constraint_contract_sha256"
             ],

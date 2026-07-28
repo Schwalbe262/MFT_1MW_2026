@@ -1827,6 +1827,12 @@ def test_diagnostic_n1_6_compact_contract_is_separate_screening_only():
         }
     )
     assert diagnostic_scout._validate_task(task) == task
+    forged_temperature = copy.deepcopy(task)
+    forged_temperature.pop("payload_sha256")
+    forged_temperature["temperature_contract_sha256"] = "f" * 64
+    forged_temperature = launch._seal(forged_temperature)
+    with pytest.raises(RuntimeError, match="task contract"):
+        diagnostic_scout._validate_task(forged_temperature)
     forged = copy.deepcopy(task)
     forged.pop("payload_sha256")
     forged["production_eligible"] = True
