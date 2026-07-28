@@ -529,6 +529,12 @@ CANDIDATE_REPORT_FIELDS = (
     "pred_secondary_side_winding_loss_W", "pred_secondary_winding_loss_W",
     "pred_component_winding_loss_sum_W", "pred_total_winding_loss_W",
     "pred_total_loss_W", "rated_power_W", "pred_efficiency_pct",
+    "surrogate_output_basis",
+)
+# These fields are accepted by newer candidate artifacts but are deliberately
+# optional.  CANDIDATE_REPORT_FIELDS remains the producer compatibility
+# contract used by the current Tier-1 persistence path.
+CANDIDATE_UI_OPTIONAL_FIELDS = (
     "pred_k", "pred_C_tx_tx_F", "pred_C_rx_rx_F", "pred_C_tx_rx_F",
     "pred_f_res_tx_self_Hz", "pred_f_res_rx_self_Hz",
     "pred_f_res_interwinding_Hz",
@@ -543,7 +549,6 @@ CANDIDATE_REPORT_FIELDS = (
     "cu_mass_Tx_kg", "cu_mass_Rx_main_kg", "cu_mass_Rx_side_kg",
     "cu_mass_total_kg", "window_fill_x", "window_fill_z1",
     "aspect_h1_l2", "aspect_w1_l2",
-    "surrogate_output_basis",
 )
 _CANDIDATE_DIMENSION_ALIASES = {
     "size_W_mm": (
@@ -7029,7 +7034,10 @@ class ArtifactService:
         }
         report = {
             key: _coerce(row.get(key))
-            for key in CANDIDATE_REPORT_FIELDS
+            for key in (
+                *CANDIDATE_REPORT_FIELDS,
+                *CANDIDATE_UI_OPTIONAL_FIELDS,
+            )
             if row.get(key) not in (None, "")
         }
         report.update(dimension_report)
