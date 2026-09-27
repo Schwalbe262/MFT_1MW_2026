@@ -33,6 +33,7 @@ from run_simulation_260706 import (
     _parse_rl_matrix_export,
     _remap_copied_design_objects,
     _retry_copied_loss_preparation,
+    _runtime_provenance,
     _set_copied_loss_winding_excitation,
     _thermal_failure_frame,
     _thermal_result_is_valid,
@@ -4766,6 +4767,13 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
         self.assertEqual(_completion_exit_code(7, 8), 1)
         self.assertEqual(_completion_exit_code(1, 8), 1)
         self.assertEqual(_completion_exit_code(0, 8), 1)
+
+
+class RuntimeProvenanceTests(unittest.TestCase):
+    def test_native_aedt_version_is_recorded_and_checked(self):
+        desktop = SimpleNamespace(version=None, aedt_version_id="2025.2")
+        with patch.dict(os.environ, {"MFT_EXPECTED_AEDT_VERSION": "2025.2"}, clear=True):
+            self.assertEqual(_runtime_provenance(desktop)["aedt_version"], "2025.2")
 
 
 if __name__ == "__main__":

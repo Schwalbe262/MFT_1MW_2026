@@ -878,6 +878,7 @@ def _runtime_provenance(desktop):
             pyaedt_version = "unknown"
     aedt_version = str(
         getattr(desktop, "version", None)
+        or getattr(desktop, "aedt_version_id", None)
         or getattr(desktop, "_aedt_version", None)
         or "unknown"
     )
