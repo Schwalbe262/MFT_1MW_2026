@@ -8,6 +8,22 @@ import pytest
 from regression_260707.monitoring import deadline_design, readers
 
 
+def test_regular_file_accepts_readable_provider_without_strict_realpath(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "selector.json"
+    path.write_text("{}", encoding="utf-8")
+    original_resolve = Path.resolve
+
+    def provider_resolve(self, strict=False):
+        if self == path and strict:
+            raise FileNotFoundError(str(self))
+        return original_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", provider_resolve)
+    assert deadline_design._regular_file(path, "selector", 1024) == path
+
+
 def _write(path, payload):
     path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",

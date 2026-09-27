@@ -287,7 +287,25 @@ def _file_sha256(path: Path) -> str:
 
 
 def _regular_file(path: Path, label: str, max_bytes: int) -> Path:
-    resolved = path.resolve(strict=True)
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        # RaiDrive can stat and open a file while Windows realpath(strict=True)
+        # reports it missing.  Accept that provider only after checking the
+        # original path and every parent for links/reparse points.
+        try:
+            for component in (path, *path.parents):
+                attributes = getattr(component.lstat(), "st_file_attributes", 0)
+                if component.is_symlink() or attributes & getattr(
+                    stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
+                ):
+                    raise DeadlineDesignError(
+                        f"{label} contains a link or reparse point: {component}"
+                    )
+            resolved = path.resolve(strict=False)
+            resolved.stat()
+        except OSError as fallback_exc:
+            raise DeadlineDesignError(f"{label} is unavailable: {path}") from fallback_exc
     info = resolved.stat()
     reparse = getattr(info, "st_file_attributes", 0) & getattr(
         stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
