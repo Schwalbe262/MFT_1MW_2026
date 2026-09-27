@@ -398,6 +398,53 @@ def _raw_aedt_object_attribute(obj, property_name):
     return str(value).strip().strip('"')
 
 
+def _attest_native_solid_geometry(design, groups, stage):
+    """Require each expected solid to exist in the AEDT editor with volume."""
+    try:
+        native_names = list(design.modeler.oeditor.GetObjectsInGroup("Solids"))
+    except Exception as exc:
+        raise RuntimeError(f"{stage}: native solid inventory unavailable") from exc
+    if not native_names or len(native_names) != len(set(native_names)):
+        raise RuntimeError(f"{stage}: native solid inventory is empty or duplicated")
+    native = set(native_names)
+    counts = {}
+    for label, objects in groups.items():
+        objects = list(objects)
+        names = [getattr(obj, "name", "") for obj in objects]
+        if len(names) != len(set(names)) or any(not name for name in names):
+            raise RuntimeError(f"{stage}: {label} has missing or duplicate object names")
+        missing = sorted(set(names) - native)
+        if missing:
+            raise RuntimeError(f"{stage}: {label} missing native solids: {missing!r}")
+        for obj in objects:
+            try:
+                volume = abs(float(obj.volume))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{stage}: native volume unavailable for {obj.name!r}"
+                ) from exc
+            if not math.isfinite(volume) or volume <= 0.0:
+                raise RuntimeError(
+                    f"{stage}: invalid native volume for {obj.name!r}: {volume!r}"
+                )
+        counts[label] = len(objects)
+    return counts
+
+
+def _dab_phase_for_target(target_w, frequency_hz, leakage_h, primary_v, secondary_referred_v):
+    """Calculate the existing sinusoidal DAB proxy phase, rejecting infeasible power."""
+    values = (target_w, frequency_hz, leakage_h, primary_v, secondary_referred_v)
+    if not all(math.isfinite(float(value)) and float(value) > 0 for value in values):
+        raise ValueError("DAB phase inputs must be finite and positive")
+    ratio = (float(target_w) * 2 * math.pi * float(frequency_hz)
+             * float(leakage_h) / (float(primary_v) * float(secondary_referred_v)))
+    if not math.isfinite(ratio) or ratio > 1.0:
+        raise ValueError(
+            f"P_target unreachable under sinusoidal DAB proxy: sin(phi)={ratio:.12g}"
+        )
+    return math.degrees(math.asin(ratio))
+
+
 def _sheet_area_model_units(sheet):
     """Read one sheet area through PyAEDT's FacePrimitive API."""
     name = getattr(sheet, "name", sheet)
@@ -816,6 +863,44 @@ def _library_git_provenance():
 
 
 PYAEDT_LIBRARY_GIT_HASH, PYAEDT_LIBRARY_GIT_DIRTY = _library_git_provenance()
+
+
+def _runtime_provenance(desktop):
+    """Capture solver versions and honor an explicit verified rerun contract."""
+    from importlib import metadata
+
+    try:
+        pyaedt_version = metadata.version("ansys-aedt-core")
+    except metadata.PackageNotFoundError:
+        try:
+            pyaedt_version = metadata.version("pyaedt")
+        except metadata.PackageNotFoundError:
+            pyaedt_version = "unknown"
+    aedt_version = str(
+        getattr(desktop, "version", None)
+        or getattr(desktop, "_aedt_version", None)
+        or "unknown"
+    )
+    observed = {
+        "solver_git_hash": GIT_HASH,
+        "pyaedt_library_git_hash": PYAEDT_LIBRARY_GIT_HASH,
+        "pyaedt_version": pyaedt_version,
+        "aedt_version": aedt_version,
+    }
+    expected_env = {
+        "solver_git_hash": "MFT_EXPECTED_SOLVER_GIT_HASH",
+        "pyaedt_library_git_hash": "MFT_EXPECTED_PYAEDT_LIBRARY_GIT_HASH",
+        "pyaedt_version": "MFT_EXPECTED_PYAEDT_VERSION",
+        "aedt_version": "MFT_EXPECTED_AEDT_VERSION",
+    }
+    for key, env_name in expected_env.items():
+        expected = os.environ.get(env_name, "").strip()
+        if expected and observed[key] != expected:
+            raise RuntimeError(
+                f"runtime version mismatch ({key}): expected={expected!r}, "
+                f"actual={observed[key]!r}"
+            )
+    return observed
 
 
 class SolutionDataUnavailableError(RuntimeError):
@@ -3292,6 +3377,24 @@ class Simulation():
             core_equal_three_leg_air_gap=equal_three_leg_gap,
         )
         if native_stacking:
+            pieces_per_group = (
+                8 if equal_three_leg_gap and center_gap_mm > 0
+                else 6 if center_gap_mm > 0 else 5
+            )
+        else:
+            pieces_per_group = 1
+        if len(core_objs) != n_group * pieces_per_group:
+            raise RuntimeError("core creation returned an unexpected piece count")
+        if len(plate_objs) != (3 * (n_group + 1) if plate_on else 0):
+            raise RuntimeError("core plate creation returned an unexpected piece count")
+        if len(pad_objs) != (6 * (n_group + 1) if pad_on and plate_on else 0):
+            raise RuntimeError("core pad creation returned an unexpected piece count")
+        _attest_native_solid_geometry(
+            self.design1,
+            {"core": core_objs, "core_plates": plate_objs, "core_pads": pad_objs},
+            "core creation",
+        )
+        if native_stacking:
             if center_gap_mm > 0.0:
                 if equal_three_leg_gap:
                     expected_regions = set(
@@ -3760,6 +3863,29 @@ class Simulation():
             self.design1.wcp_plates = []
             self.design1.wcp_pads = []
 
+        expected_wcp_plates = 2 * len(tx_slot_indices) if wcp_on else 0
+        expected_wcp_pads = (
+            2 * expected_wcp_plates
+            if float(self.df_plus["wcp_pad_t"].iloc[0]) > 0 else 0
+        )
+        if (len(self.design1.wcp_plates) != expected_wcp_plates
+                or len(self.design1.wcp_pads) != expected_wcp_pads):
+            raise RuntimeError("winding cooling plate or pad creation count mismatch")
+        _attest_native_solid_geometry(
+            self.design1,
+            {
+                "Tx_main": self.design1.Tx_windings_main,
+                "Rx_main": self.design1.Rx_windings_main,
+                "Tx_side": self.design1.Tx_windings_side,
+                "Rx_side": self.design1.Rx_windings_side,
+                "Tx_side2": self.design1.Tx_windings_side2,
+                "Rx_side2": self.design1.Rx_windings_side2,
+                "wcp_plates": self.design1.wcp_plates,
+                "wcp_pads": self.design1.wcp_pads,
+            },
+            "coil creation",
+        )
+
         self.Tx_windings = self.design1.Tx_windings_main + self.design1.Tx_windings_side + self.design1.Tx_windings_side2
         self.Rx_windings = self.design1.Rx_windings_main + self.design1.Rx_windings_side + self.design1.Rx_windings_side2
         self.design1.Tx_windings = self.Tx_windings
@@ -3778,10 +3904,27 @@ class Simulation():
                      + self.design1.Tx_windings_side + self.design1.Rx_windings_side)
         flux_sheets = list(self.design1.core_flux_sheets)
 
+        # A split may legitimately remove solids outside the retained octant.
+        # Record which source solids intersect its interior before editing.
+        expected_retained = set()
+        for obj in geometrys:
+            try:
+                bbox = tuple(float(value) for value in obj.bounding_box)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"symmetry split: bounding box unavailable for {obj.name!r}"
+                ) from exc
+            if len(bbox) != 6 or not all(math.isfinite(value) for value in bbox):
+                raise RuntimeError(f"symmetry split: invalid bounding box for {obj.name!r}")
+            if bbox[0] < 0 and bbox[4] > 0 and bbox[5] > 0:
+                expected_retained.add(obj.name)
+
         # 분할 순서대로 진행하되, 앞 분할에서 통째로 삭제된 오브젝트를 다음 호출에 넘기지 않음
         # (넘기면 AEDT가 'Part not found' 경고를 배치로 뿜음 - 무해하지만 소음)
         def _alive(objs):
-            existing = set(self.design1.modeler.object_names)
+            editor = self.design1.modeler.oeditor
+            existing = (set(editor.GetObjectsInGroup("Solids"))
+                        | set(editor.GetObjectsInGroup("Sheets")))
             return [o for o in objs if o.name in existing]
 
         self.design1.modeler.split(assignment=geometrys, plane="XY", sides="PositiveOnly")
@@ -3801,7 +3944,29 @@ class Simulation():
 
         # 대칭 분할로 완전히 잘려나간 오브젝트(y<0 쪽 콜드플레이트/냉각판 등)를 리스트에서 제거
         # (이후 eddy 설정/손실 계산이 존재하지 않는 오브젝트를 참조하지 않도록)
-        existing = set(self.design1.modeler.object_names)
+        editor = self.design1.modeler.oeditor
+        native = set(editor.GetObjectsInGroup("Solids"))
+        existing = native | set(editor.GetObjectsInGroup("Sheets"))
+        missing_retained = sorted(expected_retained - native)
+        if missing_retained:
+            raise RuntimeError(
+                f"symmetry split removed required native solids: {missing_retained!r}"
+            )
+        for obj in geometrys:
+            if obj.name not in expected_retained:
+                continue
+            try:
+                bounds = tuple(float(value) for value in obj.bounding_box)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"symmetry split: retained bounds unavailable for {obj.name!r}"
+                ) from exc
+            if (len(bounds) != 6 or not all(math.isfinite(value) for value in bounds)
+                    or bounds[3] > 1e-6 or bounds[1] < -1e-6
+                    or bounds[2] < -1e-6):
+                raise RuntimeError(
+                    f"symmetry split left {obj.name!r} outside retained octant: {bounds!r}"
+                )
         self.design1.core_objs = [o for o in self.design1.core_objs if o.name in existing]
         center_gap_mm = float(
             self.df_plus["core_center_gap_mm"].iloc[0]
@@ -3955,6 +4120,21 @@ class Simulation():
         self.design1.core_pads = [o for o in self.design1.core_pads if o.name in existing]
         self.design1.wcp_plates = [o for o in self.design1.wcp_plates if o.name in existing]
         self.design1.wcp_pads = [o for o in self.design1.wcp_pads if o.name in existing]
+        _attest_native_solid_geometry(
+            self.design1,
+            {
+                "core": self.design1.core_objs,
+                "core_plates": self.design1.core_plates,
+                "core_pads": self.design1.core_pads,
+                "wcp_plates": self.design1.wcp_plates,
+                "wcp_pads": self.design1.wcp_pads,
+                "Tx_main": self.design1.Tx_windings_main,
+                "Rx_main": self.design1.Rx_windings_main,
+                "Tx_side": self.design1.Tx_windings_side,
+                "Rx_side": self.design1.Rx_windings_side,
+            },
+            "symmetry split",
+        )
 
     def create_coil_section(self):
 
@@ -8042,6 +8222,14 @@ class Simulation():
         results_df["git_dirty"] = GIT_DIRTY
         results_df["pyaedt_library_git_hash"] = PYAEDT_LIBRARY_GIT_HASH
         results_df["pyaedt_library_git_dirty"] = PYAEDT_LIBRARY_GIT_DIRTY
+        runtime = getattr(self, "runtime_provenance", {})
+        excitation_model = (
+            "single_frequency_sinusoidal_proxy"
+            if int(self.df_plus["loss_on"].iloc[0]) else "none"
+        )
+        results_df["pyaedt_version"] = runtime.get("pyaedt_version", "unknown")
+        results_df["aedt_version"] = runtime.get("aedt_version", "unknown")
+        results_df["loss_excitation_model"] = excitation_model
         results_df["project_name"] = getattr(self, "PROJECT_NAME", "")
         results_df["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # RESULT_JSON 스트리밍이 동일 메타(특히 dedup 키)를 쓰도록 보관
@@ -8049,6 +8237,9 @@ class Simulation():
                                "git_dirty": GIT_DIRTY,
                                "pyaedt_library_git_hash": PYAEDT_LIBRARY_GIT_HASH,
                                "pyaedt_library_git_dirty": PYAEDT_LIBRARY_GIT_DIRTY,
+                               "pyaedt_version": runtime.get("pyaedt_version", "unknown"),
+                               "aedt_version": runtime.get("aedt_version", "unknown"),
+                               "loss_excitation_model": excitation_model,
                                "project_name": results_df["project_name"].iloc[0],
                                "saved_at": results_df["saved_at"].iloc[0]}
 
@@ -8443,6 +8634,7 @@ def _create_simulation_session(max_attempts=3, retry_delay_s=30):
             simulation = Simulation(desktop=desktop)
             if simulation is None:
                 raise RuntimeError("Simulation construction returned None")
+            simulation.runtime_provenance = _runtime_provenance(desktop)
             simulation.aedt_lease = lease
             return desktop, simulation
         except Exception as error:
@@ -9029,13 +9221,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 V1 = float(sim.df_plus["V1_rms"].iloc[0])
                 V2p = float(sim.df_plus["V2_rms"].iloc[0]) * int(sim.df_plus["N1"].iloc[0]) / int(sim.df_plus["N2"].iloc[0])
                 Llt_true = float(sim.df1["Llt"].iloc[0]) * 1e-6 * (1.0 if sim.full_model else 2.0)
-                omega = 2 * math.pi * freq
-                arg = P_t * omega * Llt_true / (V1 * V2p) if V1 * V2p > 0 else 2.0
-                if arg >= 1.0:
-                    logging.warning(f"P_target unreachable with Lk={Llt_true*1e6:.1f}uH (sin(phi)={arg:.2f}>1) - phi=90deg capped")
-                    phi_deg = 90.0
-                else:
-                    phi_deg = math.degrees(math.asin(arg))
+                phi_deg = _dab_phase_for_target(P_t, freq, Llt_true, V1, V2p)
                 sim.I2_phase_auto = -phi_deg / 2.0
                 sim.phi_deg = phi_deg
                 logging.info(f"auto phase: Lk={Llt_true*1e6:.2f}uH, phi={phi_deg:.2f}deg -> I2 phase {sim.I2_phase_auto:.2f}deg")

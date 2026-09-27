@@ -5,6 +5,19 @@ import math
 from module.modeling import create_coil_section
 
 
+def _create_required_box(design, *, origin, sizes, name, material):
+    obj = design.modeler.create_box(
+        origin=origin, sizes=sizes, name=name, material=material
+    )
+    if obj is None or obj is False or not getattr(obj, "name", None):
+        raise RuntimeError(f"create_box returned no object for {name!r}")
+    if obj.name != name:
+        raise RuntimeError(
+            f"create_box name mismatch: requested={name!r}, actual={obj.name!r}"
+        )
+    return obj
+
+
 def create_core(design, name="core", core_material="ferrite", n_group=3,
                 plate_material="aluminum", pad_material="thermal_pad",
                 plate_on=True, pad_on=True, plate_color=None, pad_color=None,
@@ -151,14 +164,14 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
                  "4*l1+2*l2", "l1", yoke_material),
             )
             for region, x0, z0, width, height, material in pieces:
-                core_objs.append(design.modeler.create_box(
+                core_objs.append(_create_required_box(design,
                     origin=[x0, y0, z0],
                     sizes=[width, d_expr, height],
                     name=f"{name}_{i + 1}_{region}",
                     material=material,
                 ))
         else:
-            core = design.modeler.create_box(
+            core = _create_required_box(design,
                 origin=["-(4*l1+2*l2)/2", y0, "-(h1+2*l1)/2"],
                 sizes=["4*l1+2*l2", d_expr, "h1+2*l1"],
                 name=f"{name}_{i + 1}",
@@ -193,7 +206,7 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
                 ]
             for y_start, t_expr, mat, obj_name in layers:
                 for side, x0, width in i_plate_x:
-                    obj = design.modeler.create_box(
+                    obj = _create_required_box(design,
                         origin=[x0, y_start, "-(h1+2*l1)/2"],
                         sizes=[width, t_expr, "h1+2*l1"],
                         name=f"{obj_name}_{side}",
@@ -210,19 +223,22 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
 
     # 창 2개는 코어 조에만 subtract한다. I plate는 그대로 유지한다.
     if not segmented_lamination:
-        sub1 = design.modeler.create_box(
+        sub1 = _create_required_box(design,
             origin=["-l1", "-w1/2", "-h1/2"],
             sizes=["-l2", "w1", "h1"],
             name=f"{name}_sub1",
             material=core_material
         )
-        sub2 = design.modeler.create_box(
+        sub2 = _create_required_box(design,
             origin=["l1", "-w1/2", "-h1/2"],
             sizes=["l2", "w1", "h1"],
             name=f"{name}_sub2",
             material=core_material
         )
-        design.modeler.subtract(core_objs, [sub1, sub2], keep_originals=False)
+        if design.modeler.subtract(
+            core_objs, [sub1, sub2], keep_originals=False
+        ) is False:
+            raise RuntimeError("core window subtraction failed")
 
     return core_objs, plate_objs, pad_objs
 
@@ -429,6 +445,10 @@ def create_coil(design, name="coil", window_height=50, window_length=50, window_
                     f"{object_name} (layer={i}, turn={j}, "
                     f"xsection_width={coil_width}, xsection_height={coil_height})"
                 )
+            if getattr(winding, "name", None) != object_name:
+                raise RuntimeError(
+                    f"create_polyline name mismatch for {object_name!r}"
+                )
             if color is not None:
                 winding.color = color
             windings.append(winding)
@@ -484,7 +504,7 @@ def create_winding_cooling_plates(design, name, space_width, coil_width, y_gaps,
             for y_start, t, mat, base_name in layers:
                 # y- 측은 대칭 위치 (박스 origin은 항상 작은 y 값)
                 y_origin = y_start if sign > 0 else -(y_start + t)
-                obj = design.modeler.create_box(
+                obj = _create_required_box(design,
                     origin=[
                         f"{-wcp_len_x / 2}mm + {offset[0]}mm",
                         f"{y_origin}mm + {offset[1]}mm",

@@ -14,6 +14,8 @@ import pandas as pd
 from run_simulation_260706 import (
     Simulation,
     SolutionDataUnavailableError,
+    _attest_native_solid_geometry,
+    _dab_phase_for_target,
     _assign_native_copied_core_loss,
     _assert_native_core_loss_assignment,
     _completion_exit_code,
@@ -38,6 +40,8 @@ from run_simulation_260706 import (
     _validate_saved_copied_loss_preparation,
     log_failed_sample,
 )
+
+
 from module.input_parameter_260706 import (
     ALL_INPUT_KEYS,
     COLD_PLATE_MAX_T_MM,
@@ -86,6 +90,35 @@ from module.thermal_probe_contract import (
     RX_SIDE_FACE_MEAN_RULE,
     RX_SIDE_FACE_PROBE_CONTRACT_VERSION,
 )
+
+
+class RerunPreflightTests(unittest.TestCase):
+    def test_native_solid_inventory_rejects_missing_and_zero_volume(self):
+        editor = Mock()
+        editor.GetObjectsInGroup.return_value = ["core_1"]
+        design = SimpleNamespace(modeler=SimpleNamespace(oeditor=editor))
+        solid = SimpleNamespace(name="core_1", volume=12.0)
+        self.assertEqual(
+            _attest_native_solid_geometry(design, {"core": [solid]}, "test"),
+            {"core": 1},
+        )
+        with self.assertRaisesRegex(RuntimeError, "missing native solids"):
+            _attest_native_solid_geometry(
+                design, {"core": [SimpleNamespace(name="core_2", volume=1)]}, "test"
+            )
+        solid.volume = 0.0
+        with self.assertRaisesRegex(RuntimeError, "invalid native volume"):
+            _attest_native_solid_geometry(design, {"core": [solid]}, "test")
+
+    def test_unreachable_target_does_not_cap_phase(self):
+        limit_w = 1000 * 1000 / (2 * math.pi * 1000 * 0.001)
+        self.assertAlmostEqual(
+            _dab_phase_for_target(limit_w, 1000, 0.001, 1000, 1000), 90.0
+        )
+        with self.assertRaisesRegex(ValueError, "P_target unreachable"):
+            _dab_phase_for_target(1.01 * limit_w, 1000, 0.001, 1000, 1000)
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            _dab_phase_for_target(100, 1000, float("nan"), 1000, 1000)
 
 
 class _FakeSolution:
@@ -519,6 +552,24 @@ class _GeometryModeler:
 
 
 class ColdPlateGeometryTests(unittest.TestCase):
+    def test_core_creation_rejects_missing_box(self):
+        modeler = _GeometryModeler()
+        modeler.create_box = Mock(return_value=None)
+        with self.assertRaisesRegex(RuntimeError, "create_box returned no object"):
+            create_core_geometry(
+                SimpleNamespace(modeler=modeler), n_group=1,
+                plate_on=False, pad_on=False,
+            )
+
+    def test_core_creation_rejects_failed_subtraction(self):
+        modeler = _GeometryModeler()
+        modeler.subtract = Mock(return_value=False)
+        with self.assertRaisesRegex(RuntimeError, "core window subtraction failed"):
+            create_core_geometry(
+                SimpleNamespace(modeler=modeler), n_group=1,
+                plate_on=False, pad_on=False,
+            )
+
     def test_core_cooling_uses_two_i_plates_not_window_subtracted_u_frame(self):
         design = SimpleNamespace(modeler=_GeometryModeler())
         cores, plates, pads = create_core_geometry(
