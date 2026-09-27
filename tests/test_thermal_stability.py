@@ -3644,6 +3644,69 @@ class ThermalStabilityTest(unittest.TestCase):
         )
         self.assertEqual(evidence["required_objects_missing"], [])
 
+    def test_grid_mapping_coverage_rejects_missing_assigned_copper(self):
+        plan = self._mesh_region_plan()
+        plan["operations"].append({
+            "name": "tx_mesh_level",
+            "operation_type": "object_level",
+            "objects": ["Tx_main_0_0"],
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            global_artifact = self._write_grid_mapping_artifact(
+                tmp,
+                "DV1_Meshes0_V0.sd",
+                self._grid_mapping_text(
+                    "GlobalRegion", 0, {"Fluid": (1,)}
+                ),
+            )
+            local_artifact = self._write_grid_mapping_artifact(
+                tmp,
+                "DV1_Meshes1_V0.sd",
+                self._grid_mapping_text(
+                    "wcp_pad_mesh_region_1_in_p", 6,
+                    {"Tx_main_wcp_pad_1_in_p": (17,)},
+                    overlap_faces=(101,),
+                ),
+            )
+            evidence = thermal._thermal_mesh_mapping_coverage(
+                plan, [global_artifact, local_artifact]
+            )
+
+        self.assertFalse(evidence["passed"])
+        self.assertEqual(evidence["required_objects_missing"], [])
+        self.assertEqual(evidence["assigned_objects_missing"], ["Tx_main_0_0"])
+
+    def test_grid_mapping_coverage_rejects_duplicate_local_region(self):
+        plan = self._mesh_region_plan()
+        with tempfile.TemporaryDirectory() as tmp:
+            global_artifact = self._write_grid_mapping_artifact(
+                tmp,
+                "DV1_Meshes0_V0.sd",
+                self._grid_mapping_text(
+                    "GlobalRegion", 0, {"Fluid": (1,)}
+                ),
+            )
+            local_text = self._grid_mapping_text(
+                "wcp_pad_mesh_region_1_in_p", 6,
+                {"Tx_main_wcp_pad_1_in_p": (17,)},
+                overlap_faces=(101,),
+            )
+            local_artifacts = [
+                self._write_grid_mapping_artifact(
+                    tmp, f"DV1_Meshes{index}_V0.sd", local_text
+                )
+                for index in (1, 2)
+            ]
+            evidence = thermal._thermal_mesh_mapping_coverage(
+                plan, [global_artifact, *local_artifacts]
+            )
+
+        self.assertFalse(evidence["passed"])
+        self.assertEqual(
+            evidence["duplicate_local_regions"],
+            ["wcp_pad_mesh_region_1_in_p"],
+        )
+
     def test_native_mesh_region_readback_requires_exact_part_level_and_enable(self):
         operation_props = {
             "Assignment": ["SubRegionPad1"],

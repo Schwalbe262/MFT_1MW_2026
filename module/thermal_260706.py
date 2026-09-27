@@ -2214,6 +2214,13 @@ def _thermal_mesh_mapping_coverage(mesh_plan, fresh_artifacts):
     required_objects = sorted(set(map(
         str, mesh_plan.get("required_thin_objects", [])
     )))
+    # Every assigned solid must survive meshing.  Checking only the thin-pad
+    # subset can accept a grid with a missing copper turn or core segment.
+    assigned_objects = sorted({
+        str(name)
+        for operation in mesh_plan.get("operations", [])
+        for name in operation.get("objects", [])
+    })
     expected_regions = {
         str(operation["name"]): sorted(set(map(
             str, operation.get("objects", [])
@@ -2267,9 +2274,14 @@ def _thermal_mesh_mapping_coverage(mesh_plan, fresh_artifacts):
         for name in readback["objects_with_domains"]
     })
     required_missing = sorted(set(required_objects) - set(mapped_objects))
+    assigned_missing = sorted(set(assigned_objects) - set(mapped_objects))
     global_regions = [
         item for item in readbacks if item["parent_region"] == 0
     ]
+    duplicate_regions = sorted({
+        name for name in expected_regions
+        if sum(item["region_name"] == name for item in readbacks) > 1
+    })
     region_missing = sorted(
         name for name in expected_regions
         if not any(item["region_name"] == name for item in readbacks)
@@ -2304,7 +2316,9 @@ def _thermal_mesh_mapping_coverage(mesh_plan, fresh_artifacts):
         and bool(global_regions)
         and all(item["has_mesh"] is True for item in global_regions)
         and not required_missing
+        and not assigned_missing
         and not region_missing
+        and not duplicate_regions
         and not region_without_mesh
         and not region_uncoupled
         and not region_objects_missing
@@ -2320,8 +2334,14 @@ def _thermal_mesh_mapping_coverage(mesh_plan, fresh_artifacts):
             len(required_objects) - len(required_missing)
         ),
         "required_objects_missing": required_missing,
+        "assigned_object_count": len(assigned_objects),
+        "mapped_assigned_object_count": (
+            len(assigned_objects) - len(assigned_missing)
+        ),
+        "assigned_objects_missing": assigned_missing,
         "expected_local_region_count": len(expected_regions),
         "missing_local_regions": region_missing,
+        "duplicate_local_regions": duplicate_regions,
         "local_regions_without_mesh": region_without_mesh,
         "uncoupled_local_regions": region_uncoupled,
         "local_region_objects_missing": region_objects_missing,
