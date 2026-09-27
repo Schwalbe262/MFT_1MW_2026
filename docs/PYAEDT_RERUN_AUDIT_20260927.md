@@ -17,7 +17,7 @@
 - Python 3.11.14 (`pyaedt2026v1`), PyAEDT 0.22.0, 설치 AEDT 2025.2.
 - `pyaedt_library`는 깨끗한 별도 checkout `e6b9b9d20a832ff5c3f7ca97218737a0b8650781`을 사용했다.
 - `regression_260707/test_simulation_stability.py`와 `tests/test_thermal_stability.py`: 279 passed.
-- `regression_260707/monitoring/tests`: 330 passed. 전체 `tests` 실행은 이 호스트의 외부 Scheduler 배포 파일을 요구하는 테스트에서 멈췄다(별도 환경 의존성).
+- `regression_260707/monitoring/tests`: 327 passed, 3 skipped. 관련 두 시뮬레이션 테스트 모듈과 합친 재검증은 606 passed, 3 skipped였다. 전체 `tests` 실행은 이 호스트의 외부 Scheduler 배포 파일을 요구하는 테스트에서 멈췄다(별도 환경 의존성).
 - `verification_params/thermal_smoke.json`의 headless model-only 시험은 통과했다.
 - `main`의 headless Maxwell matrix·capacitance·loss 시험은 종료 코드 0, `result_valid_em=1`이었다. `thermal_on=0`으로 실행했으며 결과에 AEDT `2025.2`, PyAEDT `0.22.0`, 시험 당시의 깨끗한 솔버 revision `0f857a22`와 위의 깨끗한 라이브러리 revision이 기록됐다. 로그는 아카이브의 `canary_em_smoke_final.log`에 있다.
 - 동일 조건의 Maxwell 3D + Icepak canary: Maxwell matrix·capacitance·loss 해석과 Icepak native mesh 생성 및 사전 검증을 통과했다. Icepak Fluent 유동 계산은 82회 반복에서 continuity residual `4.33e+02`, 0 K 온도 제한과 pressure outlet 역류가 나타나 시험을 중단했다. 따라서 **열해석 성공이나 수렴은 검증되지 않았다.** 조건은 `P_target=0`, `fan_velocity=1.5`, `wcp_pad_t=2`, `core_plate_pad_t=2`; 이 시험은 파이프라인 검증용이며 1 MW 운전점의 설계 검증이 아니다. 원시 로그는 아카이브의 `canary_thermal_smoke_retry.log`, `canary_thermal_smoke_retry_fluent.trn`, `canary_thermal_smoke_retry_uns_out.log`에 있다.
