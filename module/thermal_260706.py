@@ -2259,6 +2259,10 @@ def _thermal_mesh_mapping_coverage(mesh_plan, fresh_artifacts):
             readbacks.append({
                 **readback,
                 "artifact_name": str(artifact.get("name", "")),
+                "artifact_family": re.sub(
+                    r"_Meshes\d+_V\d+\.sd$", "",
+                    str(artifact.get("name", "")),
+                ),
                 "grid_mapping_size": signature[0],
                 "grid_mapping_sha256_sample": signature[2],
             })
@@ -2280,7 +2284,14 @@ def _thermal_mesh_mapping_coverage(mesh_plan, fresh_artifacts):
     ]
     duplicate_regions = sorted({
         name for name in expected_regions
-        if sum(item["region_name"] == name for item in readbacks) > 1
+        if any(
+            sum(
+                item["region_name"] == name
+                and item["artifact_family"] == family
+                for item in readbacks
+            ) > 1
+            for family in {item["artifact_family"] for item in readbacks}
+        )
     })
     region_missing = sorted(
         name for name in expected_regions

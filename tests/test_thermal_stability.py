@@ -3707,6 +3707,34 @@ class ThermalStabilityTest(unittest.TestCase):
             ["wcp_pad_mesh_region_1_in_p"],
         )
 
+    def test_grid_mapping_coverage_accepts_repeated_native_snapshot(self):
+        plan = self._mesh_region_plan()
+        global_text = self._grid_mapping_text(
+            "Global", 0, {"Fluid": (1,)}
+        )
+        local_text = self._grid_mapping_text(
+            "wcp_pad_mesh_region_1_in_p", 6,
+            {"Tx_main_wcp_pad_1_in_p": (17,)},
+            overlap_faces=(101,),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = [
+                self._write_grid_mapping_artifact(tmp, name, content)
+                for name, content in (
+                    ("DV1_Meshes0_V0.sd", global_text),
+                    ("DV1_Meshes1_V1.sd", local_text),
+                    ("DV1_S2_Meshes0_V0.sd", global_text),
+                    ("DV1_S2_Meshes1_V1.sd", local_text),
+                )
+            ]
+            evidence = thermal._thermal_mesh_mapping_coverage(
+                plan, artifacts
+            )
+
+        self.assertTrue(evidence["passed"])
+        self.assertEqual(evidence["duplicate_local_regions"], [])
+        self.assertEqual(evidence["fresh_grid_mapping_count"], 4)
+
     def test_native_mesh_region_readback_requires_exact_part_level_and_enable(self):
         operation_props = {
             "Assignment": ["SubRegionPad1"],
