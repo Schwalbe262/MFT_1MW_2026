@@ -1,0 +1,495 @@
+{
+  "test_name": "secondaryHV_primaryHWground",
+  "excitation_voltage_expression": "28*sqrt(2) kV",
+  "excitation_voltage_peak_V": 39597.97974644666,
+  "source_design": "maxwell_cap",
+  "solution": "Setup1 : LastAdaptive",
+  "hotspots": [
+    {
+      "object_name": "Region",
+      "material": "air",
+      "E_stored_V_per_m": 3199565.989837539,
+      "E_1V_V_per_m": 80.80124315242757,
+      "location_mm": [
+        -343.96700000000004,
+        199.62576785115348,
+        -132.5
+      ]
+    },
+    {
+      "object_name": "core_plate_pad_6_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1120465.2975812533,
+      "E_1V_V_per_m": 28.296021785853828,
+      "location_mm": [
+        -420.5,
+        237.0,
+        -39.13741740919163
+      ]
+    }
+  ],
+  "all_pad_maxima": [
+    {
+      "object_name": "core_plate_pad_1_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1013808.2564780798
+    },
+    {
+      "object_name": "core_plate_pad_1_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 984942.8047475622
+    },
+    {
+      "object_name": "core_plate_pad_1_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 983462.8765890264
+    },
+    {
+      "object_name": "core_plate_pad_1_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 56942.36999819658
+    },
+    {
+      "object_name": "core_plate_pad_1_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 38219.518494167096
+    },
+    {
+      "object_name": "core_plate_pad_1_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 59173.20487513092
+    },
+    {
+      "object_name": "core_plate_pad_2_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 53980.18069157118
+    },
+    {
+      "object_name": "core_plate_pad_2_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 43145.762711808595
+    },
+    {
+      "object_name": "core_plate_pad_2_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 39681.5527816048
+    },
+    {
+      "object_name": "core_plate_pad_2_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 43630.70952258002
+    },
+    {
+      "object_name": "core_plate_pad_2_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 57576.51352159175
+    },
+    {
+      "object_name": "core_plate_pad_2_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 51539.21015956131
+    },
+    {
+      "object_name": "core_plate_pad_3_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 67755.93238092413
+    },
+    {
+      "object_name": "core_plate_pad_3_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 35074.47127747679
+    },
+    {
+      "object_name": "core_plate_pad_3_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 43361.414098492045
+    },
+    {
+      "object_name": "core_plate_pad_3_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 58420.90720183112
+    },
+    {
+      "object_name": "core_plate_pad_3_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 26407.755376487836
+    },
+    {
+      "object_name": "core_plate_pad_3_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 67291.55737128032
+    },
+    {
+      "object_name": "core_plate_pad_4_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 35269.68759305097
+    },
+    {
+      "object_name": "core_plate_pad_4_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 28000.22326206394
+    },
+    {
+      "object_name": "core_plate_pad_4_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 63693.58303294825
+    },
+    {
+      "object_name": "core_plate_pad_4_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 51514.29245141859
+    },
+    {
+      "object_name": "core_plate_pad_4_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 35502.85704060562
+    },
+    {
+      "object_name": "core_plate_pad_4_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 56044.1499037612
+    },
+    {
+      "object_name": "core_plate_pad_5_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 33458.22888971038
+    },
+    {
+      "object_name": "core_plate_pad_5_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 31368.357336658268
+    },
+    {
+      "object_name": "core_plate_pad_5_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 48915.74011410173
+    },
+    {
+      "object_name": "core_plate_pad_5_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 53814.056386241595
+    },
+    {
+      "object_name": "core_plate_pad_5_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 29818.13794869161
+    },
+    {
+      "object_name": "core_plate_pad_5_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 47602.29776314031
+    },
+    {
+      "object_name": "core_plate_pad_6_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 49729.5716830909
+    },
+    {
+      "object_name": "core_plate_pad_6_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 60577.00654965286
+    },
+    {
+      "object_name": "core_plate_pad_6_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 64581.25222382739
+    },
+    {
+      "object_name": "core_plate_pad_6_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1120465.2975812533
+    },
+    {
+      "object_name": "core_plate_pad_6_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 953017.3001811753
+    },
+    {
+      "object_name": "core_plate_pad_6_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1034955.5487426498
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_1_in_p",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 2168.3700341724953
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_1_out_p",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 2529.2992089837685
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_1_in_n",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 2461.992034954326
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_1_out_n",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 2079.4549539363734
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_2_in_p",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1964.8931405424396
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_2_out_p",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1612.8633707637625
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_2_in_n",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1792.703515364706
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_2_out_n",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 2300.9896653446262
+    }
+  ],
+  "boundary_snapshot": [
+    {
+      "name": "CapTx",
+      "props": {
+        "ID": 0,
+        "BoundType": "Voltage",
+        "IsComponent": false,
+        "Objects": [
+          2358,
+          2602,
+          2846,
+          3090,
+          3334,
+          3578
+        ],
+        "ParentBndID": -1,
+        "Voltage": "0kV",
+        "CoordinateSystem": -1
+      }
+    },
+    {
+      "name": "CapRx",
+      "props": {
+        "ID": 1,
+        "BoundType": "Voltage",
+        "IsComponent": false,
+        "Objects": [
+          3822,
+          4066,
+          4310,
+          4554,
+          4798,
+          5042,
+          5286,
+          5530,
+          5774,
+          6018,
+          6262,
+          6506,
+          6750,
+          6994,
+          7238,
+          7482,
+          7726,
+          7970,
+          8214,
+          8458,
+          8702,
+          8946,
+          9190,
+          9434,
+          9678,
+          9922,
+          10166,
+          10410,
+          10654,
+          10898,
+          11142,
+          11386,
+          11630,
+          11874,
+          12118,
+          12362,
+          12606,
+          12850,
+          13094,
+          13338,
+          13582,
+          13826,
+          14070,
+          14314,
+          14558,
+          14802,
+          15046,
+          15290,
+          15534,
+          15778,
+          16022,
+          16266,
+          16510,
+          16754,
+          16998,
+          17242,
+          17486,
+          17730,
+          17974,
+          18218,
+          18462,
+          18706,
+          18950,
+          19194,
+          19438,
+          19682,
+          19926,
+          20170,
+          20414,
+          20658,
+          20902,
+          21146,
+          21390,
+          21634,
+          21878,
+          22122,
+          22366,
+          22610,
+          22854,
+          23098,
+          23342,
+          23586,
+          23830
+        ],
+        "ParentBndID": -1,
+        "Voltage": "28*sqrt(2) kV",
+        "CoordinateSystem": -1
+      }
+    },
+    {
+      "name": "CapGroundSolids",
+      "props": {
+        "ID": 2,
+        "BoundType": "Voltage",
+        "IsComponent": false,
+        "Objects": [
+          6,
+          34,
+          62,
+          90,
+          118,
+          146,
+          174,
+          202,
+          230,
+          258,
+          286,
+          314,
+          342,
+          370,
+          398,
+          426,
+          454,
+          482,
+          510,
+          538,
+          566,
+          594,
+          622,
+          650,
+          678,
+          706,
+          734,
+          762,
+          790,
+          818,
+          930,
+          958,
+          986,
+          1182,
+          1210,
+          1238,
+          1434,
+          1462,
+          1490,
+          1686,
+          1714,
+          1742,
+          1938,
+          1966,
+          1994,
+          2190,
+          2218,
+          2246,
+          24102,
+          24186,
+          24270,
+          24354
+        ],
+        "ParentBndID": -1,
+        "Voltage": "0V",
+        "CoordinateSystem": -1
+      }
+    },
+    {
+      "name": "CapGroundRegion",
+      "props": {
+        "ID": 3,
+        "BoundType": "Voltage",
+        "IsComponent": false,
+        "Faces": [
+          24416,
+          24414,
+          24415,
+          24413,
+          24411,
+          24412
+        ],
+        "ParentBndID": -1,
+        "Voltage": "0V",
+        "CoordinateSystem": -1
+      }
+    },
+    {
+      "name": "CapMatrix",
+      "props": {
+        "ID": 0,
+        "MaxwellParameterType": "Matrix",
+        "MatrixEntry": [
+          {
+            "Source": 0,
+            "NumberOfTurns": "1"
+          },
+          {
+            "Source": 1,
+            "NumberOfTurns": "1"
+          }
+        ],
+        "$end 'MatrixEntry'": null,
+        "MatrixGroup": {},
+        "NewVersion": true
+      }
+    }
+  ],
+  "setup_snapshot": {
+    "ID": 0,
+    "SetupType": "Electrostatic",
+    "Enabled": true,
+    "MeshLink": {
+      "ImportMesh": false
+    },
+    "MaximumPasses": 10,
+    "MinimumPasses": 1,
+    "MinimumConvergedPasses": 1,
+    "PercentRefinement": 30,
+    "SolveFieldOnly": false,
+    "PercentError": 0.1,
+    "SolveMatrixAtLast": true,
+    "UseNonLinearIterNum": false,
+    "UseIterativeSolver": false,
+    "RelativeResidual": 1e-06,
+    "NonLinearResidual": 0.001,
+    "RelaxationFactor": 1
+  },
+  "note": "Native archived field predates saved current setup; use achieved solve target 1 percent from cap.asol, local E convergence unverified."
+}

@@ -1,0 +1,19 @@
+DesignVariation : cc_w2c_space_x='40mm' cc_w2c_space_y='40.899999999999999mm' core_center_gap_mm='0.63141700000000001mm' core_plate_on='1' core_plate_pad_t='2mm' core_plate_t='11.1mm' corner_radius='10mm' corner_segments='4' cs_w1s_space_y='47mm' cw1='5mm' cw2='0.90000000000000002mm' full_model='1' gap1='1.6000000000000001mm' gap2='1.841mm' h1='612mm' l1='69mm' l2='351.5mm' N1_main='6' N1_side='0' N2_main='37' N2_side='23' n_core_group='5' nwh1='573.10000000000002mm' nwh2='265mm' round_corner='1' w1='476mm' w1c_w2s_space_x='32.399999999999999mm' w1s_cs_space_x='40mm' w1s_w2s_space_y='0mm' w2c_w1c_space_x='40mm' w2c_w1c_space_y='46mm' w2s_w1s_space_x='0mm' wcp_len_x='381.69999999999999mm' wcp_on='1' wcp_pad_t='2mm' wcp_t='16.199999999999999mm'
+Setup : Setup1
+
+==================
+Number of Passes
+Completed : 5
+Maximum   : 5
+Minimum   : 5
+==================
+Criterion : Energy Error/Delta Energy (%)
+Target    : (1, 1)
+Current   : (0.42205, 0.36519)
+==================
+Pass|# Tetrahedra|Total Energy (J)|Energy Error (%)|Delta Energy (%)|
+   1|      120185|      3.3996e-10|          8.9355|             N/A|
+   2|      156233|      3.2115e-10|          3.4132|          5.5348|
+   3|      203048|      3.1574e-10|          1.2972|          1.6838|
+   4|      263860|      3.1345e-10|         0.69138|         0.72452|
+   5|      342894|      3.1231e-10|         0.42205|         0.36519|

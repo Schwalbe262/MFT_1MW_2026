@@ -120,3 +120,16 @@ python optimization/run_nsga2.py --spec al_rounds/rehearsal_spec.json --round N
 환경: conda `pyaedt2026v1` (파이썬은 `~/anaconda3/envs/pyaedt2026v1/python.exe`),
 PYTHONIOENCODING=utf-8 권장. 메모리 파일: `C:\Users\peets\.claude\projects\Y--git-MFT-1MW-2026\memory\`
 (mft-campaign-directive, mft-infra-lessons 필독).
+
+## 2026-10-05/06 절연시험 재검토
+
+각 권선의 양 끝을 각각 단락하고 권선끼리는 분리했다. 시험 요구는 AC 20 kV RMS, PD ≤15 pC, 모든 코어·냉각·도전성 하드웨어 접지다. 모델에 존재하는 Tx 6개, Rx 83개, 접지 고체 52개 및 외곽 경계를 확인했다. 최종 제작품의 모든 부품이 포함되었는지는 아직 검증되지 않았다.
+
+두 조건의 native 재해석은 정전용량 수렴·행렬 검증을 통과했다. 다만 메시 비교에서 공기/pad Emax 변화가 각각 1차 14.542168%/3.611277%, 2차 4.734926%/3.190600%로 2% 진단 기준을 초과했다. 절연 적합성은 `insufficient_data`이며 실제 내전압·PD 합격을 뜻하지 않는다.
+
+- 20 kV RMS 환산 최대 전계: 1차 air 21.033708 kV/mm, pad 15.639801 kV/mm; 2차 air 1.850630 kV/mm, pad 0.880784 kV/mm. 진단용 값이다.
+- 실제 최종 CAD·절연층·재료 허용치·시험 주파수/유지 시간·PD 전압/교정 실측 자료를 확보해야 한다. Pad εr=4는 가정이며 턴간 종이·테이프는 모델에 없다.
+- [상세 웹 보고서](reports/MFT_1MW_SIMULATION_WEB_REPORT_20260927.html), [평가 결과 JSON](reports/INSULATION_REVIEW_20261005.json), [평가 입력 JSON](reports/INSULATION_REVIEW_INPUT_20261005.json), [native 근거](reports/insulation_20261005/native_cap_validation.json).
+- 재실행 도구: `python tools/mft_insulation_review.py --help`. `extract --rerun`은 원본과 결과를 먼저 복사하고 사본만 1/0 V로 계산한다. `assess`는 저장된 입력을 평가한다.
+- 관련 시험 59개 통과. 실제 AEDT에서 객체 ID·전위 그룹·Voltage readback·MaxPos 좌표 추출을 확인했다.
+- 원본 백업: `D:\MFT_1MW_2026_archive\insulation_audit_20261005`. 원본 코드와 native 결과, Git 기준/파일 SHA-256, 재해석 사본을 보존했다.

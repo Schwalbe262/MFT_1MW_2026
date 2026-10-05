@@ -1,0 +1,40 @@
+{
+  "status": "insufficient_data",
+  "review_started_date_KST": "2026-10-05",
+  "completed_utc": "2026-10-05T15:18:48.366769+00:00",
+  "tests": {
+    "related_unittest_count": 59,
+    "passed": true,
+    "offline_cli_matches_saved_assessment": true,
+    "actual_aedt_cli_helpers_verified": [
+      "native_integer_object_ID_resolution",
+      "all_modeled_winding_and_hardware_voltage_groups",
+      "Voltage_readback_1V_secondary",
+      "MaxPos_coordinates_MKS_to_mm"
+    ]
+  },
+  "backup": {
+    "path": "D:\\MFT_1MW_2026_archive\\insulation_audit_20261005",
+    "baseline_git": "acaae31638c03598ea04740cd78189ff644b6a5b",
+    "original_source_project_unchanged": true,
+    "original_code_file_count": 7,
+    "native_backup_file_count": 390,
+    "native_backup_bytes": 214213244
+  },
+  "cases": {
+    "primary": {
+      "result_valid_cap": true,
+      "cap_validity_reason": "valid_capacitance_only",
+      "local_Emax_converged": false,
+      "withstand_status": "insufficient_data",
+      "pd_status": "insufficient_data"
+    },
+    "secondary": {
+      "result_valid_cap": true,
+      "cap_validity_reason": "valid_capacitance_only",
+      "local_Emax_converged": false,
+      "withstand_status": "insufficient_data",
+      "pd_status": "insufficient_data"
+    }
+  }
+}

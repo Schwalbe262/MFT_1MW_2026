@@ -1,0 +1,128 @@
+{
+  "primary": {
+    "result_valid_cap": true,
+    "cap_validity_reason": "valid_capacitance_only",
+    "validated_columns": {
+      "cap_percent_error": 1.0,
+      "conv_passes_cap": 4.0,
+      "conv_consecutive_cap": 2,
+      "conv_error_pct_cap": 0.1225889690342312,
+      "conv_delta_pct_cap": 0.4073971624414715,
+      "mesh_tets_cap": 263903.0,
+      "C_tx_tx_raw_F": 3.1851e-08,
+      "C_rx_rx_raw_F": 6.3251e-10,
+      "C_tx_rx_raw_F": 3.0027999999999997e-10,
+      "C_tx_rx_signed_raw_F": -3.0027999999999997e-10,
+      "C_tx_tx_F": 3.1851e-08,
+      "C_rx_rx_F": 6.3251e-10,
+      "C_tx_rx_F": 3.0027999999999997e-10,
+      "C_tx_rx_signed_F": -3.0027999999999997e-10
+    },
+    "native_convergence": {
+      "last": {
+        "p": 4.0,
+        "tet": 263903.0,
+        "de": 0.4073971624414715,
+        "te": 1.592525436347453e-08,
+        "ee": 0.1225889690342312
+      },
+      "target_percent": 1.0,
+      "derived_consecutive_converged_passes": 2,
+      "derive_note": "counted final consecutive rows with EnergyError and DeltaEnergy both <= configured target",
+      "matrix_export": "D:\\MFT_1MW_2026_archive\\insulation_audit_20261005\\postprocess\\full_cap\\primary_c_matrix.txt"
+    },
+    "parsed_matrix": {
+      "schema_version": "maxwell-capacitance-export-v1",
+      "source": "Maxwell Electrostatic export_c_matrix",
+      "unit": "pF",
+      "unit_to_f": 1e-12,
+      "names": [
+        "CapTx",
+        "CapRx"
+      ],
+      "matrix_raw": [
+        [
+          31851.0,
+          -300.28
+        ],
+        [
+          -300.28,
+          632.51
+        ]
+      ],
+      "matrix_f": [
+        [
+          3.1851e-08,
+          -3.0027999999999997e-10
+        ],
+        [
+          -3.0027999999999997e-10,
+          6.3251e-10
+        ]
+      ]
+    }
+  },
+  "secondary": {
+    "result_valid_cap": true,
+    "cap_validity_reason": "valid_capacitance_only",
+    "validated_columns": {
+      "cap_percent_error": 1.0,
+      "conv_passes_cap": 5.0,
+      "conv_consecutive_cap": 2,
+      "conv_error_pct_cap": 0.4220547314137841,
+      "conv_delta_pct_cap": 0.3651929987373521,
+      "mesh_tets_cap": 342894.0,
+      "C_tx_tx_raw_F": 3.216e-08,
+      "C_rx_rx_raw_F": 6.2461e-10,
+      "C_tx_rx_raw_F": 2.9925e-10,
+      "C_tx_rx_signed_raw_F": -2.9925e-10,
+      "C_tx_tx_F": 3.216e-08,
+      "C_rx_rx_F": 6.2461e-10,
+      "C_tx_rx_F": 2.9925e-10,
+      "C_tx_rx_signed_F": -2.9925e-10
+    },
+    "native_convergence": {
+      "last": {
+        "p": 5.0,
+        "tet": 342894.0,
+        "te": 3.12305573524714e-10,
+        "ee": 0.4220547314137841,
+        "de": 0.3651929987373521
+      },
+      "target_percent": 1.0,
+      "derived_consecutive_converged_passes": 2,
+      "derive_note": "counted final consecutive rows with EnergyError and DeltaEnergy both <= configured target",
+      "matrix_export": "D:\\MFT_1MW_2026_archive\\insulation_audit_20261005\\postprocess\\full_cap\\secondary_new_c_matrix.txt"
+    },
+    "parsed_matrix": {
+      "schema_version": "maxwell-capacitance-export-v1",
+      "source": "Maxwell Electrostatic export_c_matrix",
+      "unit": "pF",
+      "unit_to_f": 1e-12,
+      "names": [
+        "CapTx",
+        "CapRx"
+      ],
+      "matrix_raw": [
+        [
+          32160.0,
+          -299.25
+        ],
+        [
+          -299.25,
+          624.61
+        ]
+      ],
+      "matrix_f": [
+        [
+          3.216e-08,
+          -2.9925e-10
+        ],
+        [
+          -2.9925e-10,
+          6.2461e-10
+        ]
+      ]
+    }
+  }
+}

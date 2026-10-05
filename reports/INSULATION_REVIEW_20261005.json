@@ -1,0 +1,598 @@
+{
+  "schema_version": "mft-insulation-assessment-v1",
+  "status": "insufficient_data",
+  "reasons": [
+    "primaryHV_secondaryHWground:electric_field_assessment:source_geometry_is_not_verified_actual_cad",
+    "primaryHV_secondaryHWground:electric_field_assessment:verified_final_cad_not_verified",
+    "primaryHV_secondaryHWground:electric_field_assessment:dielectric_complete_not_verified",
+    "primaryHV_secondaryHWground:electric_field_assessment:conductive_hardware_complete_not_verified",
+    "primaryHV_secondaryHWground:electric_field_assessment:material_assignments_verified_not_verified",
+    "primaryHV_secondaryHWground:electric_field_assessment:cad_identity_or_target_identity_missing",
+    "primaryHV_secondaryHWground:electric_field_assessment:local_field_maximum_convergence_not_verified",
+    "primaryHV_secondaryHWground:electric_field_assessment:local_field_convergence_tolerance_not_met",
+    "primaryHV_secondaryHWground:electric_field_assessment:applicable_material_allowable_peak_field_missing",
+    "primaryHV_secondaryHWground:actual_20kV_withstand_qualification:withstand_required_hold_time_not_specified",
+    "primaryHV_secondaryHWground:actual_20kV_withstand_qualification:withstand_required_frequency_not_specified",
+    "primaryHV_secondaryHWground:actual_20kV_withstand_qualification:withstand_actual_measurement_missing",
+    "primaryHV_secondaryHWground:pd_apparent_charge_assessment:pd_required_voltage_not_specified",
+    "primaryHV_secondaryHWground:pd_apparent_charge_assessment:pd_required_hold_time_not_specified",
+    "primaryHV_secondaryHWground:pd_apparent_charge_assessment:pd_required_frequency_not_specified",
+    "primaryHV_secondaryHWground:pd_apparent_charge_assessment:pd_actual_measurement_missing",
+    "secondaryHV_primaryHWground:electric_field_assessment:source_geometry_is_not_verified_actual_cad",
+    "secondaryHV_primaryHWground:electric_field_assessment:verified_final_cad_not_verified",
+    "secondaryHV_primaryHWground:electric_field_assessment:dielectric_complete_not_verified",
+    "secondaryHV_primaryHWground:electric_field_assessment:conductive_hardware_complete_not_verified",
+    "secondaryHV_primaryHWground:electric_field_assessment:material_assignments_verified_not_verified",
+    "secondaryHV_primaryHWground:electric_field_assessment:cad_identity_or_target_identity_missing",
+    "secondaryHV_primaryHWground:electric_field_assessment:local_field_maximum_convergence_not_verified",
+    "secondaryHV_primaryHWground:electric_field_assessment:local_field_convergence_tolerance_not_met",
+    "secondaryHV_primaryHWground:electric_field_assessment:applicable_material_allowable_peak_field_missing",
+    "secondaryHV_primaryHWground:actual_20kV_withstand_qualification:withstand_required_hold_time_not_specified",
+    "secondaryHV_primaryHWground:actual_20kV_withstand_qualification:withstand_required_frequency_not_specified",
+    "secondaryHV_primaryHWground:actual_20kV_withstand_qualification:withstand_actual_measurement_missing",
+    "secondaryHV_primaryHWground:pd_apparent_charge_assessment:pd_required_voltage_not_specified",
+    "secondaryHV_primaryHWground:pd_apparent_charge_assessment:pd_required_hold_time_not_specified",
+    "secondaryHV_primaryHWground:pd_apparent_charge_assessment:pd_required_frequency_not_specified",
+    "secondaryHV_primaryHWground:pd_apparent_charge_assessment:pd_actual_measurement_missing"
+  ],
+  "model": {
+    "source_geometry_kind": "parametric",
+    "cad_identity": null,
+    "target_cad_identity": "sha256:e9ce9d192fa08529ca237561f39d08f55b9554e8f2cba0dbd976457bb18b228b",
+    "verified_final_cad": false,
+    "dielectric_complete": false,
+    "conductive_hardware_complete": false,
+    "material_assignments_verified": false,
+    "model_basis": "full",
+    "geometry_factor": 1,
+    "all_present_core_cooling_solids_grounded": true,
+    "present_winding_copper_objects": {
+      "primary": 6,
+      "secondary": 83
+    },
+    "present_ground_solid_count": 52,
+    "present_dielectric_objects": 45,
+    "source_geometry_identity": "aedt-sha256:98c79f40d9952630dec0fbbf154886c1c465d68009889e48901d3158acb37721",
+    "omitted_or_unverified": [
+      "turn insulation paper/tape/enamel",
+      "final vendor winding/support/busbar geometry correspondence",
+      "PT100 and sensor wiring",
+      "dielectric material grades, thickness and allowable stress",
+      "manufacturing voids/air gaps and creepage paths"
+    ]
+  },
+  "provenance": {
+    "review_started_date_KST": "2026-10-05",
+    "assessment_created_utc": "2026-10-05T15:11:57.530536+00:00",
+    "original_project": "C:\\w\\m580cap1\\project\\simulation_job_5807135t_full_curved_cap_v1\\simulation_job_5807135t_full_curved_cap_v1.aedt",
+    "original_project_sha256": "98c79f40d9952630dec0fbbf154886c1c465d68009889e48901d3158acb37721",
+    "evaluated_copy": "D:\\MFT_1MW_2026_archive\\insulation_audit_20261005\\postprocess\\full_cap\\simulation_job_5807135t_full_curved_cap_v1.aedt",
+    "evaluated_copy_sha256": "a27180d2384456b2a5ea219cf3b4fcb43eae9f22a367a2c8a36f3ed955d6a601",
+    "baseline_git": "acaae31638c03598ea04740cd78189ff644b6a5b",
+    "runner_sha256": "d517f72988f9e5fded908959fee8261fb9a27793a1b89884191a397496da70cf",
+    "aedt_version": "2025.2",
+    "pyaedt_version": "0.22.0",
+    "source_of_requirements": "Relevant existing mail export chain September 10/21, 2026 and user confirmed AC RMS + hardware grounding; final vendor CAD attachment August 6, 2026",
+    "private_mail_reexported": false,
+    "backup_archive": "D:\\MFT_1MW_2026_archive\\insulation_audit_20261005"
+  },
+  "materials": [
+    {
+      "name": "air",
+      "allowable_peak_field_V_per_m": null,
+      "limit_evidence": {}
+    },
+    {
+      "name": "thermal_pad",
+      "relative_permittivity_assumed": 4,
+      "allowable_peak_field_V_per_m": null,
+      "limit_evidence": {}
+    }
+  ],
+  "convergence": {},
+  "test_conditions": {
+    "voltage_rms_V": 20000,
+    "hold_time_s": null,
+    "frequency_Hz": null,
+    "voltage_peak_V": 28284.271247461904,
+    "waveform": "AC_sinusoidal",
+    "each_winding_terminals_shorted": true,
+    "primary_secondary_connected": false,
+    "all_core_cooling_conductive_hardware_grounded": true
+  },
+  "capacitance_solve": {
+    "status": "success",
+    "reasons": [],
+    "evidence": {
+      "success": true,
+      "source": "insulation_20261005/native_cap_validation.json",
+      "qualification_scope": "capacitance_numerics_only",
+      "by_case": {
+        "primary": {
+          "result_valid_cap": true,
+          "cap_validity_reason": "valid_capacitance_only",
+          "validated_columns": {
+            "cap_percent_error": 1.0,
+            "conv_passes_cap": 4.0,
+            "conv_consecutive_cap": 2,
+            "conv_error_pct_cap": 0.1225889690342312,
+            "conv_delta_pct_cap": 0.4073971624414715,
+            "mesh_tets_cap": 263903.0,
+            "C_tx_tx_raw_F": 3.1851e-08,
+            "C_rx_rx_raw_F": 6.3251e-10,
+            "C_tx_rx_raw_F": 3.0027999999999997e-10,
+            "C_tx_rx_signed_raw_F": -3.0027999999999997e-10,
+            "C_tx_tx_F": 3.1851e-08,
+            "C_rx_rx_F": 6.3251e-10,
+            "C_tx_rx_F": 3.0027999999999997e-10,
+            "C_tx_rx_signed_F": -3.0027999999999997e-10
+          },
+          "native_convergence": {
+            "last": {
+              "p": 4.0,
+              "tet": 263903.0,
+              "de": 0.4073971624414715,
+              "te": 1.592525436347453e-08,
+              "ee": 0.1225889690342312
+            },
+            "target_percent": 1.0,
+            "derived_consecutive_converged_passes": 2,
+            "derive_note": "counted final consecutive rows with EnergyError and DeltaEnergy both <= configured target",
+            "matrix_export": "D:\\MFT_1MW_2026_archive\\insulation_audit_20261005\\postprocess\\full_cap\\primary_c_matrix.txt"
+          },
+          "parsed_matrix": {
+            "schema_version": "maxwell-capacitance-export-v1",
+            "source": "Maxwell Electrostatic export_c_matrix",
+            "unit": "pF",
+            "unit_to_f": 1e-12,
+            "names": [
+              "CapTx",
+              "CapRx"
+            ],
+            "matrix_raw": [
+              [
+                31851.0,
+                -300.28
+              ],
+              [
+                -300.28,
+                632.51
+              ]
+            ],
+            "matrix_f": [
+              [
+                3.1851e-08,
+                -3.0027999999999997e-10
+              ],
+              [
+                -3.0027999999999997e-10,
+                6.3251e-10
+              ]
+            ]
+          }
+        },
+        "secondary": {
+          "result_valid_cap": true,
+          "cap_validity_reason": "valid_capacitance_only",
+          "validated_columns": {
+            "cap_percent_error": 1.0,
+            "conv_passes_cap": 5.0,
+            "conv_consecutive_cap": 2,
+            "conv_error_pct_cap": 0.4220547314137841,
+            "conv_delta_pct_cap": 0.3651929987373521,
+            "mesh_tets_cap": 342894.0,
+            "C_tx_tx_raw_F": 3.216e-08,
+            "C_rx_rx_raw_F": 6.2461e-10,
+            "C_tx_rx_raw_F": 2.9925e-10,
+            "C_tx_rx_signed_raw_F": -2.9925e-10,
+            "C_tx_tx_F": 3.216e-08,
+            "C_rx_rx_F": 6.2461e-10,
+            "C_tx_rx_F": 2.9925e-10,
+            "C_tx_rx_signed_F": -2.9925e-10
+          },
+          "native_convergence": {
+            "last": {
+              "p": 5.0,
+              "tet": 342894.0,
+              "te": 3.12305573524714e-10,
+              "ee": 0.4220547314137841,
+              "de": 0.3651929987373521
+            },
+            "target_percent": 1.0,
+            "derived_consecutive_converged_passes": 2,
+            "derive_note": "counted final consecutive rows with EnergyError and DeltaEnergy both <= configured target",
+            "matrix_export": "D:\\MFT_1MW_2026_archive\\insulation_audit_20261005\\postprocess\\full_cap\\secondary_new_c_matrix.txt"
+          },
+          "parsed_matrix": {
+            "schema_version": "maxwell-capacitance-export-v1",
+            "source": "Maxwell Electrostatic export_c_matrix",
+            "unit": "pF",
+            "unit_to_f": 1e-12,
+            "names": [
+              "CapTx",
+              "CapRx"
+            ],
+            "matrix_raw": [
+              [
+                32160.0,
+                -299.25
+              ],
+              [
+                -299.25,
+                624.61
+              ]
+            ],
+            "matrix_f": [
+              [
+                3.216e-08,
+                -2.9925e-10
+              ],
+              [
+                -2.9925e-10,
+                6.2461e-10
+              ]
+            ]
+          }
+        }
+      }
+    }
+  },
+  "tests": {
+    "primaryHV_secondaryHWground": {
+      "excited_winding": "primary",
+      "test_conditions": {
+        "voltage_rms_V": 20000,
+        "hold_time_s": null,
+        "frequency_Hz": null
+      },
+      "boundary_conditions": {
+        "terminals_within_each_winding_shorted": true,
+        "primary_secondary_connected": false,
+        "other_winding_grounded": true,
+        "all_core_cooling_hardware_grounded": true,
+        "excited_winding": "primary",
+        "scope_note": "Verified for all solids present in this model; complete final hardware inclusion is unverified."
+      },
+      "electric_field_assessment": {
+        "status": "insufficient_data",
+        "reasons": [
+          "source_geometry_is_not_verified_actual_cad",
+          "verified_final_cad_not_verified",
+          "dielectric_complete_not_verified",
+          "conductive_hardware_complete_not_verified",
+          "material_assignments_verified_not_verified",
+          "cad_identity_or_target_identity_missing",
+          "local_field_maximum_convergence_not_verified",
+          "local_field_convergence_tolerance_not_met",
+          "applicable_material_allowable_peak_field_missing"
+        ],
+        "hotspots": [
+          {
+            "object_name": "Region",
+            "material": "air",
+            "location_mm": [
+              -190.85,
+              -431.476,
+              202.67936557649398
+            ],
+            "E_1V_V_per_m": 743.6538690611109,
+            "E_peak_20kV_V_per_m": 21033707.746748976,
+            "allowable_peak_field_V_per_m": null,
+            "field_margin": null,
+            "limit_evidence": {},
+            "status": "insufficient_data",
+            "reasons": [
+              "applicable_material_allowable_peak_field_missing"
+            ]
+          },
+          {
+            "object_name": "Tx_main_wcp_pad_1_in_p",
+            "material": "thermal_pad",
+            "location_mm": [
+              23.85625,
+              431.476,
+              286.55
+            ],
+            "E_1V_V_per_m": 552.9504611650524,
+            "E_peak_20kV_V_per_m": 15639800.83000149,
+            "allowable_peak_field_V_per_m": null,
+            "field_margin": null,
+            "limit_evidence": {},
+            "status": "insufficient_data",
+            "reasons": [
+              "applicable_material_allowable_peak_field_missing"
+            ]
+          }
+        ],
+        "native_field_evidence": {
+          "source": "insulation_20261005/primary_native_fields.json",
+          "solution": "Setup1 : LastAdaptive",
+          "normalization_voltage_V": 1,
+          "unit": "V/m",
+          "solver_excitation_voltage_peak_V": 1.0,
+          "field_files": [
+            {
+              "path": "insulation_primaryHV.results\\DV150_SOL10_V127.Field155\\fields.hdr",
+              "bytes": 131,
+              "sha256": "4c4409a757f3ee9566330876a653b7ad67fab3e17d6de8be4b66ac6277c4493f"
+            },
+            {
+              "path": "insulation_primaryHV.results\\DV150_SOL10_V127.Field155\\fields.plo",
+              "bytes": 22167872,
+              "sha256": "eacad9b35f88a106b3d418922786d519b624f610a4cf8619a1f7710a32d1051d"
+            },
+            {
+              "path": "insulation_primaryHV.results\\DV150_SOL10_V127.Field155\\fields.sat",
+              "bytes": 200530,
+              "sha256": "947d113aa3d5cdb9d7056c73c268e9a2b680da17f2fca00c6eb5208bdccbc244"
+            },
+            {
+              "path": "insulation_primaryHV.results\\DV150_SOL10_V127.Field155\\fields.sol",
+              "bytes": 15280387,
+              "sha256": "5f29794cd34c534f46e308b1d317ea204e8ae222deabcd6a6cde5af6ef34f8c3"
+            },
+            {
+              "path": "insulation_primaryHV.results\\DV150_SOL10_V127.Field155\\fields.sstr",
+              "bytes": 9683450,
+              "sha256": "038c54879ab3a5d06ed484d241d4c92a2baeefb5144e7c88376e6c1f6daf9669"
+            },
+            {
+              "path": "insulation_primaryHV.results\\DV150_SOL10_V127.Field155\\fields.str",
+              "bytes": 20838824,
+              "sha256": "3469f06d1fd2b3ab1224ccba7a5151be167b56cf0aba732c24fd70d946d4e0ff"
+            },
+            {
+              "path": "insulation_primaryHV.results\\DV150_SOL10_V127.Field155\\fields.stt",
+              "bytes": 199,
+              "sha256": "5ae1a2198ee9be6b22e8476d0bdd2e13c7cec07a3cf5d6d973c7ca3db457550e"
+            }
+          ]
+        },
+        "convergence": {
+          "field_local_max_converged": false,
+          "source": "insulation_20261005/primary_native_fields.json; successive refined meshes",
+          "field_max_relative_change": 0.14542167753375734,
+          "field_max_relative_tolerance": 0.02,
+          "medium_relative_changes": {
+            "air": 0.14542167753375734,
+            "pad": 0.0361127733359381
+          },
+          "local_field_history": [
+            {
+              "adaptive_pass": 3,
+              "air_E_1V_V_per_m": 649.2402611606714,
+              "pad_E_1V_V_per_m": 533.677873099408,
+              "pad_object": "Tx_main_wcp_pad_2_in_n"
+            },
+            {
+              "adaptive_pass": 4,
+              "air_E_1V_V_per_m": 743.6538690611109,
+              "pad_E_1V_V_per_m": 552.9504611650524,
+              "pad_object": "Tx_main_wcp_pad_1_in_p"
+            }
+          ],
+          "native_energy_error_pct": 0.1225889690342312,
+          "native_delta_energy_pct": 0.4073971624414715,
+          "reason": "local E maxima exceed the diagnostic 2 percent change threshold; hotspot may move"
+        },
+        "maximum_E_peak_20kV_V_per_m": 21033707.746748976,
+        "E_voltage_scale": 28284.271247461904,
+        "local_E_geometry_factor": 1.0,
+        "electrostatic_energy_1V_J": 1.592525436347453e-08,
+        "energy_geometry_factor": 1.0,
+        "electrostatic_energy_full_at_voltage_peak_J": 12.740203490779626
+      },
+      "actual_20kV_withstand_qualification": {
+        "status": "insufficient_data",
+        "reasons": [
+          "withstand_required_hold_time_not_specified",
+          "withstand_required_frequency_not_specified",
+          "withstand_actual_measurement_missing"
+        ],
+        "required_conditions": {
+          "voltage_rms_V": 20000,
+          "hold_time_s": null,
+          "frequency_Hz": null
+        },
+        "records": []
+      },
+      "pd_apparent_charge_assessment": {
+        "status": "insufficient_data",
+        "reasons": [
+          "pd_required_voltage_not_specified",
+          "pd_required_hold_time_not_specified",
+          "pd_required_frequency_not_specified",
+          "pd_actual_measurement_missing"
+        ],
+        "required_conditions": {
+          "voltage_rms_V": null,
+          "hold_time_s": null,
+          "frequency_Hz": null
+        },
+        "records": [],
+        "limit_pC": 15.0
+      }
+    },
+    "secondaryHV_primaryHWground": {
+      "excited_winding": "secondary",
+      "test_conditions": {
+        "voltage_rms_V": 20000,
+        "hold_time_s": null,
+        "frequency_Hz": null
+      },
+      "boundary_conditions": {
+        "terminals_within_each_winding_shorted": true,
+        "primary_secondary_connected": false,
+        "other_winding_grounded": true,
+        "all_core_cooling_hardware_grounded": true,
+        "excited_winding": "secondary",
+        "scope_note": "Verified for all solids present in this model; complete final hardware inclusion is unverified."
+      },
+      "electric_field_assessment": {
+        "status": "insufficient_data",
+        "reasons": [
+          "source_geometry_is_not_verified_actual_cad",
+          "verified_final_cad_not_verified",
+          "dielectric_complete_not_verified",
+          "conductive_hardware_complete_not_verified",
+          "material_assignments_verified_not_verified",
+          "cad_identity_or_target_identity_missing",
+          "local_field_maximum_convergence_not_verified",
+          "local_field_convergence_tolerance_not_met",
+          "applicable_material_allowable_peak_field_missing"
+        ],
+        "hotspots": [
+          {
+            "object_name": "Region",
+            "material": "air",
+            "location_mm": [
+              380.5,
+              51.6385647878419,
+              -132.5
+            ],
+            "E_1V_V_per_m": 65.42965896440319,
+            "E_peak_20kV_V_per_m": 1850630.2217781069,
+            "allowable_peak_field_V_per_m": null,
+            "field_margin": null,
+            "limit_evidence": {},
+            "status": "insufficient_data",
+            "reasons": [
+              "applicable_material_allowable_peak_field_missing"
+            ]
+          },
+          {
+            "object_name": "core_plate_pad_6_b_side_left",
+            "material": "thermal_pad",
+            "location_mm": [
+              -489.5,
+              238.0,
+              -85.6415444007727
+            ],
+            "E_1V_V_per_m": 31.140431702372194,
+            "E_peak_20kV_V_per_m": 880784.417032957,
+            "allowable_peak_field_V_per_m": null,
+            "field_margin": null,
+            "limit_evidence": {},
+            "status": "insufficient_data",
+            "reasons": [
+              "applicable_material_allowable_peak_field_missing"
+            ]
+          }
+        ],
+        "native_field_evidence": {
+          "source": "insulation_20261005/secondary_native_fields.json",
+          "solution": "Setup1 : LastAdaptive",
+          "normalization_voltage_V": 1,
+          "unit": "V/m",
+          "solver_excitation_voltage_peak_V": 1.0,
+          "field_files": [
+            {
+              "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.hdr",
+              "bytes": 131,
+              "sha256": "4c4409a757f3ee9566330876a653b7ad67fab3e17d6de8be4b66ac6277c4493f"
+            },
+            {
+              "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.plo",
+              "bytes": 28803116,
+              "sha256": "c3e24deeedaebcbc89c2a6e5eba181f04c40fd1d643e705e2ced22299773a28e"
+            },
+            {
+              "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.sat",
+              "bytes": 200530,
+              "sha256": "c77338fe008a1e45dcdd56158015c79d2ce7a2144a8fdfc98b7d6faefcd126ee"
+            },
+            {
+              "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.sol",
+              "bytes": 19874681,
+              "sha256": "b37de3a27c036562b6a3c618cde1e966d79c37a4d54159070750e82da6c1b2c4"
+            },
+            {
+              "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.sstr",
+              "bytes": 12991754,
+              "sha256": "4bc8709ed6f2944b9c2433a4696015c7b95fe1ebe197f1d278b447e9e026293e"
+            },
+            {
+              "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.str",
+              "bytes": 27376804,
+              "sha256": "8416a36e81ce46806d7fe3a962e3109dd687fb11ccf991e88bdf2342be63fe82"
+            },
+            {
+              "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.stt",
+              "bytes": 199,
+              "sha256": "5ae1a2198ee9be6b22e8476d0bdd2e13c7cec07a3cf5d6d973c7ca3db457550e"
+            }
+          ]
+        },
+        "convergence": {
+          "field_local_max_converged": false,
+          "source": "insulation_20261005/secondary_native_fields.json; successive refined meshes",
+          "field_max_relative_change": 0.04734926203810863,
+          "field_max_relative_tolerance": 0.02,
+          "medium_relative_changes": {
+            "air": 0.04734926203810863,
+            "pad": 0.03190600281427636
+          },
+          "local_field_history": [
+            {
+              "adaptive_pass": 4,
+              "air_E_1V_V_per_m": 68.68168611760478,
+              "pad_E_1V_V_per_m": 30.177585572178213,
+              "pad_object": "core_plate_pad_1_a_side_left"
+            },
+            {
+              "adaptive_pass": 5,
+              "air_E_1V_V_per_m": 65.42965896440319,
+              "pad_E_1V_V_per_m": 31.140431702372194,
+              "pad_object": "core_plate_pad_6_b_side_left"
+            }
+          ],
+          "native_energy_error_pct": 0.4220547314137841,
+          "native_delta_energy_pct": 0.3651929987373521,
+          "reason": "local E maxima exceed the diagnostic 2 percent change threshold; hotspot may move"
+        },
+        "maximum_E_peak_20kV_V_per_m": 1850630.2217781069,
+        "E_voltage_scale": 28284.271247461904,
+        "local_E_geometry_factor": 1.0,
+        "electrostatic_energy_1V_J": 3.12305573524714e-10,
+        "energy_geometry_factor": 1.0,
+        "electrostatic_energy_full_at_voltage_peak_J": 0.24984445881977121
+      },
+      "actual_20kV_withstand_qualification": {
+        "status": "insufficient_data",
+        "reasons": [
+          "withstand_required_hold_time_not_specified",
+          "withstand_required_frequency_not_specified",
+          "withstand_actual_measurement_missing"
+        ],
+        "required_conditions": {
+          "voltage_rms_V": 20000,
+          "hold_time_s": null,
+          "frequency_Hz": null
+        },
+        "records": []
+      },
+      "pd_apparent_charge_assessment": {
+        "status": "insufficient_data",
+        "reasons": [
+          "pd_required_voltage_not_specified",
+          "pd_required_hold_time_not_specified",
+          "pd_required_frequency_not_specified",
+          "pd_actual_measurement_missing"
+        ],
+        "required_conditions": {
+          "voltage_rms_V": null,
+          "hold_time_s": null,
+          "frequency_Hz": null
+        },
+        "records": [],
+        "limit_pC": 15.0
+      }
+    }
+  },
+  "qualification_policy": {
+    "field_simulation_alone_establishes_withstand_pass": false,
+    "capacitance_times_voltage_is_pd_apparent_charge": false,
+    "pd_voltage_inferred_from_withstand_voltage": false,
+    "local_E_geometry_multiplier": 1.0
+  }
+}

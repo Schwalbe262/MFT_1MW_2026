@@ -1172,7 +1172,84 @@ def _parse_convergence_history(lines, tolerance):
     }
 
 
-def _em_result_validation(frame, matrix_on=True, loss_on=True):
+def _cap_result_validation(frame, cap_on=True, graded_active_winding="off"):
+    """Validate capacitance numerics and adaptive convergence, not insulation.
+
+    Electrostatic setups require one consecutive converged pass.  A disabled
+    stage has no validity verdict; missing telemetry for a requested stage is
+    a failure rather than evidence that the native solve converged.
+    """
+    graded_active_winding = str(graded_active_winding)
+    if not cap_on and graded_active_winding == "off":
+        return None, "not_requested"
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return False, "cap: result frame is missing"
+    if graded_active_winding not in {"off", "Tx", "Rx"}:
+        return False, "cap: invalid turn-graded active winding"
+
+    stages = ["cap"] if cap_on else []
+    if graded_active_winding != "off":
+        stages.append(f"cap_turn_graded_{graded_active_winding.lower()}")
+    failures = []
+    tolerance = _finite_result_value(frame, "cap_percent_error")
+    for label in stages:
+        if tolerance is None or tolerance <= 0:
+            failures.append(f"{label}: invalid cap_percent_error")
+        passes = _finite_result_value(frame, f"conv_passes_{label}")
+        consecutive = _finite_result_value(frame, f"conv_consecutive_{label}")
+        if passes is None or passes < 1 or not passes.is_integer():
+            failures.append(f"{label}: convergence pass count is missing")
+        if consecutive is None or consecutive < 1 or not consecutive.is_integer():
+            failures.append(f"{label}: consecutive converged pass count is below 1 or missing")
+        elif passes is not None and consecutive > passes:
+            failures.append(f"{label}: inconsistent convergence pass counts")
+        for metric in ("error", "delta"):
+            value = _finite_result_value(frame, f"conv_{metric}_pct_{label}")
+            if value is None or value < 0:
+                failures.append(f"{label}: {metric} energy is missing")
+            elif tolerance is not None and tolerance > 0 and value > tolerance:
+                failures.append(
+                    f"{label}: {metric} energy {value:g}% exceeds {tolerance:g}%"
+                )
+        mesh = _finite_result_value(frame, f"mesh_tets_{label}")
+        if mesh is None or mesh < 1 or not mesh.is_integer():
+            failures.append(f"{label}: mesh tetrahedra count is missing")
+
+    if cap_on:
+        for suffix in ("raw_F", "F"):
+            columns = (
+                f"C_tx_tx_{suffix}", f"C_rx_rx_{suffix}",
+                f"C_tx_rx_{suffix}", f"C_tx_rx_signed_{suffix}",
+            )
+            values = [_finite_result_value(frame, column) for column in columns]
+            if any(value is None for value in values):
+                failures.append(f"cap: non-finite required capacitance outputs {columns}")
+                continue
+            c_tx, c_rx, coupling, signed = values
+            if c_tx <= 0 or c_rx <= 0 or coupling <= 0 or signed >= 0:
+                failures.append("cap: capacitance coefficients have non-physical signs")
+            elif (
+                not math.isclose(coupling, -signed, rel_tol=1e-9, abs_tol=0.0)
+                or coupling > math.sqrt(c_tx) * math.sqrt(c_rx) * (1.0 + 1e-9)
+                or min(c_tx + signed, c_rx + signed) < -max(c_tx, c_rx) * 1e-6
+            ):
+                failures.append("cap: capacitance matrix is not passive")
+
+    if graded_active_winding != "off":
+        prefix = graded_active_winding.lower()
+        for column in (
+            "electrostatic_energy_raw_J", "C_eq_raw_F", "C_eq_full_F",
+            f"C_{prefix}_{prefix}_turn_graded_F",
+        ):
+            value = _finite_result_value(frame, column)
+            if value is None or value <= 0:
+                failures.append(f"cap_turn_graded_{prefix}: invalid {column}")
+    return not failures, "; ".join(failures) if failures else "valid_capacitance_only"
+
+
+def _em_result_validation(
+        frame, matrix_on=True, loss_on=True, *, cap_on=False,
+        cap_turn_graded_active_winding="off"):
     """Validate enabled EM stages against the configured adaptive criteria."""
     if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
         return False, "result frame is missing"
@@ -1187,7 +1264,7 @@ def _em_result_validation(frame, matrix_on=True, loss_on=True):
         enabled.append((
             "loss", "percent_error", "min_converged", LOSS_REQUIRED_RESULT_COLUMNS,
         ))
-    if not enabled:
+    if not enabled and not cap_on and cap_turn_graded_active_winding == "off":
         return False, "no EM stage is enabled"
 
     failures = []
@@ -1235,12 +1312,23 @@ def _em_result_validation(frame, matrix_on=True, loss_on=True):
                 f"{label}: non-finite required outputs {missing_outputs}"
             )
 
+    cap_valid, cap_reason = _cap_result_validation(
+        frame, cap_on=cap_on,
+        graded_active_winding=cap_turn_graded_active_winding,
+    )
+    if cap_valid is False:
+        failures.append(cap_reason)
     return not failures, "; ".join(failures) if failures else "valid"
 
 
-def _em_result_is_valid(frame, matrix_on=True, loss_on=True):
+def _em_result_is_valid(
+        frame, matrix_on=True, loss_on=True, *, cap_on=False,
+        cap_turn_graded_active_winding="off"):
     """Return True only for finite, adaptively converged enabled EM stages."""
-    return _em_result_validation(frame, matrix_on=matrix_on, loss_on=loss_on)[0]
+    return _em_result_validation(
+        frame, matrix_on=matrix_on, loss_on=loss_on, cap_on=cap_on,
+        cap_turn_graded_active_winding=cap_turn_graded_active_winding,
+    )[0]
 
 
 MAX_TRUSTED_TEMPERATURE_C = 4700.0
@@ -6947,6 +7035,10 @@ class Simulation():
             cols[f"conv_delta_pct_{label}"] = metrics["delta_pct"]
             cols[f"mesh_tets_{label}"] = metrics["mesh_tets"]
         except Exception as e:
+            if label == "cap" or label.startswith("cap_turn_graded_"):
+                raise RuntimeError(
+                    f"capacitance convergence extraction failed ({label}): {e}"
+                ) from e
             logging.warning(f"convergence info extraction failed ({label}): {e}")
         return pd.DataFrame({k: [v] for k, v in cols.items()})
 
@@ -9406,8 +9498,20 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             fixed_boundary_evidence
         ).items():
             result[name] = value
+        graded_active_winding = (
+            cap_turn_graded_config["active_winding"]
+            if cap_turn_graded_config is not None else "off"
+        )
+        cap_result_valid, cap_validity_reason = _cap_result_validation(
+            result, cap_on=cap_on, graded_active_winding=graded_active_winding,
+        )
+        result["result_valid_cap"] = (
+            int(cap_result_valid) if cap_result_valid is not None else None
+        )
+        result["cap_validity_reason"] = cap_validity_reason
         em_result_valid, em_validity_reason = _em_result_validation(
-            result, matrix_on=matrix_on, loss_on=loss_on
+            result, matrix_on=matrix_on, loss_on=loss_on, cap_on=cap_on,
+            cap_turn_graded_active_winding=graded_active_winding,
         )
         result["result_valid_em"] = int(em_result_valid)
         result["em_validity_reason"] = em_validity_reason

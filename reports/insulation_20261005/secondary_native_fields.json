@@ -1,0 +1,587 @@
+{
+  "test_name": "secondaryHV_primaryHWground",
+  "excitation_voltage_expression": "1V",
+  "excitation_voltage_peak_V": 1.0,
+  "source_design": "insulation_secondaryHV",
+  "solution": "Setup1 : LastAdaptive",
+  "hotspots": [
+    {
+      "object_name": "Region",
+      "material": "air",
+      "E_stored_V_per_m": 65.42965896440319,
+      "E_1V_V_per_m": 65.42965896440319,
+      "location_mm": [
+        380.5,
+        51.6385647878419,
+        -132.5
+      ]
+    },
+    {
+      "object_name": "core_plate_pad_6_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 31.140431702372194,
+      "E_1V_V_per_m": 31.140431702372194,
+      "location_mm": [
+        -489.5,
+        238.0,
+        -85.6415444007727
+      ]
+    }
+  ],
+  "all_pad_maxima": [
+    {
+      "object_name": "core_plate_pad_1_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 27.300200788712825
+    },
+    {
+      "object_name": "core_plate_pad_1_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 30.28125909519284
+    },
+    {
+      "object_name": "core_plate_pad_1_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 28.734443131374636
+    },
+    {
+      "object_name": "core_plate_pad_1_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.847778574525638
+    },
+    {
+      "object_name": "core_plate_pad_1_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.9215032280319713
+    },
+    {
+      "object_name": "core_plate_pad_1_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.7905363399691485
+    },
+    {
+      "object_name": "core_plate_pad_2_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.3071979039554027
+    },
+    {
+      "object_name": "core_plate_pad_2_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.8738049922922976
+    },
+    {
+      "object_name": "core_plate_pad_2_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.2020267838133227
+    },
+    {
+      "object_name": "core_plate_pad_2_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.396035446888425
+    },
+    {
+      "object_name": "core_plate_pad_2_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.0567875503351014
+    },
+    {
+      "object_name": "core_plate_pad_2_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.272280368366416
+    },
+    {
+      "object_name": "core_plate_pad_3_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.5853813410020283
+    },
+    {
+      "object_name": "core_plate_pad_3_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.0073796674154494
+    },
+    {
+      "object_name": "core_plate_pad_3_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.1521638203537123
+    },
+    {
+      "object_name": "core_plate_pad_3_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.1301690233829043
+    },
+    {
+      "object_name": "core_plate_pad_3_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.7691203311794802
+    },
+    {
+      "object_name": "core_plate_pad_3_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.0113050102932872
+    },
+    {
+      "object_name": "core_plate_pad_4_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.2722558273152764
+    },
+    {
+      "object_name": "core_plate_pad_4_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.8413401689728007
+    },
+    {
+      "object_name": "core_plate_pad_4_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.5856109480444667
+    },
+    {
+      "object_name": "core_plate_pad_4_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.3651025054692991
+    },
+    {
+      "object_name": "core_plate_pad_4_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.8658487340440012
+    },
+    {
+      "object_name": "core_plate_pad_4_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.4718221389033306
+    },
+    {
+      "object_name": "core_plate_pad_5_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.163521991723498
+    },
+    {
+      "object_name": "core_plate_pad_5_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.0650867010991243
+    },
+    {
+      "object_name": "core_plate_pad_5_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.5626911373796561
+    },
+    {
+      "object_name": "core_plate_pad_5_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.1548548459440997
+    },
+    {
+      "object_name": "core_plate_pad_5_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.9090752310965774
+    },
+    {
+      "object_name": "core_plate_pad_5_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.2523862976617355
+    },
+    {
+      "object_name": "core_plate_pad_6_a_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 2.5909838288507303
+    },
+    {
+      "object_name": "core_plate_pad_6_a_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.5587379385657418
+    },
+    {
+      "object_name": "core_plate_pad_6_a_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 1.4283821187891028
+    },
+    {
+      "object_name": "core_plate_pad_6_b_side_left",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 31.140431702372194
+    },
+    {
+      "object_name": "core_plate_pad_6_b_center",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 28.359004355401936
+    },
+    {
+      "object_name": "core_plate_pad_6_b_side_right",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 27.652579145674988
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_1_in_p",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.018778103205532626
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_1_out_p",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.012572362663254176
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_1_in_n",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.04286445011978179
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_1_out_n",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.005940740369898985
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_2_in_p",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.005171465369585921
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_2_out_p",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.014732907614153329
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_2_in_n",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.003879714951852124
+    },
+    {
+      "object_name": "Tx_main_wcp_pad_2_out_n",
+      "material": "thermal_pad",
+      "E_stored_V_per_m": 0.008710574859991037
+    }
+  ],
+  "boundary_snapshot": [
+    {
+      "name": "CapTx",
+      "props": {
+        "ID": 0,
+        "BoundType": "Voltage",
+        "IsComponent": false,
+        "Objects": [
+          2358,
+          2602,
+          2846,
+          3090,
+          3334,
+          3578
+        ],
+        "ParentBndID": -1,
+        "Voltage": "0V",
+        "CoordinateSystem": -1
+      }
+    },
+    {
+      "name": "CapRx",
+      "props": {
+        "ID": 1,
+        "BoundType": "Voltage",
+        "IsComponent": false,
+        "Objects": [
+          3822,
+          4066,
+          4310,
+          4554,
+          4798,
+          5042,
+          5286,
+          5530,
+          5774,
+          6018,
+          6262,
+          6506,
+          6750,
+          6994,
+          7238,
+          7482,
+          7726,
+          7970,
+          8214,
+          8458,
+          8702,
+          8946,
+          9190,
+          9434,
+          9678,
+          9922,
+          10166,
+          10410,
+          10654,
+          10898,
+          11142,
+          11386,
+          11630,
+          11874,
+          12118,
+          12362,
+          12606,
+          12850,
+          13094,
+          13338,
+          13582,
+          13826,
+          14070,
+          14314,
+          14558,
+          14802,
+          15046,
+          15290,
+          15534,
+          15778,
+          16022,
+          16266,
+          16510,
+          16754,
+          16998,
+          17242,
+          17486,
+          17730,
+          17974,
+          18218,
+          18462,
+          18706,
+          18950,
+          19194,
+          19438,
+          19682,
+          19926,
+          20170,
+          20414,
+          20658,
+          20902,
+          21146,
+          21390,
+          21634,
+          21878,
+          22122,
+          22366,
+          22610,
+          22854,
+          23098,
+          23342,
+          23586,
+          23830
+        ],
+        "ParentBndID": -1,
+        "Voltage": "1V",
+        "CoordinateSystem": -1
+      }
+    },
+    {
+      "name": "CapGroundSolids",
+      "props": {
+        "ID": 2,
+        "BoundType": "Voltage",
+        "IsComponent": false,
+        "Objects": [
+          6,
+          34,
+          62,
+          90,
+          118,
+          146,
+          174,
+          202,
+          230,
+          258,
+          286,
+          314,
+          342,
+          370,
+          398,
+          426,
+          454,
+          482,
+          510,
+          538,
+          566,
+          594,
+          622,
+          650,
+          678,
+          706,
+          734,
+          762,
+          790,
+          818,
+          930,
+          958,
+          986,
+          1182,
+          1210,
+          1238,
+          1434,
+          1462,
+          1490,
+          1686,
+          1714,
+          1742,
+          1938,
+          1966,
+          1994,
+          2190,
+          2218,
+          2246,
+          24102,
+          24186,
+          24270,
+          24354
+        ],
+        "ParentBndID": -1,
+        "Voltage": "0V",
+        "CoordinateSystem": -1
+      }
+    },
+    {
+      "name": "CapGroundRegion",
+      "props": {
+        "ID": 3,
+        "BoundType": "Voltage",
+        "IsComponent": false,
+        "Faces": [
+          24416,
+          24414,
+          24415,
+          24413,
+          24411,
+          24412
+        ],
+        "ParentBndID": -1,
+        "Voltage": "0V",
+        "CoordinateSystem": -1
+      }
+    },
+    {
+      "name": "CapMatrix",
+      "props": {
+        "ID": 0,
+        "MaxwellParameterType": "Matrix",
+        "MatrixEntry": [
+          {
+            "Source": 0,
+            "NumberOfTurns": "1"
+          },
+          {
+            "Source": 1,
+            "NumberOfTurns": "1"
+          }
+        ],
+        "$end 'MatrixEntry'": null,
+        "MatrixGroup": {},
+        "NewVersion": true
+      }
+    }
+  ],
+  "setup_snapshot": {
+    "ID": 0,
+    "SetupType": "Electrostatic",
+    "Enabled": true,
+    "MeshLink": {
+      "ImportMesh": false
+    },
+    "MaximumPasses": 5,
+    "MinimumPasses": 5,
+    "MinimumConvergedPasses": 1,
+    "PercentRefinement": 30,
+    "SolveFieldOnly": false,
+    "PercentError": 1,
+    "SolveMatrixAtLast": true,
+    "UseNonLinearIterNum": false,
+    "UseIterativeSolver": false,
+    "RelativeResidual": 1e-06,
+    "NonLinearResidual": 0.001,
+    "RelaxationFactor": 1
+  },
+  "convergence_export_path": "D:\\MFT_1MW_2026_archive\\insulation_audit_20261005\\postprocess\\full_cap\\secondary_new_convergence.txt",
+  "local_field_history": [
+    {
+      "adaptive_pass": 4,
+      "air_E_1V_V_per_m": 68.68168611760478,
+      "pad_E_1V_V_per_m": 30.177585572178213,
+      "pad_object": "core_plate_pad_1_a_side_left"
+    },
+    {
+      "adaptive_pass": 5,
+      "air_E_1V_V_per_m": 65.42965896440319,
+      "pad_E_1V_V_per_m": 31.140431702372194,
+      "pad_object": "core_plate_pad_6_b_side_left"
+    }
+  ],
+  "native_energy_history": [
+    {
+      "p": 1.0,
+      "tet": 120185.0,
+      "te": 3.399614011755095e-10,
+      "ee": 8.93549192585563
+    },
+    {
+      "p": 2.0,
+      "tet": 156233.0,
+      "te": 3.21145376628932e-10,
+      "ee": 3.413212477806667,
+      "de": 5.534753204780293
+    },
+    {
+      "p": 3.0,
+      "tet": 203048.0,
+      "te": 3.157378695337215e-10,
+      "ee": 1.297151703823891,
+      "de": 1.683819070345388
+    },
+    {
+      "p": 4.0,
+      "tet": 263860.0,
+      "te": 3.134502719724807e-10,
+      "ee": 0.691381585455183,
+      "de": 0.7245242911846885
+    },
+    {
+      "p": 5.0,
+      "tet": 342894.0,
+      "te": 3.12305573524714e-10,
+      "ee": 0.4220547314137841,
+      "de": 0.3651929987373521
+    }
+  ],
+  "geometry_factor": 1,
+  "field_normalization": "E_actual / electrostatic_excitation_voltage_peak",
+  "local_E_geometry_multiplier": 1,
+  "source_aedt_sha256": "a27180d2384456b2a5ea219cf3b4fcb43eae9f22a367a2c8a36f3ed955d6a601",
+  "source_original_aedt_sha256": "98c79f40d9952630dec0fbbf154886c1c465d68009889e48901d3158acb37721",
+  "native_field_files": [
+    {
+      "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.hdr",
+      "bytes": 131,
+      "sha256": "4c4409a757f3ee9566330876a653b7ad67fab3e17d6de8be4b66ac6277c4493f"
+    },
+    {
+      "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.plo",
+      "bytes": 28803116,
+      "sha256": "c3e24deeedaebcbc89c2a6e5eba181f04c40fd1d643e705e2ced22299773a28e"
+    },
+    {
+      "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.sat",
+      "bytes": 200530,
+      "sha256": "c77338fe008a1e45dcdd56158015c79d2ce7a2144a8fdfc98b7d6faefcd126ee"
+    },
+    {
+      "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.sol",
+      "bytes": 19874681,
+      "sha256": "b37de3a27c036562b6a3c618cde1e966d79c37a4d54159070750e82da6c1b2c4"
+    },
+    {
+      "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.sstr",
+      "bytes": 12991754,
+      "sha256": "4bc8709ed6f2944b9c2433a4696015c7b95fe1ebe197f1d278b447e9e026293e"
+    },
+    {
+      "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.str",
+      "bytes": 27376804,
+      "sha256": "8416a36e81ce46806d7fe3a962e3109dd687fb11ccf991e88bdf2342be63fe82"
+    },
+    {
+      "path": "insulation_secondaryHV.results\\DV176_SOL10_V153.Field181\\fields.stt",
+      "bytes": 199,
+      "sha256": "5ae1a2198ee9be6b22e8476d0bdd2e13c7cec07a3cf5d6d973c7ca3db457550e"
+    }
+  ]
+}
