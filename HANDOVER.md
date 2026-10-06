@@ -133,3 +133,18 @@ PYTHONIOENCODING=utf-8 권장. 메모리 파일: `C:\Users\peets\.claude\project
 - 재실행 도구: `python tools/mft_insulation_review.py --help`. `extract --rerun`은 원본과 결과를 먼저 복사하고 사본만 1/0 V로 계산한다. `assess`는 저장된 입력을 평가한다.
 - 관련 시험 59개 통과. 실제 AEDT에서 객체 ID·전위 그룹·Voltage readback·MaxPos 좌표 추출을 확인했다.
 - 원본 백업: `D:\MFT_1MW_2026_archive\insulation_audit_20261005`. 원본 코드와 native 결과, Git 기준/파일 SHA-256, 재해석 사본을 보존했다.
+
+
+## 2026-10-06 조건부 PD 겉보기 전하 모델
+
+전체 단자 C×V와 PD 겉보기 전하를 구분하기 위해 작은 구형 공기 보이드의 유도전하 모델을 추가했다. 실제 결함을 확인하거나 CAD에 삽입한 것이 아니며, 기존 native Maxwell 패드 내부 1 V 전계에 가상의 보이드 모델을 연결했다. 기존 July 전체 6/60 파라메트릭 모델이 August 6 최종 공급업체 CAD와 같은 형상인지 확인되지 않았다.
+
+- 공식: q_app = 4π ε0 εr,host r³ (E_inc−E_ext) E_w,host. E_w는 native 1 V 호스트 전계/1 V로 단위 1/m. 정확한 임계 교차점, 순간 방전, 벽면 전하 기억, 첫 사인파 한 주기를 계산한다. 전자 시드 지연·벽면 전하 이완·실제 파형 측정은 포함하지 않았다.
+- 동등 표현: C_eff = 2π ε0 εr,host r² E_w,host, ΔV_void = 2r(E_inc−E_ext), q_app = C_eff ΔV_void. C_eff는 이 모델의 단자 결합 계수이며 전체 변압기 정전용량이나 실제 계측 Cb가 아니다.
+- 내부점 native 전계: 1차 패드 중심 499.999999915 V/m @1 V, 국부 메시 변화 약 3.07e−10로 안정. 2차 패드 중심 5.842826455 V/m, 변화 4.5846%로 2% 진단 기준 미달. 국부 안정은 전체 Emax 수렴을 뜻하지 않는다.
+- 가정: 공기 101325 Pa, 호스트 εr=4, 주파수 60 Hz, 시험전압 5/10/15/20 kV RMS, 보이드 반지름 25–500 μm, 소멸/개시 전계 비 0.3/0.5/0.8. 실제 PD 시험전압·주파수·재료·보이드 정보는 미확인이다.
+- 1차 20 kV RMS·소멸 비 0.5에서 반지름 250/300/500 μm 조건의 최대 이벤트 전하는 각각 9.41365/15.49130/63.24035 pC. 300 μm 조건의 첫 주기 사건 수는 22회. 가정된 모델의 계산이며 실물 불합격 판정이 아니다.
+- 2차 선택점에서 이 가정들로 사건이 없더라도 실물 무방전이나 15 pC 합격을 입증하지 않는다. 모든 실물 적합성은 insufficient_data다. 유한 두께 호스트 경계 보정·표면/코로나/복수 결함은 포함하지 않았다.
+- 코드: module/pd_void_model.py, tools/mft_pd_void_estimate.py. 재실행: python tools/mft_pd_void_estimate.py --input reports/pd_void_20261006/model_inputs.json --output pd_result.json.
+- 입력·native 근거·216개 시나리오·그래프: reports/pd_void_20261006/. 관련 단위·평가 테스트 69개 통과; 이벤트 전하 및 벽면 기억의 보존을 전 조건에서 독립 검증했다.
+- 기존 코드·보고서·Git 기준·native 사본 백업: D:/MFT_1MW_2026_archive/pd_void_model_20261006_185613. 원본 native SHA-256은 a27180d2384456b2a5ea219cf3b4fcb43eae9f22a367a2c8a36f3ed955d6a601로 유지했다.

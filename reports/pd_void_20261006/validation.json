@@ -1,0 +1,18 @@
+{
+  "status": "passed",
+  "related_tests": 69,
+  "scenario_checks": 216,
+  "event_checks": 1195,
+  "max_charge_formula_relative_error": 2.1934715627342789e-16,
+  "source_project_sha256": "a27180d2384456b2a5ea219cf3b4fcb43eae9f22a367a2c8a36f3ed955d6a601",
+  "source_unchanged": true,
+  "checks": [
+    "independent dipole induced-charge formula",
+    "C_eff times local void voltage drop",
+    "signed pulse sum equals final wall memory induced charge",
+    "threshold event order and sign",
+    "increment field names",
+    "physical qualification stays insufficient_data"
+  ],
+  "assumptions_are_unverified": true
+}

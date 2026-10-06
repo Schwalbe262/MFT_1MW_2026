@@ -1,0 +1,372 @@
+{
+  "schema_version": "mft-pd-void-batch-input-v1",
+  "provenance": {
+    "created_utc": "2026-10-06T10:13:37.630113+00:00",
+    "baseline_git": "0d13ba6142346897cac1acb9754b8f351dfcf4ab",
+    "native_field_dataset": "native_interior_fields.json",
+    "actual_final_cad_verified": false,
+    "actual_void_geometry_known": false,
+    "actual_material_permittivity_verified": false,
+    "actual_PD_test_voltage_rms_V": null,
+    "actual_PD_test_frequency_Hz": null,
+    "air_pressure_and_extinction_ratios_are_assumed": true,
+    "voltage_scenarios_are_not_confirmed_test_conditions": true,
+    "scope": "one hypothetical spherical void per selected native pad interior point; conditional first virgin AC cycle"
+  },
+  "models": [
+    {
+      "case": "primary",
+      "scenario_id": "primary_extinction_0.3",
+      "field_evidence": {
+        "source": "native_interior_fields.json#primary",
+        "solution": "Setup1 : LastAdaptive",
+        "unit": "V/m",
+        "normalization_voltage_V": 1,
+        "local_field_at_1V_V_per_m": 499.9999999149923,
+        "E_vector_at_1V_V_per_m": [
+          5.861511751898922e-09,
+          499.9999999149923,
+          2.661814523811294e-08
+        ],
+        "location_mm": [
+          0.0,
+          430.476,
+          0.0
+        ],
+        "object_name": "Tx_main_wcp_pad_1_in_p",
+        "material_name": "thermal_pad",
+        "point_in_dielectric": true,
+        "model_basis": "full",
+        "local_field_geometry_multiplier": 1,
+        "local_field_converged": true,
+        "point_mesh_relative_change": 3.071451981639939e-10,
+        "source_project_sha256": "a27180d2384456b2a5ea219cf3b4fcb43eae9f22a367a2c8a36f3ed955d6a601",
+        "native_export_sha256": "91fc13d84b5f5c52eec47ea48b34ac6cf34e3ad06c75c0458f7f0ae935c290b1",
+        "selected_point_not_global_maximum": true
+      },
+      "void": {
+        "radii_m": [
+          2.4999999999999998e-05,
+          4.9999999999999996e-05,
+          9.999999999999999e-05,
+          0.00015,
+          0.00019999999999999998,
+          0.00025,
+          0.0003,
+          0.00039999999999999996,
+          0.0005
+        ],
+        "minimum_host_boundary_distance_m": 0.001,
+        "relative_permittivity_host": 4.0,
+        "relative_permittivity_gas": 1.0,
+        "gas_kind": "air",
+        "pressure_Pa": 101325,
+        "extinction_ratio": 0.3,
+        "containment_evidence": "native solid volume equals axis-aligned bounding-box volume, centered sphere; bbox [-190.85, 429.476, -286.55, 190.85, 431.476, 286.55]"
+      },
+      "voltage_scenarios_rms_V": [
+        5000,
+        10000,
+        15000,
+        20000
+      ],
+      "frequency_Hz": 60,
+      "max_events": 10000
+    },
+    {
+      "case": "primary",
+      "scenario_id": "primary_extinction_0.5",
+      "field_evidence": {
+        "source": "native_interior_fields.json#primary",
+        "solution": "Setup1 : LastAdaptive",
+        "unit": "V/m",
+        "normalization_voltage_V": 1,
+        "local_field_at_1V_V_per_m": 499.9999999149923,
+        "E_vector_at_1V_V_per_m": [
+          5.861511751898922e-09,
+          499.9999999149923,
+          2.661814523811294e-08
+        ],
+        "location_mm": [
+          0.0,
+          430.476,
+          0.0
+        ],
+        "object_name": "Tx_main_wcp_pad_1_in_p",
+        "material_name": "thermal_pad",
+        "point_in_dielectric": true,
+        "model_basis": "full",
+        "local_field_geometry_multiplier": 1,
+        "local_field_converged": true,
+        "point_mesh_relative_change": 3.071451981639939e-10,
+        "source_project_sha256": "a27180d2384456b2a5ea219cf3b4fcb43eae9f22a367a2c8a36f3ed955d6a601",
+        "native_export_sha256": "91fc13d84b5f5c52eec47ea48b34ac6cf34e3ad06c75c0458f7f0ae935c290b1",
+        "selected_point_not_global_maximum": true
+      },
+      "void": {
+        "radii_m": [
+          2.4999999999999998e-05,
+          4.9999999999999996e-05,
+          9.999999999999999e-05,
+          0.00015,
+          0.00019999999999999998,
+          0.00025,
+          0.0003,
+          0.00039999999999999996,
+          0.0005
+        ],
+        "minimum_host_boundary_distance_m": 0.001,
+        "relative_permittivity_host": 4.0,
+        "relative_permittivity_gas": 1.0,
+        "gas_kind": "air",
+        "pressure_Pa": 101325,
+        "extinction_ratio": 0.5,
+        "containment_evidence": "native solid volume equals axis-aligned bounding-box volume, centered sphere; bbox [-190.85, 429.476, -286.55, 190.85, 431.476, 286.55]"
+      },
+      "voltage_scenarios_rms_V": [
+        5000,
+        10000,
+        15000,
+        20000
+      ],
+      "frequency_Hz": 60,
+      "max_events": 10000
+    },
+    {
+      "case": "primary",
+      "scenario_id": "primary_extinction_0.8",
+      "field_evidence": {
+        "source": "native_interior_fields.json#primary",
+        "solution": "Setup1 : LastAdaptive",
+        "unit": "V/m",
+        "normalization_voltage_V": 1,
+        "local_field_at_1V_V_per_m": 499.9999999149923,
+        "E_vector_at_1V_V_per_m": [
+          5.861511751898922e-09,
+          499.9999999149923,
+          2.661814523811294e-08
+        ],
+        "location_mm": [
+          0.0,
+          430.476,
+          0.0
+        ],
+        "object_name": "Tx_main_wcp_pad_1_in_p",
+        "material_name": "thermal_pad",
+        "point_in_dielectric": true,
+        "model_basis": "full",
+        "local_field_geometry_multiplier": 1,
+        "local_field_converged": true,
+        "point_mesh_relative_change": 3.071451981639939e-10,
+        "source_project_sha256": "a27180d2384456b2a5ea219cf3b4fcb43eae9f22a367a2c8a36f3ed955d6a601",
+        "native_export_sha256": "91fc13d84b5f5c52eec47ea48b34ac6cf34e3ad06c75c0458f7f0ae935c290b1",
+        "selected_point_not_global_maximum": true
+      },
+      "void": {
+        "radii_m": [
+          2.4999999999999998e-05,
+          4.9999999999999996e-05,
+          9.999999999999999e-05,
+          0.00015,
+          0.00019999999999999998,
+          0.00025,
+          0.0003,
+          0.00039999999999999996,
+          0.0005
+        ],
+        "minimum_host_boundary_distance_m": 0.001,
+        "relative_permittivity_host": 4.0,
+        "relative_permittivity_gas": 1.0,
+        "gas_kind": "air",
+        "pressure_Pa": 101325,
+        "extinction_ratio": 0.8,
+        "containment_evidence": "native solid volume equals axis-aligned bounding-box volume, centered sphere; bbox [-190.85, 429.476, -286.55, 190.85, 431.476, 286.55]"
+      },
+      "voltage_scenarios_rms_V": [
+        5000,
+        10000,
+        15000,
+        20000
+      ],
+      "frequency_Hz": 60,
+      "max_events": 10000
+    },
+    {
+      "case": "secondary",
+      "scenario_id": "secondary_extinction_0.3",
+      "field_evidence": {
+        "source": "native_interior_fields.json#secondary",
+        "solution": "Setup1 : LastAdaptive",
+        "unit": "V/m",
+        "normalization_voltage_V": 1,
+        "local_field_at_1V_V_per_m": 5.842826455436639,
+        "E_vector_at_1V_V_per_m": [
+          0.006136774120832175,
+          -5.842823207705449,
+          -0.0005402335444271733
+        ],
+        "location_mm": [
+          -455.0,
+          237.0,
+          0.0
+        ],
+        "object_name": "core_plate_pad_6_b_side_left",
+        "material_name": "thermal_pad",
+        "point_in_dielectric": true,
+        "model_basis": "full",
+        "local_field_geometry_multiplier": 1,
+        "local_field_converged": false,
+        "point_mesh_relative_change": 0.045846164065700745,
+        "source_project_sha256": "a27180d2384456b2a5ea219cf3b4fcb43eae9f22a367a2c8a36f3ed955d6a601",
+        "native_export_sha256": "a8a465ea530bfd1db235a13651f2fb2fa152602f25e7f10c789272ddb8cdd3c7",
+        "selected_point_not_global_maximum": true
+      },
+      "void": {
+        "radii_m": [
+          2.4999999999999998e-05,
+          4.9999999999999996e-05,
+          9.999999999999999e-05,
+          0.00015,
+          0.00019999999999999998,
+          0.00025,
+          0.0003,
+          0.00039999999999999996,
+          0.0005
+        ],
+        "minimum_host_boundary_distance_m": 0.001,
+        "relative_permittivity_host": 4.0,
+        "relative_permittivity_gas": 1.0,
+        "gas_kind": "air",
+        "pressure_Pa": 101325,
+        "extinction_ratio": 0.3,
+        "containment_evidence": "native solid volume equals axis-aligned bounding-box volume, centered sphere; bbox [-489.5, 236.0, -375.0, -420.5, 238.0, 375.0]"
+      },
+      "voltage_scenarios_rms_V": [
+        5000,
+        10000,
+        15000,
+        20000
+      ],
+      "frequency_Hz": 60,
+      "max_events": 10000
+    },
+    {
+      "case": "secondary",
+      "scenario_id": "secondary_extinction_0.5",
+      "field_evidence": {
+        "source": "native_interior_fields.json#secondary",
+        "solution": "Setup1 : LastAdaptive",
+        "unit": "V/m",
+        "normalization_voltage_V": 1,
+        "local_field_at_1V_V_per_m": 5.842826455436639,
+        "E_vector_at_1V_V_per_m": [
+          0.006136774120832175,
+          -5.842823207705449,
+          -0.0005402335444271733
+        ],
+        "location_mm": [
+          -455.0,
+          237.0,
+          0.0
+        ],
+        "object_name": "core_plate_pad_6_b_side_left",
+        "material_name": "thermal_pad",
+        "point_in_dielectric": true,
+        "model_basis": "full",
+        "local_field_geometry_multiplier": 1,
+        "local_field_converged": false,
+        "point_mesh_relative_change": 0.045846164065700745,
+        "source_project_sha256": "a27180d2384456b2a5ea219cf3b4fcb43eae9f22a367a2c8a36f3ed955d6a601",
+        "native_export_sha256": "a8a465ea530bfd1db235a13651f2fb2fa152602f25e7f10c789272ddb8cdd3c7",
+        "selected_point_not_global_maximum": true
+      },
+      "void": {
+        "radii_m": [
+          2.4999999999999998e-05,
+          4.9999999999999996e-05,
+          9.999999999999999e-05,
+          0.00015,
+          0.00019999999999999998,
+          0.00025,
+          0.0003,
+          0.00039999999999999996,
+          0.0005
+        ],
+        "minimum_host_boundary_distance_m": 0.001,
+        "relative_permittivity_host": 4.0,
+        "relative_permittivity_gas": 1.0,
+        "gas_kind": "air",
+        "pressure_Pa": 101325,
+        "extinction_ratio": 0.5,
+        "containment_evidence": "native solid volume equals axis-aligned bounding-box volume, centered sphere; bbox [-489.5, 236.0, -375.0, -420.5, 238.0, 375.0]"
+      },
+      "voltage_scenarios_rms_V": [
+        5000,
+        10000,
+        15000,
+        20000
+      ],
+      "frequency_Hz": 60,
+      "max_events": 10000
+    },
+    {
+      "case": "secondary",
+      "scenario_id": "secondary_extinction_0.8",
+      "field_evidence": {
+        "source": "native_interior_fields.json#secondary",
+        "solution": "Setup1 : LastAdaptive",
+        "unit": "V/m",
+        "normalization_voltage_V": 1,
+        "local_field_at_1V_V_per_m": 5.842826455436639,
+        "E_vector_at_1V_V_per_m": [
+          0.006136774120832175,
+          -5.842823207705449,
+          -0.0005402335444271733
+        ],
+        "location_mm": [
+          -455.0,
+          237.0,
+          0.0
+        ],
+        "object_name": "core_plate_pad_6_b_side_left",
+        "material_name": "thermal_pad",
+        "point_in_dielectric": true,
+        "model_basis": "full",
+        "local_field_geometry_multiplier": 1,
+        "local_field_converged": false,
+        "point_mesh_relative_change": 0.045846164065700745,
+        "source_project_sha256": "a27180d2384456b2a5ea219cf3b4fcb43eae9f22a367a2c8a36f3ed955d6a601",
+        "native_export_sha256": "a8a465ea530bfd1db235a13651f2fb2fa152602f25e7f10c789272ddb8cdd3c7",
+        "selected_point_not_global_maximum": true
+      },
+      "void": {
+        "radii_m": [
+          2.4999999999999998e-05,
+          4.9999999999999996e-05,
+          9.999999999999999e-05,
+          0.00015,
+          0.00019999999999999998,
+          0.00025,
+          0.0003,
+          0.00039999999999999996,
+          0.0005
+        ],
+        "minimum_host_boundary_distance_m": 0.001,
+        "relative_permittivity_host": 4.0,
+        "relative_permittivity_gas": 1.0,
+        "gas_kind": "air",
+        "pressure_Pa": 101325,
+        "extinction_ratio": 0.8,
+        "containment_evidence": "native solid volume equals axis-aligned bounding-box volume, centered sphere; bbox [-489.5, 236.0, -375.0, -420.5, 238.0, 375.0]"
+      },
+      "voltage_scenarios_rms_V": [
+        5000,
+        10000,
+        15000,
+        20000
+      ],
+      "frequency_Hz": 60,
+      "max_events": 10000
+    }
+  ]
+}
